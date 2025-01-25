@@ -1,1 +1,1 @@
-cd bin/publish; DOTNET_GCHeapHardLimit=500000000 ./fredapi --urls http://*:$PORT
+fredapi cd bin/publish; DOTNET_GCHeapHardLimit=500000000 ./fredapi --urls http://*:$PORT
