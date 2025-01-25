@@ -1,0 +1,163 @@
+@fredapi_HostAddress = http://localhost:5113
+
+### Match Routes ###
+GET {{fredapi_HostAddress}}/api/match/upcoming
+Accept: application/json
+###
+
+GET {{fredapi_HostAddress}}/api/match/details_extended?matchId=51271799
+Accept: application/json
+###
+
+GET {{fredapi_HostAddress}}/api/match/details?matchId=51389003
+Accept: application/json
+###
+
+GET {{fredapi_HostAddress}}/api/match/info?matchId=51389003
+Accept: application/json
+###
+
+GET {{fredapi_HostAddress}}/api/match/odds?matchId=51389003
+Accept: application/json
+###
+
+GET {{fredapi_HostAddress}}/api/match/insights?matchId=51389003
+Accept: application/json
+###
+
+GET {{fredapi_HostAddress}}/api/matches/date?date=2025-01-05
+Accept: application/json
+###
+
+GET {{fredapi_HostAddress}}/api/matches/live
+Accept: application/json
+###
+
+GET {{fredapi_HostAddress}}/api/matches/select?leagueId=24&type=1
+Accept: application/json
+###
+
+GET {{fredapi_HostAddress}}/api/phrases/51389003
+Accept: application/json
+###
+
+GET {{fredapi_HostAddress}}/api/situation/51271799
+Accept: application/json
+###
+
+GET {{fredapi_HostAddress}}/api/squads/51389003
+Accept: application/json
+###
+
+GET {{fredapi_HostAddress}}/api/timeline/51389003
+Accept: application/json
+###
+
+GET {{fredapi_HostAddress}}/api/timeline/delta/51389003
+Accept: application/json
+###
+
+GET {{fredapi_HostAddress}}/api/match/funfacts/51389003
+Accept: application/json
+###
+
+GET {{fredapi_HostAddress}}/api/match/form/51271799
+Accept: application/json
+###
+
+GET {{fredapi_HostAddress}}/api/match/phrasesdelta/51271799
+Accept: application/json
+###
+
+### Season Routes ###
+GET {{fredapi_HostAddress}}/api/season/metadata?seasonId=119847
+Accept: application/json
+###
+
+GET {{fredapi_HostAddress}}/api/season/goals?seasonId=119847
+Accept: application/json
+###
+
+GET {{fredapi_HostAddress}}/api/season/dynamic/table?seasonId=119847
+Accept: application/json
+###
+GET {{fredapi_HostAddress}}/api/season/live/table?seasonId=119847
+Accept: application/json
+###
+
+GET {{fredapi_HostAddress}}/api/season/stats/season/match/table?seasonId=119847
+Accept: application/json
+###
+
+GET {{fredapi_HostAddress}}/api/season/stats/overunder?seasonId=119847
+Accept: application/json
+###
+
+GET {{fredapi_HostAddress}}/api/season/topcards?seasonId=119847
+Accept: application/json
+###
+
+GET {{fredapi_HostAddress}}/api/season/tables?seasonId=119847
+Accept: application/json
+###
+
+GET {{fredapi_HostAddress}}/api/brackets/gm-51389003
+Accept: application/json
+###
+
+GET {{fredapi_HostAddress}}/api/season/teampositionhistory/119847/744135/4500
+Accept: application/json
+###
+
+GET {{fredapi_HostAddress}}/api/season/teamscoringconceding/119847/744135
+Accept: application/json
+###
+
+GET {{fredapi_HostAddress}}/api/season/teamfixtures/119847/744135
+Accept: application/json
+###
+
+GET {{fredapi_HostAddress}}/api/season/teamdisciplinary/119847/744135
+Accept: application/json
+###
+
+GET {{fredapi_HostAddress}}/api/season/fixtures/119847
+Accept: application/json
+###
+
+GET {{fredapi_HostAddress}}/api/season/uniqueteamstats/119847
+Accept: application/json
+###
+
+GET {{fredapi_HostAddress}}/api/season/topgoals/119847
+Accept: application/json
+###
+
+### Team Routes ###
+GET {{fredapi_HostAddress}}/api/team/lastx?teamId=744135&count=5
+Accept: application/json
+###
+
+GET {{fredapi_HostAddress}}/api/team/lastx/extended?teamId=744135
+Accept: application/json
+###
+
+GET {{fredapi_HostAddress}}/api/team/nextx?teamId=744135&count=5
+Accept: application/json
+###
+
+GET {{fredapi_HostAddress}}/api/team/stats/form/table?teamId=744135
+Accept: application/json
+###
+
+GET {{fredapi_HostAddress}}/api/team/versus-recent?teamId1=744135&teamId2=4500&count=10
+Accept: application/json
+###
+
+GET {{fredapi_HostAddress}}/api/team/info?teamId=744135
+Accept: application/json
+###
+
+GET {{fredapi_HostAddress}}/api/team/squad?teamId=744135
+Accept: application/json
+###
