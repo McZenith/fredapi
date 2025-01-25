@@ -32,7 +32,6 @@ public class EnrichedMatch
     public string? MatchPhrasesDelta { get; set; }
     public string? MatchInsights { get; set; }
     public string? FormTable { get; set; }
-    public string? VersusRecentStats { get; set; }
     public string? LastXStatsTeam1 { get; set; }
     public string? LastXStatsTeam2 { get; set; }
     public string? CupBrackets { get; set; }

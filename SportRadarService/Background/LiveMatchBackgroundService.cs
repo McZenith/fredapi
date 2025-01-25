@@ -18,7 +18,7 @@ public class LiveMatchBackgroundService(
     IHubContext<LiveMatchHub> hubContext)
     : BackgroundService
 {
-    private const int BatchSize = 100;
+    private const int BatchSize = 50;
     private const int DelaySecs = 1;
     private static readonly Random Random = new();
     private bool isInitialFetch;
@@ -402,7 +402,7 @@ public class LiveMatchBackgroundService(
                     SeasonLiveTable = JsonSerializer.Deserialize<dynamic>(match.SeasonLiveTable ?? "{}"),
                     BookmakerOdds = JsonSerializer.Deserialize<dynamic>(match.BookmakerOdds ?? "{}"),
                     SeasonTopGoals = JsonSerializer.Deserialize<dynamic>(match.SeasonTopGoals ?? "{}"),
-                    VersusRecentStats = JsonSerializer.Deserialize<dynamic>(match.VersusRecentStats ?? "{}"),
+                    TeamVersusRecent = JsonSerializer.Deserialize<dynamic>(match.TeamVersusRecent ?? "{}"),
                     LastXStatsTeam1 = JsonSerializer.Deserialize<dynamic>(match.LastXStatsTeam1 ?? "{}"),
                     LastXStatsTeam2 = JsonSerializer.Deserialize<dynamic>(match.LastXStatsTeam2 ?? "{}"),
                     MatchPhrases = JsonSerializer.Deserialize<dynamic>(match.MatchPhrases ?? "{}"),
