@@ -13,7 +13,7 @@ public class UpcomingMatchBackgroundService(
     : BackgroundService
 {
     private static readonly Random Random = new();
-    private const int BatchSize = 10;
+    private const int BatchSize = 100;
     private const int MaxRetries = 3;
     private const int RetryDelayMs = 1000;
 

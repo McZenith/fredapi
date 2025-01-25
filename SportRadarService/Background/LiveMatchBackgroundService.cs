@@ -18,7 +18,7 @@ public class LiveMatchBackgroundService(
     IHubContext<LiveMatchHub> hubContext)
     : BackgroundService
 {
-    private const int BatchSize = 10;
+    private const int BatchSize = 100;
     private const int DelaySecs = 1;
     private static readonly Random Random = new();
     private bool isInitialFetch;
