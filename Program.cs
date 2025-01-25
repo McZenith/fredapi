@@ -2,6 +2,7 @@ using fredapi.Database;
 using fredapi.Routes;
 using fredapi.SignalR;
 using fredapi.Utils;
+using Microsoft.AspNetCore.Cors.Infrastructure;
 using Microsoft.AspNetCore.Http.Connections;
 
 var builder = WebApplication.CreateBuilder(args);
@@ -11,6 +12,17 @@ builder.Services.AddLogging(logging =>
     logging.ClearProviders();
     logging.AddConsole(options => { options.TimestampFormat = "[yyyy-MM-dd HH:mm:ss.fff] "; });
     logging.AddDebug();
+});
+
+builder.Services.AddCors(options =>
+{
+    options.AddDefaultPolicy(policy =>
+    {
+        policy.AllowAnyHeader()
+            .AllowAnyMethod()
+            .SetIsOriginAllowed((host) => true)
+            .AllowCredentials();
+    });
 });
 
 builder.Services.AddSignalR(options =>
@@ -45,13 +57,15 @@ var app = builder.Build();
 
 if (app.Environment.IsDevelopment()) app.MapOpenApi();
 
+app.UseCors();
 app.UseWebSockets();
 
 // Map the SignalR hub directly
 app.MapHub<LiveMatchHub>("/livematchhub", options =>
 {
-    options.Transports = HttpTransportType.WebSockets;
+    options.Transports = HttpTransportType.WebSockets | HttpTransportType.ServerSentEvents | HttpTransportType.LongPolling;
     options.WebSockets.CloseTimeout = TimeSpan.FromSeconds(5);
+    options.LongPolling.PollTimeout = TimeSpan.FromSeconds(90);
 });
 
 
