@@ -33,7 +33,7 @@ public static class MatchDetailsEndpoint
                         statusCode: 500);
                 }
             })
-            .WithName("GetMatchDetails")
+            .WithName("GetMatchDetailsForIdInDatabase")
             .WithOpenApi();
     }
 }

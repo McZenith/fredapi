@@ -42,7 +42,7 @@ public static class MatchOddsEndpoint
                         statusCode: 500);
                 }
             })
-            .WithName("GetMatchOddsForId")
+            .WithName("GetMatchOddsForIdInDatabase")
             .WithOpenApi();
     }
 }

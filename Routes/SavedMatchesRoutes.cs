@@ -54,7 +54,7 @@ public static class MatchesEndpoints
                     statusCode: 500);
             }
         })
-        .WithName("GetMatches")
+        .WithName("GetMatchesInDatabase")
         .WithOpenApi();
     }
 }
