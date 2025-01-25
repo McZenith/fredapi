@@ -28,13 +28,11 @@ builder.Services.AddCors(options =>
 builder.Services.AddSignalR(options =>
 {
     options.EnableDetailedErrors = true;
-    options.KeepAliveInterval = TimeSpan.FromSeconds(15);      // Matches your client KEEP_ALIVE_INTERVAL
-    options.ClientTimeoutInterval = TimeSpan.FromSeconds(30);   // Should be 2x KeepAliveInterval
-    options.HandshakeTimeout = TimeSpan.FromSeconds(15);       // Good for most network conditions
-    options.MaximumReceiveMessageSize = 102400;                // 100KB - adjust based on your payload size
-    options.StreamBufferCapacity = 10;                         // Good for your batch size
-    options.MaximumParallelInvocationsPerClient = 2;          // Prevents overwhelming clients
-});
+    options.KeepAliveInterval = TimeSpan.FromSeconds(15);
+    options.ClientTimeoutInterval = TimeSpan.FromSeconds(30);
+    options.HandshakeTimeout = TimeSpan.FromSeconds(15);
+    options.MaximumReceiveMessageSize = 102400;
+}).AddMessagePackProtocol();
 
 // MongoDB configuration
 builder.Services.Configure<MongoDbSettings>(
@@ -59,13 +57,16 @@ if (app.Environment.IsDevelopment()) app.MapOpenApi();
 
 app.UseCors();
 app.UseWebSockets();
+app.UseRouting();
 
-// Map the SignalR hub directly
-app.MapHub<LiveMatchHub>("/livematchhub", options =>
+app.UseEndpoints(endpoints =>
 {
-    options.Transports = HttpTransportType.WebSockets | HttpTransportType.ServerSentEvents | HttpTransportType.LongPolling;
-    options.WebSockets.CloseTimeout = TimeSpan.FromSeconds(5);
-    options.LongPolling.PollTimeout = TimeSpan.FromSeconds(90);
+    endpoints.MapHub<LiveMatchHub>("/livematchhub", options =>
+    {
+        options.Transports = HttpTransportType.WebSockets | 
+                             HttpTransportType.ServerSentEvents | 
+                             HttpTransportType.LongPolling;
+    });
 });
 
 
