@@ -647,7 +647,7 @@ public class SportRadarService
         }
     }
 
-    private async Task<JsonDocument?> MakeRequestWithRetryAsync(string url, int maxRetries = 3, int timeout = 10000)
+    private async Task<JsonDocument?> MakeRequestWithRetryAsync(string url, int maxRetries = 3, int timeout = 20000)
     {
         var handler = new SocketsHttpHandler
         {
@@ -660,12 +660,12 @@ public class SportRadarService
             },
     
             // Adjust connection timeout if needed
-            ConnectTimeout = TimeSpan.FromSeconds(30),
+            ConnectTimeout = TimeSpan.FromSeconds(timeout),
     
             // Keep connections alive
             KeepAlivePingPolicy = HttpKeepAlivePingPolicy.WithActiveRequests,
-            KeepAlivePingDelay = TimeSpan.FromSeconds(60),
-            KeepAlivePingTimeout = TimeSpan.FromSeconds(30),
+            KeepAlivePingDelay = TimeSpan.FromSeconds(timeout),
+            KeepAlivePingTimeout = TimeSpan.FromSeconds(timeout),
         };
         
         handler.MaxConnectionsPerServer = 20;
