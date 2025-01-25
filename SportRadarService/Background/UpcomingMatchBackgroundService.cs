@@ -3,6 +3,7 @@ using fredapi.Database;
 using fredapi.Model.SportMatchesResponse;
 using fredapi.SportRadarService.TokenService;
 using Microsoft.AspNetCore.Http.HttpResults;
+using MongoDB.Bson;
 using MongoDB.Driver;
 
 namespace fredapi.SportRadarService.Background;
@@ -31,10 +32,16 @@ public class UpcomingMatchBackgroundService(
 
                 var matchesCollection = mongoDbService.GetCollection<Model.EnrichedMatch>("DailyMatches");
 
+                var indexKeysDefinition = Builders<Model.EnrichedMatch>.IndexKeys.Ascending(x => x.CreatedAt);
+                var indexOptions = new CreateIndexOptions { ExpireAfter = TimeSpan.FromHours(36) };
+                await matchesCollection.Indexes.CreateOneAsync(
+                    new CreateIndexModel<Model.EnrichedMatch>(indexKeysDefinition, indexOptions),
+                    cancellationToken: stoppingToken);
+
                 // 1) Fetch all upcoming matches
                 if (matchService == null) continue;
                 var matchesResult = await matchService.GetUpcomingMatchesAsync();
-                
+
                 // 2) Check if the result is Ok<JsonDocument>
                 if (matchesResult is Ok<JsonDocument> okResult && okResult.Value is not null)
                 {
@@ -88,7 +95,7 @@ public class UpcomingMatchBackgroundService(
                             try
                             {
                                 // 8) Enrich matches in the current batch
-                                var enrichmentTasks = matchBatch.Select(m => 
+                                var enrichmentTasks = matchBatch.Select(m =>
                                     EnrichMatchAsync(m, matchService));
                                 var enrichedMatches = await Task.WhenAll(enrichmentTasks);
 
@@ -166,9 +173,9 @@ public class UpcomingMatchBackgroundService(
                 retryCount++;
                 if (retryCount > maxRetries)
                 {
-                    logger.LogError(ex, 
-                        "Failed {Operation} after {RetryCount} attempts", 
-                        operationName, 
+                    logger.LogError(ex,
+                        "Failed {Operation} after {RetryCount} attempts",
+                        operationName,
                         retryCount);
                     throw;
                 }
@@ -247,14 +254,16 @@ public class UpcomingMatchBackgroundService(
     {
         var enrichedMatch = new Model.EnrichedMatch
         {
+            Id = ObjectId.GenerateNewId(),
             MatchId = match.Id.ToString(),
             SeasonId = match.SeasonId.ToString(),
             Team1Id = match.Teams.Home.Id.ToString(),
             Team2Id = match.Teams.Away.Id.ToString(),
-            CoreMatchData = JsonSerializer.Serialize(match)
+            CoreMatchData = JsonSerializer.Serialize(match),
+            CreatedAt = DateTime.UtcNow
         };
 
-        // Group 1: Essential match information (always fetched first)
+        // Group 1: Essential match information
         await FetchEssentialMatchInfo(matchService, enrichedMatch);
         await AddHumanLikeDelay(500, 1000);
 
@@ -276,8 +285,46 @@ public class UpcomingMatchBackgroundService(
 
         // Group 6: Additional content and metadata
         await FetchAdditionalContent(matchService, enrichedMatch);
+        await AddHumanLikeDelay(400, 800);
+
+        // Group 7: Extended statistics
+        await FetchExtendedStats(matchService, enrichedMatch);
 
         return enrichedMatch;
+    }
+
+    private async Task FetchExtendedStats(
+        SportRadarService matchService,
+        Model.EnrichedMatch enrichedMatch)
+    {
+        var tasks = new Dictionary<string, Task<IResult>>
+        {
+            {
+                "TeamScoringConceding",
+                matchService.GetStatsSeasonTeamscoringConcedingAsync(enrichedMatch.SeasonId, enrichedMatch.Team1Id)
+            },
+            { "Team1LastX", matchService.GetTeamLastXExtendedAsync(enrichedMatch.Team1Id) },
+            { "Team2LastX", matchService.GetTeamLastXExtendedAsync(enrichedMatch.Team2Id) },
+            { "Team1NextX", matchService.GetTeamNextXAsync(enrichedMatch.Team1Id) },
+            { "Team2NextX", matchService.GetTeamNextXAsync(enrichedMatch.Team2Id) },
+            { "MatchForm", matchService.GetStatsMatchFormAsync(enrichedMatch.MatchId) },
+            { "TableSlice", matchService.GetStatsSeasonMatchTableSpliceAsync(enrichedMatch.SeasonId) },
+            { "SeasonGoals", matchService.GetSeasonGoalsAsync(enrichedMatch.SeasonId) },
+            { "TopCards", matchService.GetSeasonTopCardsAsync(enrichedMatch.SeasonId) }
+        };
+
+        foreach (var task in tasks.OrderBy(_ => Random.Next()))
+        {
+            var result = await task.Value;
+            if (result is Ok<JsonDocument> okResult)
+            {
+                enrichedMatch.GetType().GetProperty(task.Key)?.SetValue(
+                    enrichedMatch,
+                    okResult.Value?.RootElement.GetRawText());
+            }
+
+            await AddHumanLikeDelay(300, 500);
+        }
     }
 
     private async Task FetchEssentialMatchInfo(
@@ -300,6 +347,7 @@ public class UpcomingMatchBackgroundService(
                     enrichedMatch,
                     okResult.Value?.RootElement.GetRawText());
             }
+
             await AddHumanLikeDelay(200, 400);
         }
     }
@@ -312,7 +360,7 @@ public class UpcomingMatchBackgroundService(
         {
             { "DynamicTable", matchService.GetSeasonDynamicTableAsync(enrichedMatch.SeasonId) },
             { "FormTable", matchService.GetStatsFormTableAsync(enrichedMatch.SeasonId) },
-            { "LiveTable", matchService.GetSeasonLiveTableAsync(enrichedMatch.SeasonId) },
+            { "SeasonLiveTable", matchService.GetSeasonLiveTableAsync(enrichedMatch.SeasonId) },
             { "Tables", matchService.GetSeasonTablesAsync(enrichedMatch.SeasonId) }
         };
 
@@ -325,6 +373,7 @@ public class UpcomingMatchBackgroundService(
                     enrichedMatch,
                     okResult.Value?.RootElement.GetRawText());
             }
+
             await AddHumanLikeDelay(300, 500);
         }
     }
@@ -341,7 +390,7 @@ public class UpcomingMatchBackgroundService(
             { "TeamSquad2", matchService.GetStatsTeamSquadAsync(enrichedMatch.Team2Id) },
             { "LastXStatsTeam1", matchService.GetTeamLastXAsync(enrichedMatch.Team1Id) },
             { "LastXStatsTeam2", matchService.GetTeamLastXAsync(enrichedMatch.Team2Id) },
-            { "VersusRecentStats", matchService.GetTeamVersusRecentAsync(enrichedMatch.Team1Id, enrichedMatch.Team2Id) }
+            { "TeamVersusRecent", matchService.GetTeamVersusRecentAsync(enrichedMatch.Team1Id, enrichedMatch.Team2Id) }
         };
 
         foreach (var task in tasks.OrderBy(_ => Random.Next()))
@@ -353,6 +402,7 @@ public class UpcomingMatchBackgroundService(
                     enrichedMatch,
                     okResult.Value?.RootElement.GetRawText());
             }
+
             await AddHumanLikeDelay(300, 500);
         }
     }
@@ -364,12 +414,22 @@ public class UpcomingMatchBackgroundService(
         var tasks = new Dictionary<string, Task<IResult>>
         {
             { "OverUnderStats", matchService.GetStatsSeasonOverUnderAsync(enrichedMatch.SeasonId) },
-            { "TeamPositionHistory", matchService.GetStatsSeasonTeamPositionHistoryAsync(enrichedMatch.SeasonId, enrichedMatch.Team1Id, enrichedMatch.Team2Id) },
-            { "TeamFixtures", matchService.GetStatsSeasonTeamFixturesAsync(enrichedMatch.SeasonId, enrichedMatch.Team1Id) },
-            { "TeamDisciplinary", matchService.GetStatsSeasonTeamDisciplinaryAsync(enrichedMatch.SeasonId, enrichedMatch.Team1Id) },
+            {
+                "TeamPositionHistory",
+                matchService.GetStatsSeasonTeamPositionHistoryAsync(enrichedMatch.SeasonId, enrichedMatch.Team1Id,
+                    enrichedMatch.Team2Id)
+            },
+            {
+                "TeamFixtures",
+                matchService.GetStatsSeasonTeamFixturesAsync(enrichedMatch.SeasonId, enrichedMatch.Team1Id)
+            },
+            {
+                "TeamDisciplinary",
+                matchService.GetStatsSeasonTeamDisciplinaryAsync(enrichedMatch.SeasonId, enrichedMatch.Team1Id)
+            },
             { "Fixtures", matchService.GetStatsSeasonFixturesAsync(enrichedMatch.SeasonId) },
             { "UniqueTeamStats", matchService.GetStatsSeasonUniqueTeamStatsAsync(enrichedMatch.SeasonId) },
-            { "TopGoals", matchService.GetStatsSeasonTopGoalsAsync(enrichedMatch.SeasonId) }
+            { "SeasonTopGoals", matchService.GetStatsSeasonTopGoalsAsync(enrichedMatch.SeasonId) }
         };
 
         foreach (var task in tasks.OrderBy(_ => Random.Next()))
@@ -381,6 +441,7 @@ public class UpcomingMatchBackgroundService(
                     enrichedMatch,
                     okResult.Value?.RootElement.GetRawText());
             }
+
             await AddHumanLikeDelay(300, 500);
         }
     }
@@ -391,11 +452,11 @@ public class UpcomingMatchBackgroundService(
     {
         var tasks = new Dictionary<string, Task<IResult>>
         {
-            { "BookmakerOdds", matchService.GetMatchOddsAsync(enrichedMatch.MatchId) },
+            { "MatchOdds", matchService.GetMatchOddsAsync(enrichedMatch.MatchId) },
             { "MatchInsights", matchService.GetMatchInsightsAsync(enrichedMatch.MatchId) },
             { "MatchSituation", matchService.GetMatchSituationAsync(enrichedMatch.MatchId) },
             { "MatchTimeline", matchService.GetMatchTimelineAsync(enrichedMatch.MatchId) },
-            { "TimelineDelta", matchService.GetMatchTimelineDeltaAsync(enrichedMatch.MatchId) },
+            { "MatchTimelineDelta", matchService.GetMatchTimelineDeltaAsync(enrichedMatch.MatchId) },
             { "CupBrackets", matchService.GetBracketsAsync(enrichedMatch.MatchId) }
         };
 
@@ -408,6 +469,7 @@ public class UpcomingMatchBackgroundService(
                     enrichedMatch,
                     okResult.Value?.RootElement.GetRawText());
             }
+
             await AddHumanLikeDelay(300, 500);
         }
     }
@@ -418,10 +480,10 @@ public class UpcomingMatchBackgroundService(
     {
         var tasks = new Dictionary<string, Task<IResult>>
         {
-            { "Phrases", matchService.GetMatchPhrasesAsync(enrichedMatch.MatchId) },
-            { "PhraseDelta", matchService.GetMatchPhrasesDeltaAsync(enrichedMatch.MatchId) },
-            { "FunFacts", matchService.GetMatchFunFactsAsync(enrichedMatch.MatchId) },
-            { "MetaData", matchService.GetSeasonMetadataAsync(enrichedMatch.SeasonId) }
+            { "MatchPhrases", matchService.GetMatchPhrasesAsync(enrichedMatch.MatchId) },
+            { "MatchPhrasesDelta", matchService.GetMatchPhrasesDeltaAsync(enrichedMatch.MatchId) },
+            { "MatchFunFacts", matchService.GetMatchFunFactsAsync(enrichedMatch.MatchId) },
+            { "SeasonMeta", matchService.GetSeasonMetadataAsync(enrichedMatch.SeasonId) }
         };
 
         foreach (var task in tasks.OrderBy(_ => Random.Next()))
@@ -433,6 +495,7 @@ public class UpcomingMatchBackgroundService(
                     enrichedMatch,
                     okResult.Value?.RootElement.GetRawText());
             }
+
             await AddHumanLikeDelay(300, 500);
         }
     }

@@ -1,7 +1,13 @@
+using MongoDB.Bson;
+using MongoDB.Bson.Serialization.Attributes;
+
 namespace fredapi.Model;
 
 public class EnrichedMatch
 {
+    [BsonId]
+    public ObjectId Id { get; set; }
+    public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
     public string? MatchId { get; set; } = string.Empty;
     public string? SeasonId { get; set; } = string.Empty;
     public string? Team1Id { get; set; } = string.Empty;

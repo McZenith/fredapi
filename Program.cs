@@ -20,7 +20,7 @@ builder.Services.AddCors(options =>
     {
         policy.AllowAnyHeader()
             .AllowAnyMethod()
-            .SetIsOriginAllowed((host) => true)
+            .SetIsOriginAllowed((_) => true)
             .AllowCredentials()
             .WithExposedHeaders("Content-Disposition"); // Add if needed
     });
@@ -92,5 +92,8 @@ var sportRadarGroup = app.MapGroup("/api").WithOpenApi().WithTags("SportRadar");
 sportRadarGroup.MapSeasonRoutes();
 sportRadarGroup.MapTeamRoutes();
 sportRadarGroup.MapMatchRoutes();
+sportRadarGroup.MapMatchesEndpoints();
+sportRadarGroup.MapMatchOddsEndpoint();
+sportRadarGroup.MapMatchDetailsEndpoint();
 
 app.Run();
