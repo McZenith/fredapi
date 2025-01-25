@@ -22,20 +22,31 @@ public class SportRadarTokenService : ISportRadarTokenService
     public SportRadarTokenService(ILogger<SportRadarTokenService> logger)
     {
         _logger = logger;
-        
+
         var options = new ChromeOptions();
-        options.AddArgument("--no-sandbox");
-        options.AddArgument("--disable-dev-shm-usage");
-        options.AddArgument("--headless");
-        // Additional options to better emulate a real browser
-        options.AddArgument("--window-size=1920,1080");
-        options.AddArgument("--disable-gpu");
-        options.AddArgument("--ignore-certificate-errors");
-        options.AddArgument("--enable-javascript");
-        // Set a proper user agent
-        options.AddArgument("--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36");
-        
-        _driver = new ChromeDriver(options);
+        options.AddArguments(
+            "--no-sandbox",
+            "--disable-dev-shm-usage",
+            "--headless",
+            "--window-size=1920,1080",
+            "--disable-gpu",
+            "--ignore-certificate-errors",
+            "--enable-javascript",
+            "--disable-extensions",
+            "--disable-setuid-sandbox",
+            "--disable-web-security",
+            "--blink-settings=imagesEnabled=false",
+            "--memory-pressure-off",
+            "--js-flags=--max-old-space-size=128",
+            "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        );
+
+        options.PageLoadStrategy = PageLoadStrategy.Eager;
+
+        var service = ChromeDriverService.CreateDefaultService();
+        service.HideCommandPromptWindow = true;
+
+        _driver = new ChromeDriver(service, options);
     }
 
     public async Task<string> ExtractAuthTokenAsync()
