@@ -1,0 +1,9 @@
+{
+  "runtimeOptions": {
+    "configProperties": {
+      "System.GC.HeapHardLimit": "800000000",
+      "System.GC.HeapHardLimitPercent": 65,
+      "System.GC.Server": true
+    }
+  }
+}
