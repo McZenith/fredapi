@@ -1,1 +1,1 @@
-fredapi cd bin/publish; CHROME_BIN=/app/.apt/usr/bin/google-chrome DOTNET_GCHeapHardLimit=150000000 DOTNET_GCHeapHardLimitPercent=30 DOTNET_SERVER_GC=0 NEW_RELIC_DISTRIBUTED_TRACING_ENABLED=true ./fredapi --urls http://*:$PORT
+fredapi  web: cd bin/publish; CHROME_BIN=/app/.apt/usr/bin/google-chrome DOTNET_GCHeapHardLimit=150000000 DOTNET_GCHeapHardLimitPercent=30 DOTNET_SERVER_GC=0 NEW_RELIC_DISTRIBUTED_TRACING_ENABLED=true ./fredapi --urls http://*:$PORT
