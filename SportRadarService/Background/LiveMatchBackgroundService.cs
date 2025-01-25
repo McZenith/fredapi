@@ -18,10 +18,10 @@ public class LiveMatchBackgroundService(
     IHubContext<LiveMatchHub> hubContext)
     : BackgroundService
 {
-    private const int BatchSize = 50;
-    private const int DelaySecs = 20;
+    private const int BatchSize = 10;
+    private const int DelaySecs = 1;
     private static readonly Random Random = new();
-    private bool _isInitialFetch;
+    private bool isInitialFetch;
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
@@ -29,10 +29,10 @@ public class LiveMatchBackgroundService(
         {
             try
             {
-                _isInitialFetch = string.IsNullOrWhiteSpace(TokenService.TokenService.ApiToken);
+                isInitialFetch = string.IsNullOrWhiteSpace(TokenService.TokenService.ApiToken);
                 using var scope = serviceProvider.CreateScope();
 
-                if (_isInitialFetch)
+                if (isInitialFetch)
                 {
                     var tokenService = scope.ServiceProvider.GetRequiredService<ITokenService>();
                     await tokenService.GetSportRadarToken();
@@ -48,7 +48,7 @@ public class LiveMatchBackgroundService(
             {
                 try
                 {
-                    await Task.Delay(TimeSpan.FromSeconds(DelaySecs), stoppingToken);
+                    await Task.Delay(TimeSpan.FromMinutes(DelaySecs), stoppingToken);
                 }
                 catch (OperationCanceledException)
                 {

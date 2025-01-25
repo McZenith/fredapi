@@ -16,6 +16,8 @@ builder.Services.AddLogging(logging =>
 builder.Services.AddSignalR(options =>
 {
     options.EnableDetailedErrors = true;
+    options.KeepAliveInterval = TimeSpan.FromSeconds(15);      // Matches your client KEEP_ALIVE_INTERVAL
+    options.ClientTimeoutInterval = TimeSpan.FromSeconds(30);   // Should be 2x KeepAliveInterval
     options.HandshakeTimeout = TimeSpan.FromSeconds(15);       // Good for most network conditions
     options.MaximumReceiveMessageSize = 102400;                // 100KB - adjust based on your payload size
     options.StreamBufferCapacity = 10;                         // Good for your batch size
