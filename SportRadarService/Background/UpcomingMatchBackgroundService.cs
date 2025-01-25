@@ -452,7 +452,7 @@ public class UpcomingMatchBackgroundService(
     {
         var tasks = new Dictionary<string, Task<IResult>>
         {
-            { "MatchOdds", matchService.GetMatchOddsAsync(enrichedMatch.MatchId) },
+            { "BookmakerOdds", matchService.GetMatchOddsAsync(enrichedMatch.MatchId) },
             { "MatchInsights", matchService.GetMatchInsightsAsync(enrichedMatch.MatchId) },
             { "MatchSituation", matchService.GetMatchSituationAsync(enrichedMatch.MatchId) },
             { "MatchTimeline", matchService.GetMatchTimelineAsync(enrichedMatch.MatchId) },

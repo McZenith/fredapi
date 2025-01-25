@@ -219,7 +219,7 @@ public class LiveMatchBackgroundService(
         var criticalTasks = new Dictionary<string, Task<IResult>>
         {
             { "MatchInfo", matchService.GetMatchInfoAsync(enrichedMatch.MatchId) },
-            { "TimelineDelta", matchService.GetMatchTimelineDeltaAsync(enrichedMatch.MatchId) },
+            { "MatchTimelineDelta", matchService.GetMatchTimelineDeltaAsync(enrichedMatch.MatchId) },
             { "MatchTimeline", matchService.GetMatchTimelineAsync(enrichedMatch.MatchId) }
         };
 
@@ -247,9 +247,9 @@ public class LiveMatchBackgroundService(
         {
             { "MatchSituation", matchService.GetMatchSituationAsync(enrichedMatch.MatchId) },
             { "MatchDetailsExtended", matchService.GetMatchDetailsExtendedAsync(enrichedMatch.MatchId) },
-            { "FormTable", matchService.GetStatsMatchFormAsync(enrichedMatch.MatchId) },
-            { "LiveTable", matchService.GetSeasonLiveTableAsync(enrichedMatch.SeasonId) },
-            { "MetaData", matchService.GetSeasonMetadataAsync(enrichedMatch.SeasonId) }
+            { "MatchForm", matchService.GetStatsMatchFormAsync(enrichedMatch.MatchId) },
+            { "SeasonLiveTable", matchService.GetSeasonLiveTableAsync(enrichedMatch.SeasonId) },
+            { "SeasonMeta", matchService.GetSeasonMetadataAsync(enrichedMatch.SeasonId) }
         };
 
         foreach (var task in statisticsTasks.OrderBy(_ => Random.Next()))
@@ -300,9 +300,9 @@ public class LiveMatchBackgroundService(
         var h2hTasks = new Dictionary<string, Task<IResult>>
         {
             { "BookmakerOdds", matchService.GetMatchOddsAsync(enrichedMatch.MatchId) },
-            { "TopGoals", matchService.GetStatsSeasonTopGoalsAsync(enrichedMatch.SeasonId) },
+            { "SeasonTopGoals", matchService.GetStatsSeasonTopGoalsAsync(enrichedMatch.SeasonId) },
             {
-                "VersusRecentStats", matchService.GetTeamVersusRecentAsync(enrichedMatch.Team1Id, enrichedMatch.Team2Id)
+                "TeamVersusRecent", matchService.GetTeamVersusRecentAsync(enrichedMatch.Team1Id, enrichedMatch.Team2Id)
             },
             { "LastXStatsTeam1", matchService.GetTeamLastXAsync(enrichedMatch.Team1Id) },
             { "LastXStatsTeam2", matchService.GetTeamLastXAsync(enrichedMatch.Team2Id) },
@@ -356,9 +356,9 @@ public class LiveMatchBackgroundService(
     {
         var timelineTasks = new Dictionary<string, Task<IResult>>
         {
-            { "Phrases", matchService.GetMatchPhrasesAsync(enrichedMatch.MatchId) },
-            { "FunFacts", matchService.GetMatchFunFactsAsync(enrichedMatch.MatchId) },
-            { "PhraseDelta", matchService.GetMatchPhrasesDeltaAsync(enrichedMatch.MatchId) },
+            { "MatchPhrases", matchService.GetMatchPhrasesAsync(enrichedMatch.MatchId) },
+            { "MatchFunFacts", matchService.GetMatchFunFactsAsync(enrichedMatch.MatchId) },
+            { "MatchPhrasesDelta", matchService.GetMatchPhrasesDeltaAsync(enrichedMatch.MatchId) },
         };
 
         foreach (var task in timelineTasks.OrderBy(_ => Random.Next()))
@@ -392,22 +392,22 @@ public class LiveMatchBackgroundService(
                     Team2 = match.Team2Id,
                     CoreData = JsonSerializer.Deserialize<dynamic>(match.CoreMatchData ?? "{}"),
                     MatchInfo = JsonSerializer.Deserialize<dynamic>(match.MatchInfo ?? "{}"),
-                    MetaData = JsonSerializer.Deserialize<dynamic>(match.MetaData ?? "{}"),
+                    SeasonMeta = JsonSerializer.Deserialize<dynamic>(match.SeasonMeta ?? "{}"),
                     MatchTimeline = JsonSerializer.Deserialize<dynamic>(match.MatchTimeline ?? "{}"),
-                    TimelineDelta = JsonSerializer.Deserialize<dynamic>(match.TimelineDelta ?? "{}"),
+                    MatchTimelineDelta = JsonSerializer.Deserialize<dynamic>(match.MatchTimelineDelta ?? "{}"),
                     MatchDetailsExtended = JsonSerializer.Deserialize<dynamic>(match.MatchDetailsExtended ?? "{}"),
                     MatchSquads = JsonSerializer.Deserialize<dynamic>(match.MatchSquads ?? "{}"),
                     MatchSituation = JsonSerializer.Deserialize<dynamic>(match.MatchSituation ?? "{}"),
                     FormTable = JsonSerializer.Deserialize<dynamic>(match.FormTable ?? "{}"),
-                    LiveTable = JsonSerializer.Deserialize<dynamic>(match.LiveTable ?? "{}"),
+                    SeasonLiveTable = JsonSerializer.Deserialize<dynamic>(match.SeasonLiveTable ?? "{}"),
                     BookmakerOdds = JsonSerializer.Deserialize<dynamic>(match.BookmakerOdds ?? "{}"),
-                    TopGoals = JsonSerializer.Deserialize<dynamic>(match.TopGoals ?? "{}"),
+                    SeasonTopGoals = JsonSerializer.Deserialize<dynamic>(match.SeasonTopGoals ?? "{}"),
                     VersusRecentStats = JsonSerializer.Deserialize<dynamic>(match.VersusRecentStats ?? "{}"),
                     LastXStatsTeam1 = JsonSerializer.Deserialize<dynamic>(match.LastXStatsTeam1 ?? "{}"),
                     LastXStatsTeam2 = JsonSerializer.Deserialize<dynamic>(match.LastXStatsTeam2 ?? "{}"),
-                    Phrases = JsonSerializer.Deserialize<dynamic>(match.Phrases ?? "{}"),
-                    FunFacts = JsonSerializer.Deserialize<dynamic>(match.FunFacts ?? "{}"),
-                    PhraseDelta = JsonSerializer.Deserialize<dynamic>(match.PhraseDelta ?? "{}"),
+                    MatchPhrases = JsonSerializer.Deserialize<dynamic>(match.MatchPhrases ?? "{}"),
+                    MatchFunFacts = JsonSerializer.Deserialize<dynamic>(match.MatchFunFacts ?? "{}"),
+                    MatchPhrasesDelta = JsonSerializer.Deserialize<dynamic>(match.MatchPhrasesDelta ?? "{}"),
                     CupBrackets = JsonSerializer.Deserialize<dynamic>(match.CupBrackets ?? "{}"),
                     DynamicTable = JsonSerializer.Deserialize<dynamic>(match.DynamicTable ?? "{}"),
                     LastUpdated = DateTime.UtcNow
