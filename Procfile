@@ -1,0 +1,1 @@
+web: DOTNET_GCHeapHardLimit=800000000 dotnet run
