@@ -1,1 +1,1 @@
-fredapi cd bin/publish; CHROME_BIN=/app/.apt/usr/bin/google-chrome DOTNET_GCHeapHardLimit=200000000 DOTNET_GCHeapHardLimitPercent=40 DOTNET_SERVER_GC=0 ./fredapi --urls http://*:$PORT
+fredapi cd bin/publish; DOTNET_GCHeapHardLimit=200000000 DOTNET_GCHeapHardLimitPercent=40 DOTNET_SERVER_GC=0 ./fredapi --urls http://*:$PORT
