@@ -1,1 +1,1 @@
-web: DOTNET_GCHeapHardLimit=800000000 dotnet run
+web: DOTNET_GCHeapHardLimit=500000000 dotnet fredapi.dll --urls=http://+:$PORT
