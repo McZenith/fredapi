@@ -398,7 +398,7 @@ public class LiveMatchBackgroundService(
                     MatchDetailsExtended = JsonSerializer.Deserialize<dynamic>(match.MatchDetailsExtended ?? "{}"),
                     MatchSquads = JsonSerializer.Deserialize<dynamic>(match.MatchSquads ?? "{}"),
                     MatchSituation = JsonSerializer.Deserialize<dynamic>(match.MatchSituation ?? "{}"),
-                    FormTable = JsonSerializer.Deserialize<dynamic>(match.FormTable ?? "{}"),
+                    MatchForm = JsonSerializer.Deserialize<dynamic>(match.MatchForm ?? "{}"),
                     SeasonLiveTable = JsonSerializer.Deserialize<dynamic>(match.SeasonLiveTable ?? "{}"),
                     BookmakerOdds = JsonSerializer.Deserialize<dynamic>(match.BookmakerOdds ?? "{}"),
                     SeasonTopGoals = JsonSerializer.Deserialize<dynamic>(match.SeasonTopGoals ?? "{}"),
