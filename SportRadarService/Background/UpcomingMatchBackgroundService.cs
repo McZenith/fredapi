@@ -14,7 +14,7 @@ public class UpcomingMatchBackgroundService(
     : BackgroundService
 {
     private static readonly Random Random = new();
-    private const int BatchSize = 50;
+    private readonly int _batchSize = new Random().Next(50,100);
     private const int MaxRetries = 3;
     private const int RetryDelayMs = 1000;
 
@@ -85,10 +85,10 @@ public class UpcomingMatchBackgroundService(
                             "Found {TotalMatches} matches, {NewMatches} need enrichment. Processing in batches of {BatchSize}",
                             allMatches.Count,
                             matchesToEnrich.Count,
-                            BatchSize);
+                            _batchSize);
 
                         // 7) Process new matches in batches
-                        foreach (var matchBatch in matchesToEnrich.Chunk(BatchSize))
+                        foreach (var matchBatch in matchesToEnrich.Chunk(_batchSize))
                         {
                             if (stoppingToken.IsCancellationRequested) break;
 
