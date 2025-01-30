@@ -78,7 +78,7 @@ public class SportRadarTokenService : ISportRadarTokenService, IDisposable
             var urls = new[]
             {
                 "https://www.sportybet.com/ng/sport/football/live/Argentina/Primera_LFP/CA_Belgrano_vs_CA_Huracan/sr:match:56742701",
-                "https://www.sportybet.com/ng/sport/football/live/Italy/Serie_C,_Group_C/Potenza_Calcio_vs_Audace_Cerignola/sr:match:51548795?navigatedFrom=live"
+                "https://www.sportybet.com/ng/sport/football/live/Italy/Serie_C,_Group_C/Potenza_Calcio_vs_Audace_Cerignola/sr:match:51548795"
             };
 
             foreach (var url in urls)
