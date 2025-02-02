@@ -360,7 +360,6 @@ public class UpcomingMatchBackgroundService(
         {
             { "DynamicTable", matchService.GetSeasonDynamicTableAsync(enrichedMatch.SeasonId) },
             { "FormTable", matchService.GetStatsFormTableAsync(enrichedMatch.SeasonId) },
-            { "SeasonLiveTable", matchService.GetSeasonLiveTableAsync(enrichedMatch.SeasonId) },
             { "Tables", matchService.GetSeasonTablesAsync(enrichedMatch.SeasonId) }
         };
 
@@ -454,9 +453,6 @@ public class UpcomingMatchBackgroundService(
         {
             { "BookmakerOdds", matchService.GetMatchOddsAsync(enrichedMatch.MatchId) },
             { "MatchInsights", matchService.GetMatchInsightsAsync(enrichedMatch.MatchId) },
-            { "MatchSituation", matchService.GetMatchSituationAsync(enrichedMatch.MatchId) },
-            { "MatchTimeline", matchService.GetMatchTimelineAsync(enrichedMatch.MatchId) },
-            { "MatchTimelineDelta", matchService.GetMatchTimelineDeltaAsync(enrichedMatch.MatchId) },
             { "CupBrackets", matchService.GetBracketsAsync(enrichedMatch.MatchId) }
         };
 
@@ -480,8 +476,6 @@ public class UpcomingMatchBackgroundService(
     {
         var tasks = new Dictionary<string, Task<IResult>>
         {
-            { "MatchPhrases", matchService.GetMatchPhrasesAsync(enrichedMatch.MatchId) },
-            { "MatchPhrasesDelta", matchService.GetMatchPhrasesDeltaAsync(enrichedMatch.MatchId) },
             { "MatchFunFacts", matchService.GetMatchFunFactsAsync(enrichedMatch.MatchId) },
             { "SeasonMeta", matchService.GetSeasonMetadataAsync(enrichedMatch.SeasonId) }
         };
