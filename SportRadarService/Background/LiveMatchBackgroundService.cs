@@ -196,6 +196,10 @@ public class LiveMatchBackgroundService(
             await FetchHeadToHeadComparisons(matchService, enrichedMatch, cancellationToken);
             await AddHumanLikeDelay(300, 500);
 
+            // Group 5: Standing and Tournament Information
+            await FetchStandingAndTournament(matchService, enrichedMatch, cancellationToken);
+            await AddHumanLikeDelay(300, 500);
+
             // Group 6: Timeline and Commentary
             await FetchTimelineAndCommentary(matchService, enrichedMatch, cancellationToken);
 
@@ -246,6 +250,7 @@ public class LiveMatchBackgroundService(
             { "MatchDetailsExtended", matchService.GetMatchDetailsExtendedAsync(enrichedMatch.MatchId) },
             { "MatchForm", matchService.GetStatsMatchFormAsync(enrichedMatch.MatchId) },
             { "SeasonLiveTable", matchService.GetSeasonLiveTableAsync(enrichedMatch.SeasonId) },
+            { "SeasonMeta", matchService.GetSeasonMetadataAsync(enrichedMatch.SeasonId) }
         };
 
         foreach (var task in statisticsTasks.OrderBy(_ => Random.Next()))
@@ -296,9 +301,41 @@ public class LiveMatchBackgroundService(
         var h2hTasks = new Dictionary<string, Task<IResult>>
         {
             { "BookmakerOdds", matchService.GetMatchOddsAsync(enrichedMatch.MatchId) },
+            { "SeasonTopGoals", matchService.GetStatsSeasonTopGoalsAsync(enrichedMatch.SeasonId) },
+            {
+                "TeamVersusRecent", matchService.GetTeamVersusRecentAsync(enrichedMatch.Team1Id, enrichedMatch.Team2Id)
+            },
+            { "LastXStatsTeam1", matchService.GetTeamLastXAsync(enrichedMatch.Team1Id) },
+            { "LastXStatsTeam2", matchService.GetTeamLastXAsync(enrichedMatch.Team2Id) },
         };
 
         foreach (var task in h2hTasks.OrderBy(_ => Random.Next()))
+        {
+            if (cancellationToken.IsCancellationRequested) break;
+            var result = await task.Value;
+            if (result is Ok<JsonDocument> okResult)
+            {
+                enrichedMatch.GetType().GetProperty(task.Key)?.SetValue(
+                    enrichedMatch,
+                    okResult.Value?.RootElement.GetRawText());
+            }
+
+            await AddHumanLikeDelay(300, 500);
+        }
+    }
+
+    private async Task FetchStandingAndTournament(
+        SportRadarService matchService,
+        EnrichedMatch enrichedMatch,
+        CancellationToken cancellationToken)
+    {
+        var standingTasks = new Dictionary<string, Task<IResult>>
+        {
+            { "CupBrackets", matchService.GetBracketsAsync(enrichedMatch.SeasonId) },
+            { "DynamicTable", matchService.GetSeasonDynamicTableAsync(enrichedMatch.SeasonId) },
+        };
+
+        foreach (var task in standingTasks.OrderBy(_ => Random.Next()))
         {
             if (cancellationToken.IsCancellationRequested) break;
             var result = await task.Value;
@@ -356,6 +393,7 @@ public class LiveMatchBackgroundService(
                     Team2 = match.Team2Id,
                     CoreData = JsonSerializer.Deserialize<dynamic>(match.CoreMatchData ?? "{}"),
                     MatchInfo = JsonSerializer.Deserialize<dynamic>(match.MatchInfo ?? "{}"),
+                    SeasonMeta = JsonSerializer.Deserialize<dynamic>(match.SeasonMeta ?? "{}"),
                     MatchTimeline = JsonSerializer.Deserialize<dynamic>(match.MatchTimeline ?? "{}"),
                     MatchTimelineDelta = JsonSerializer.Deserialize<dynamic>(match.MatchTimelineDelta ?? "{}"),
                     MatchDetailsExtended = JsonSerializer.Deserialize<dynamic>(match.MatchDetailsExtended ?? "{}"),
@@ -364,9 +402,15 @@ public class LiveMatchBackgroundService(
                     MatchForm = JsonSerializer.Deserialize<dynamic>(match.MatchForm ?? "{}"),
                     SeasonLiveTable = JsonSerializer.Deserialize<dynamic>(match.SeasonLiveTable ?? "{}"),
                     BookmakerOdds = JsonSerializer.Deserialize<dynamic>(match.BookmakerOdds ?? "{}"),
+                    SeasonTopGoals = JsonSerializer.Deserialize<dynamic>(match.SeasonTopGoals ?? "{}"),
+                    TeamVersusRecent = JsonSerializer.Deserialize<dynamic>(match.TeamVersusRecent ?? "{}"),
+                    LastXStatsTeam1 = JsonSerializer.Deserialize<dynamic>(match.LastXStatsTeam1 ?? "{}"),
+                    LastXStatsTeam2 = JsonSerializer.Deserialize<dynamic>(match.LastXStatsTeam2 ?? "{}"),
                     MatchPhrases = JsonSerializer.Deserialize<dynamic>(match.MatchPhrases ?? "{}"),
                     MatchFunFacts = JsonSerializer.Deserialize<dynamic>(match.MatchFunFacts ?? "{}"),
                     MatchPhrasesDelta = JsonSerializer.Deserialize<dynamic>(match.MatchPhrasesDelta ?? "{}"),
+                    CupBrackets = JsonSerializer.Deserialize<dynamic>(match.CupBrackets ?? "{}"),
+                    DynamicTable = JsonSerializer.Deserialize<dynamic>(match.DynamicTable ?? "{}"),
                     LastUpdated = DateTime.UtcNow
                 })
                 .ToList();
