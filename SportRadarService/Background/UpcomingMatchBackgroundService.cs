@@ -260,7 +260,8 @@ public class UpcomingMatchBackgroundService(
             Team1Id = match.Teams.Home.Id.ToString(),
             Team2Id = match.Teams.Away.Id.ToString(),
             CoreMatchData = JsonSerializer.Serialize(match),
-            CreatedAt = DateTime.UtcNow
+            CreatedAt = DateTime.UtcNow,
+            MatchTime = DateTime.Parse(match.Dt.Date)
         };
 
         // Group 1: Essential match information

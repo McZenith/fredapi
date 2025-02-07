@@ -18,8 +18,21 @@ public static class MatchesEndpoints
             {
                 var collection = mongoDbService.GetCollection<EnrichedMatch>("DailyMatches");
                 
-                // Ensure index exists
-                var indexKeysDefinition = Builders<EnrichedMatch>.IndexKeys.Descending(x => x.MatchId);
+                // Get today's date (start and end)
+                var today = DateTime.UtcNow.Date;
+                var tomorrow = today.AddDays(1);
+
+                // Create filter for today's matches
+                var filter = Builders<EnrichedMatch>.Filter.And(
+                    Builders<EnrichedMatch>.Filter.Gte(x => x.MatchTime, today),
+                    Builders<EnrichedMatch>.Filter.Lt(x => x.MatchTime, tomorrow)
+                );
+
+                // Create index
+                var indexKeysDefinition = Builders<EnrichedMatch>.IndexKeys
+                    .Ascending(x => x.MatchTime)
+                    .Descending(x => x.MatchId);
+
                 await collection.Indexes.CreateOneAsync(
                     new CreateIndexModel<EnrichedMatch>(indexKeysDefinition),
                     cancellationToken: cancellationToken);
@@ -32,14 +45,14 @@ public static class MatchesEndpoints
                 };
 
                 var matches = await collection
-                    .Find(FilterDefinition<EnrichedMatch>.Empty, findOptions)
+                    .Find(filter, findOptions)
                     .Skip(skip)
                     .Limit(limit)
                     .SortByDescending(x => x.MatchId)
                     .ToListAsync(cancellationToken);
 
                 var count = await collection.CountDocumentsAsync(
-                    Builders<EnrichedMatch>.Filter.Empty,
+                    filter,
                     new CountOptions { MaxTime = TimeSpan.FromSeconds(30) },
                     cancellationToken);
 

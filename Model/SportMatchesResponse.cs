@@ -184,6 +184,28 @@ public class Tournament
     public List<Match> Matches { get; set; }
 }
 
+public class TimeInfoBig
+{
+    [JsonPropertyName("_doc")]
+    public string Doc { get; set; }
+        
+    [JsonPropertyName("time")]
+    public string Time { get; set; }
+        
+    [JsonPropertyName("date")]
+    public string Date { get; set; }
+        
+    [JsonPropertyName("tz")]
+    public string Tz { get; set; }
+        
+    [JsonPropertyName("tzoffset")]
+    public int TzOffset { get; set; }
+        
+    [JsonPropertyName("uts")]
+    public long Uts { get; set; }
+}
+
+
 public class Match
 {
     [JsonPropertyName("_doc")]
@@ -191,6 +213,9 @@ public class Match
     
     [JsonPropertyName("_id")]
     public int Id { get; set; }
+    
+    [JsonPropertyName("_dt")]
+    public TimeInfoBig Dt { get; set; }
     
     [JsonPropertyName("_sid")]
     public int Sid { get; set; }
