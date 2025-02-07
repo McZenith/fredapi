@@ -18,11 +18,14 @@ public static class MatchesEndpoints
             {
                 var collection = mongoDbService.GetCollection<EnrichedMatch>("DailyMatches");
                 
-                // Get today's date (start and end)
+                // Get today's date in UTC, ensuring we match the +00:00 timezone
                 var today = DateTime.UtcNow.Date;
                 var tomorrow = today.AddDays(1);
 
-                // Create filter for today's matches
+                // Log the date range we're querying (for debugging)
+                logger.LogInformation($"Querying matches between {today:yyyy-MM-ddTHH:mm:ss.fffzzz} and {tomorrow:yyyy-MM-ddTHH:mm:ss.fffzzz}");
+
+                // Create filter for today's matches using UTC dates
                 var filter = Builders<EnrichedMatch>.Filter.And(
                     Builders<EnrichedMatch>.Filter.Gte(x => x.MatchTime, today),
                     Builders<EnrichedMatch>.Filter.Lt(x => x.MatchTime, tomorrow)
@@ -51,12 +54,24 @@ public static class MatchesEndpoints
                     .SortByDescending(x => x.MatchId)
                     .ToListAsync(cancellationToken);
 
+                // Log sample dates for verification
+                if (matches.Any())
+                {
+                    logger.LogInformation($"Sample match dates: {string.Join(", ", matches.Take(3).Select(m => m.MatchTime.ToString("yyyy-MM-ddTHH:mm:ss.fffzzz")))}");
+                }
+
                 var count = await collection.CountDocumentsAsync(
                     filter,
                     new CountOptions { MaxTime = TimeSpan.FromSeconds(30) },
                     cancellationToken);
 
-                return Results.Ok(new { total = count, matches });
+                return Results.Ok(new 
+                { 
+                    total = count, 
+                    matches,
+                    queryDate = today.ToString("yyyy-MM-dd"),
+                    matchCount = matches.Count
+                });
             }
             catch (Exception ex)
             {
