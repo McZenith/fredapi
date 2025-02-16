@@ -95,6 +95,72 @@ public partial class ArbitrageLiveMatchBackgroundService
         var margin = (impliedProbabilities.Sum() - 1m) * 100;
         return margin;
     }
+    
+    private bool IsValidMarketOutcomes(string marketDescription, int outcomeCount)
+{
+    return marketDescription.ToLower() switch
+    {
+        // Match Outcomes
+        var m when m.Contains("1x2") || m.Contains("match result") => outcomeCount == 3,
+        var m when m.Contains("double chance") => outcomeCount == 3,
+        var m when m.Contains("draw no bet") || m.Contains("dnb") => outcomeCount == 2,
+        
+        // Goals Markets
+        var m when m.Contains("over/under") || m.Contains("o/u") || m.Contains("total goals") => outcomeCount == 2,
+        var m when m.Contains("alternative total goals") => outcomeCount == 2,
+        var m when m.Contains("team total goals") => outcomeCount == 2,
+        var m when m.Contains("exact goals") => outcomeCount == 2,
+        
+        // Both Teams Markets
+        var m when m.Contains("gg/ng") || m.Contains("btts") || m.Contains("both teams to score") => outcomeCount == 2,
+        var m when m.Contains("btts and over/under") => outcomeCount == 2,
+        var m when m.Contains("btts and match result") => outcomeCount == 3,
+        
+        // Half Markets
+        var m when m.Contains("1st half result") || m.Contains("2nd half result") => outcomeCount == 3,
+        var m when m.Contains("half time/full time") || m.Contains("ht/ft") => outcomeCount == 3,
+        var m when m.Contains("1st half goals") || m.Contains("2nd half goals") => outcomeCount == 2,
+        var m when m.Contains("half with most goals") => outcomeCount == 3,
+        
+        // Asian Markets
+        var m when m.Contains("asian handicap") || m.Contains("ah") => outcomeCount == 2,
+        var m when m.Contains("asian total") => outcomeCount == 2,
+        
+        // Corner Markets
+        var m when m.Contains("corner match") => outcomeCount == 3,
+        var m when m.Contains("total corners") || m.Contains("corner line") => outcomeCount == 2,
+        var m when m.Contains("corner handicap") => outcomeCount == 2,
+        var m when m.Contains("first corner") || m.Contains("last corner") => outcomeCount == 3,
+        
+        // Card Markets
+        var m when m.Contains("total cards") || m.Contains("booking points") => outcomeCount == 2,
+        var m when m.Contains("team cards") => outcomeCount == 2,
+        var m when m.Contains("red card") => outcomeCount == 2,
+        
+        // Score Markets
+        var m when m.Contains("correct score") => outcomeCount == 2,
+        var m when m.Contains("winning margin") => outcomeCount == 3,
+        var m when m.Contains("team to score first") || m.Contains("team to score last") => outcomeCount == 3,
+        var m when m.Contains("clean sheet") => outcomeCount == 2,
+        
+        // Specific Time Period Markets
+        var m when m.Contains("result after") || m.Contains("score after") => outcomeCount == 3,
+        var m when m.Contains("next goal") => outcomeCount == 3,
+        var m when m.Contains("goals in period") => outcomeCount == 2,
+        
+        // Combination Markets
+        var m when m.Contains("result and both teams to score") => outcomeCount == 3,
+        var m when m.Contains("result and total goals") => outcomeCount == 3,
+        var m when m.Contains("score cast") => outcomeCount == 2,
+        
+        // Qualifying/Progress Markets
+        var m when m.Contains("to qualify") || m.Contains("to advance") => outcomeCount == 2,
+        var m when m.Contains("method of victory") => outcomeCount == 3,
+        
+        // Default case for unrecognized markets
+        _ => false
+    };
+}
 
     private (bool hasArbitrage, List<decimal> stakePercentages, decimal profitPercentage) CalculateArbitrageOpportunity(Market market)
     {
@@ -155,8 +221,9 @@ public partial class ArbitrageLiveMatchBackgroundService
                 {
                     // First, create potential markets
                     var potentialMarkets = x.Markets
-                        .Where(m => m.Status != 2 && m.Status != 3)
-                        .Where(m => m.Outcomes.Count is 2 or 3)
+                        .Where(m => m.Status != 2 && m.Status != 3) // Exclude suspended and settled markets
+                        .Where(m => m.Outcomes != null && 
+                                    IsValidMarketOutcomes(m.Desc ?? "", m.Outcomes.Count))
                         .Select(m =>
                         {
                             var market = new Market
@@ -165,16 +232,24 @@ public partial class ArbitrageLiveMatchBackgroundService
                                 Description = m.Desc,
                                 Specifier = m.Specifier,
                                 Outcomes = m.Outcomes
-                                    .Where(o => o.IsActive == 1)
+                                    .Where(o => o != null && o.IsActive == 1 && !string.IsNullOrEmpty(o.Odds))
                                     .Select(o => new Outcome
                                     {
-                                        Id = o.Id,
-                                        Description = o.Desc,
+                                        Id = o.Id ?? "",
+                                        Description = o.Desc ?? "",
                                         Odds = decimal.Parse(o.Odds)
                                     }).ToList()
                             };
 
-                            var (hasArbitrage, stakePercentages, profitPercentage) = CalculateArbitrageOpportunity(market);
+                            // Only proceed if we still have the required number of outcomes after filtering
+                            if (!IsValidMarketOutcomes(market.Description, market.Outcomes.Count))
+                            {
+                                return (market: market, hasArbitrage: false);
+                            }
+
+                            var (hasArbitrage, stakePercentages, profitPercentage) = 
+                                CalculateArbitrageOpportunity(market);
+        
                             if (hasArbitrage)
                             {
                                 // Add stake percentages to outcomes and profit percentage to market
