@@ -21,4 +21,5 @@ public class LiveMatchHub(ILogger<LiveMatchHub> logger) : Hub
     {
         await Clients.All.SendAsync("ReceiveLiveMatches", matches);
     }
+    
 }
