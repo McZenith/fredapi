@@ -11,6 +11,7 @@ public partial class UpcomingArbitrageBackgroundService : BackgroundService
     private readonly ILogger<UpcomingArbitrageBackgroundService> _logger;
     private readonly IServiceProvider _serviceProvider;
     private readonly HttpClient _httpClient;
+    private readonly MarketValidator _marketValidator;
     private const int MaxRetries = 3;
     private const int PageSize = 100;
     private const int PageLimit = 9;
@@ -22,6 +23,7 @@ public partial class UpcomingArbitrageBackgroundService : BackgroundService
     {
         _logger = logger;
         _serviceProvider = serviceProvider;
+        _marketValidator = new MarketValidator(logger);
         _httpClient = new HttpClient
         {
             Timeout = TimeSpan.FromSeconds(15)
@@ -29,72 +31,6 @@ public partial class UpcomingArbitrageBackgroundService : BackgroundService
         _httpClient.DefaultRequestHeaders.Add("Connection", "keep-alive");
     }
 
-    private bool IsValidMarketOutcomes(string marketDescription, int outcomeCount)
-{
-    return marketDescription.ToLower() switch
-    {
-        // Match Outcomes
-        var m when m.Contains("1x2") || m.Contains("match result") => outcomeCount == 3,
-        var m when m.Contains("double chance") => outcomeCount == 3,
-        var m when m.Contains("draw no bet") || m.Contains("dnb") => outcomeCount == 2,
-        
-        // Goals Markets
-        var m when m.Contains("over/under") || m.Contains("o/u") || m.Contains("total goals") => outcomeCount == 2,
-        var m when m.Contains("alternative total goals") => outcomeCount == 2,
-        var m when m.Contains("team total goals") => outcomeCount == 2,
-        var m when m.Contains("exact goals") => outcomeCount == 2,
-        
-        // Both Teams Markets
-        var m when m.Contains("gg/ng") || m.Contains("btts") || m.Contains("both teams to score") => outcomeCount == 2,
-        var m when m.Contains("btts and over/under") => outcomeCount == 2,
-        var m when m.Contains("btts and match result") => outcomeCount == 3,
-        
-        // Half Markets
-        var m when m.Contains("1st half result") || m.Contains("2nd half result") => outcomeCount == 3,
-        var m when m.Contains("half time/full time") || m.Contains("ht/ft") => outcomeCount == 3,
-        var m when m.Contains("1st half goals") || m.Contains("2nd half goals") => outcomeCount == 2,
-        var m when m.Contains("half with most goals") => outcomeCount == 3,
-        
-        // Asian Markets
-        var m when m.Contains("asian handicap") || m.Contains("ah") => outcomeCount == 2,
-        var m when m.Contains("asian total") => outcomeCount == 2,
-        
-        // Corner Markets
-        var m when m.Contains("corner match") => outcomeCount == 3,
-        var m when m.Contains("total corners") || m.Contains("corner line") => outcomeCount == 2,
-        var m when m.Contains("corner handicap") => outcomeCount == 2,
-        var m when m.Contains("first corner") || m.Contains("last corner") => outcomeCount == 3,
-        
-        // Card Markets
-        var m when m.Contains("total cards") || m.Contains("booking points") => outcomeCount == 2,
-        var m when m.Contains("team cards") => outcomeCount == 2,
-        var m when m.Contains("red card") => outcomeCount == 2,
-        
-        // Score Markets
-        var m when m.Contains("correct score") => outcomeCount == 2,
-        var m when m.Contains("winning margin") => outcomeCount == 3,
-        var m when m.Contains("team to score first") || m.Contains("team to score last") => outcomeCount == 3,
-        var m when m.Contains("clean sheet") => outcomeCount == 2,
-        
-        // Specific Time Period Markets
-        var m when m.Contains("result after") || m.Contains("score after") => outcomeCount == 3,
-        var m when m.Contains("next goal") => outcomeCount == 3,
-        var m when m.Contains("goals in period") => outcomeCount == 2,
-        
-        // Combination Markets
-        var m when m.Contains("result and both teams to score") => outcomeCount == 3,
-        var m when m.Contains("result and total goals") => outcomeCount == 3,
-        var m when m.Contains("score cast") => outcomeCount == 2,
-        
-        // Qualifying/Progress Markets
-        var m when m.Contains("to qualify") || m.Contains("to advance") => outcomeCount == 2,
-        var m when m.Contains("method of victory") => outcomeCount == 3,
-        
-        // Default case for unrecognized markets
-        _ => false
-    };
-}
-    
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         while (!stoppingToken.IsCancellationRequested)
@@ -105,12 +41,7 @@ public partial class UpcomingArbitrageBackgroundService : BackgroundService
                 var mongoDbService = scope.ServiceProvider.GetRequiredService<MongoDbService>();
                 var arbitrageCollection = mongoDbService.GetCollection<ArbitrageMatch>("UpcomingArbitrageMatches");
 
-                // Create TTL index for automatic document expiration
-                var indexKeysDefinition = Builders<ArbitrageMatch>.IndexKeys.Ascending(x => x.CreatedAt);
-                var indexOptions = new CreateIndexOptions { ExpireAfter = TimeSpan.FromHours(24) };
-                await arbitrageCollection.Indexes.CreateOneAsync(
-                    new CreateIndexModel<ArbitrageMatch>(indexKeysDefinition, indexOptions),
-                    cancellationToken: stoppingToken);
+                await CreateTTLIndex(arbitrageCollection, stoppingToken);
 
                 var matches = await FetchAllUpcomingMatchesAsync(stoppingToken);
                 _logger.LogInformation($"Fetched {matches.Count} upcoming matches");
@@ -141,6 +72,15 @@ public partial class UpcomingArbitrageBackgroundService : BackgroundService
         }
     }
 
+    private async Task CreateTTLIndex(IMongoCollection<ArbitrageMatch> collection, CancellationToken stoppingToken)
+    {
+        var indexKeysDefinition = Builders<ArbitrageMatch>.IndexKeys.Ascending(x => x.CreatedAt);
+        var indexOptions = new CreateIndexOptions { ExpireAfter = TimeSpan.FromHours(24) };
+        await collection.Indexes.CreateOneAsync(
+            new CreateIndexModel<ArbitrageMatch>(indexKeysDefinition, indexOptions),
+            cancellationToken: stoppingToken);
+    }
+
     private async Task<List<MatchData>> FetchAllUpcomingMatchesAsync(CancellationToken stoppingToken)
     {
         var allMatches = new List<MatchData>();
@@ -157,16 +97,13 @@ public partial class UpcomingArbitrageBackgroundService : BackgroundService
                 var tasks = chunk.Select(pageNum => FetchPageWithRetryAsync(pageNum, timestamp, stoppingToken));
                 var results = await Task.WhenAll(tasks);
 
-                foreach (var result in results)
-                {
-                    if (result?.Data?.Tournaments != null)
-                    {
-                        var matches = result.Data.Tournaments
-                            .SelectMany(t => t.Events)
-                            .ToList();
-                        allMatches.AddRange(matches);
-                    }
-                }
+                var validResults = results
+                    .Where(r => r?.Data?.Tournaments != null)
+                    .SelectMany(r => r.Data.Tournaments)
+                    .SelectMany(t => t.Events)
+                    .ToList();
+
+                allMatches.AddRange(validResults);
 
                 // Add human-like delay between chunks
                 await Task.Delay(Random.Shared.Next(1000, 2000), stoppingToken);
@@ -193,16 +130,11 @@ public partial class UpcomingArbitrageBackgroundService : BackgroundService
                     await Task.Delay((int)delay, stoppingToken);
                 }
 
-                var url = $"https://www.sportybet.com/api/ng/factsCenter/pcUpcomingEvents?" +
-                         $"sportId=sr%3Asport%3A1&marketId=1%2C18%2C19%2C20%2C10%2C29%2C11%2C26%2C36%2C14%2C60100" +
-                         $"&pageSize={PageSize}&pageNum={pageNum}&option=1&timeline=24&_t={timestamp}";
-
+                var url = BuildApiUrl(pageNum, timestamp);
                 var response = await _httpClient.GetAsync(url, stoppingToken);
-                if (response.StatusCode == System.Net.HttpStatusCode.NotFound ||
-                    response.StatusCode == System.Net.HttpStatusCode.Forbidden)
-                {
+                
+                if (IsInvalidResponse(response))
                     return null;
-                }
 
                 response.EnsureSuccessStatusCode();
                 var content = await response.Content.ReadAsStringAsync(stoppingToken);
@@ -216,9 +148,16 @@ public partial class UpcomingArbitrageBackgroundService : BackgroundService
 
         return null;
     }
-}
-public partial class UpcomingArbitrageBackgroundService
-{
+
+    private string BuildApiUrl(int pageNum, long timestamp) =>
+        $"https://www.sportybet.com/api/ng/factsCenter/pcUpcomingEvents?" +
+        $"sportId=sr%3Asport%3A1&marketId=1%2C18%2C19%2C20%2C10%2C29%2C11%2C26%2C36%2C14%2C60100" +
+        $"&pageSize={PageSize}&pageNum={pageNum}&option=1&timeline=24&_t={timestamp}";
+
+    private bool IsInvalidResponse(HttpResponseMessage response) =>
+        response.StatusCode == System.Net.HttpStatusCode.NotFound ||
+        response.StatusCode == System.Net.HttpStatusCode.Forbidden;
+
     private List<ArbitrageMatch> ProcessArbitrageOpportunities(List<MatchData> matches)
     {
         var arbitrageMatches = new List<ArbitrageMatch>();
@@ -233,121 +172,15 @@ public partial class UpcomingArbitrageBackgroundService
         {
             try
             {
-                if (match == null || 
-                    string.IsNullOrEmpty(match.EventId) || 
-                    string.IsNullOrEmpty(match.HomeTeamId) || 
-                    string.IsNullOrEmpty(match.AwayTeamId) ||
-                    string.IsNullOrEmpty(match.HomeTeamName) ||
-                    string.IsNullOrEmpty(match.AwayTeamName) ||
-                    match.Markets == null)
-                {
+                if (!IsValidMatch(match))
                     continue;
-                }
 
-                var arbitrageMarkets = match.Markets
-                    .Where(m => m != null)
-                    .Where(m => m.Status != 2 && m.Status != 3) // Exclude suspended and settled markets
-                    .Where(m => m.Outcomes != null && IsValidMarketOutcomes(m.Desc ?? "", m.Outcomes.Count))
-                    .Select(m =>
-                    {
-                        try
-                        {
-                            var validOutcomes = m.Outcomes
-                                .Where(o => o != null && o.IsActive == 1 && !string.IsNullOrEmpty(o.Odds))
-                                .Select(o =>
-                                {
-                                    try
-                                    {
-                                        return new Outcome
-                                        {
-                                            Id = o.Id ?? "",
-                                            Description = o.Desc ?? "",
-                                            Odds = decimal.TryParse(o.Odds, out var odds) ? odds : 0m
-                                        };
-                                    }
-                                    catch (Exception ex)
-                                    {
-                                        _logger.LogWarning(ex, "Error processing outcome in market {MarketId}", m.Id);
-                                        return null;
-                                    }
-                                })
-                                .Where(o => o != null && o.Odds > 0)
-                                .ToList();
-
-                            // Check again after filtering inactive outcomes
-                            if (!validOutcomes.Any() || !IsValidMarketOutcomes(m.Desc ?? "", validOutcomes.Count))
-                            {
-                                return null;
-                            }
-
-                            var market = new Market
-                            {
-                                Id = m.Id ?? "",
-                                Description = m.Desc ?? "",
-                                Specifier = m.Specifier ?? "",
-                                Outcomes = validOutcomes
-                            };
-
-                            var (hasArbitrage, stakePercentages, profitPercentage) = CalculateArbitrageOpportunity(market);
-                            if (hasArbitrage)
-                            {
-                                for (int i = 0; i < market.Outcomes.Count; i++)
-                                {
-                                    market.Outcomes[i].StakePercentage = stakePercentages[i];
-                                }
-                                market.Margin = CalculateMarginPercentage(market.Outcomes);
-                                market.ProfitPercentage = profitPercentage;
-
-                                _logger.LogInformation(
-                                    "Found arbitrage opportunity in match {MatchId}, market {MarketId} with {ProfitPercentage}% profit",
-                                    match.EventId,
-                                    market.Id,
-                                    market.ProfitPercentage);
-
-                                return market;
-                            }
-
-                            return null;
-                        }
-                        catch (Exception ex)
-                        {
-                            _logger.LogWarning(ex, "Error processing market {MarketId}", m.Id);
-                            return null;
-                        }
-                    })
-                    .Where(m => m != null)
-                    .ToList();
-
+                var arbitrageMarkets = ProcessMatchMarkets(match);
                 if (arbitrageMarkets.Any())
                 {
                     try
                     {
-                        var arbitrageMatch = new ArbitrageMatch
-                        {
-                            Id = ObjectId.GenerateNewId(),
-                            MatchId = match.EventId,
-                            Teams = new Teams
-                            {
-                                Home = new Team
-                                {
-                                    Id = match.HomeTeamId,
-                                    Name = match.HomeTeamName
-                                },
-                                Away = new Team
-                                {
-                                    Id = match.AwayTeamId,
-                                    Name = match.AwayTeamName
-                                }
-                            },
-                            TournamentName = match.Tournament?.Name ?? "Unknown Tournament",
-                            Markets = arbitrageMarkets,
-                            CreatedAt = DateTime.UtcNow,
-                            MatchTime = DateTime.TryParse(match.StartTime, out var matchTime) 
-                                ? matchTime 
-                                : DateTime.UtcNow
-                        };
-
-                        arbitrageMatches.Add(arbitrageMatch);
+                        arbitrageMatches.Add(CreateArbitrageMatch(match, arbitrageMarkets));
                     }
                     catch (Exception ex)
                     {
@@ -368,36 +201,179 @@ public partial class UpcomingArbitrageBackgroundService
         return arbitrageMatches;
     }
 
-    private (bool hasArbitrage, List<decimal> stakePercentages, decimal profitPercentage) CalculateArbitrageOpportunity(Market market)
+    private bool IsValidMatch(MatchData match) =>
+        match != null && 
+        !string.IsNullOrEmpty(match.EventId) && 
+        !string.IsNullOrEmpty(match.HomeTeamId) && 
+        !string.IsNullOrEmpty(match.AwayTeamId) &&
+        !string.IsNullOrEmpty(match.HomeTeamName) &&
+        !string.IsNullOrEmpty(match.AwayTeamName) &&
+        match.Markets != null;
+
+    private List<Market> ProcessMatchMarkets(MatchData match)
     {
-        if (!market.Outcomes.Any()) return (false, new List<decimal>(), 0m);
+        return match.Markets
+            .Where(m => m != null && IsValidMarketStatus(m))
+            .Select(m => ProcessMarket(m, match.EventId))
+            .Where(m => m != null)
+            .ToList();
+    }
 
-        // Calculate margin but don't filter on it, just store it
+    private bool IsValidMarketStatus(MarketData market) =>
+        market.Status != 2 && market.Status != 3; // Exclude suspended and settled markets
+
+    private Market? ProcessMarket(MarketData marketData, string matchId)
+    {
+        try
+        {
+            if (!_marketValidator.ValidateMarket(marketData))
+                return null;
+
+            var validOutcomes = ProcessOutcomes(marketData);
+            if (!validOutcomes.Any())
+                return null;
+
+            var market = CreateMarket(marketData, validOutcomes);
+            var (hasArbitrage, stakePercentages, profitPercentage) = CalculateArbitrageOpportunity(market);
+            
+            if (hasArbitrage)
+            {
+                UpdateMarketWithArbitrageData(market, stakePercentages, profitPercentage);
+                LogArbitrageOpportunity(matchId, market);
+                return market;
+            }
+
+            return null;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Error processing market {MarketId}", marketData.Id);
+            return null;
+        }
+    }
+
+    // Continued in Part 2...
+    // Continuation of UpcomingArbitrageBackgroundService
+    private List<Outcome> ProcessOutcomes(MarketData marketData)
+    {
+        return marketData.Outcomes
+            .Where(o => o != null && o.IsActive == 1 && !string.IsNullOrEmpty(o.Odds))
+            .Select(CreateOutcome)
+            .Where(o => o != null && o.Odds > 0)
+            .ToList();
+    }
+
+    private Outcome? CreateOutcome(OutcomeData outcomeData)
+    {
+        try
+        {
+            return new Outcome
+            {
+                Id = outcomeData.Id ?? "",
+                Description = outcomeData.Desc ?? "",
+                Odds = decimal.TryParse(outcomeData.Odds, out var odds) ? odds : 0m
+            };
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Error creating outcome {OutcomeId}", outcomeData.Id);
+            return null;
+        }
+    }
+
+    private Market CreateMarket(MarketData marketData, List<Outcome> outcomes)
+    {
+        return new Market
+        {
+            Id = marketData.Id ?? "",
+            Description = marketData.Desc ?? "",
+            Specifier = marketData.Specifier ?? "",
+            Outcomes = outcomes
+        };
+    }
+
+    private void UpdateMarketWithArbitrageData(Market market, List<decimal> stakePercentages, decimal profitPercentage)
+    {
+        for (int i = 0; i < market.Outcomes.Count; i++)
+        {
+            market.Outcomes[i].StakePercentage = stakePercentages[i];
+        }
+        market.Margin = CalculateMarginPercentage(market.Outcomes);
+        market.ProfitPercentage = profitPercentage;
+    }
+
+    private void LogArbitrageOpportunity(string matchId, Market market)
+    {
+        _logger.LogInformation(
+            "Found arbitrage opportunity in match {MatchId}, market {MarketId} with {ProfitPercentage}% profit",
+            matchId,
+            market.Id,
+            market.ProfitPercentage);
+    }
+
+    private (bool hasArbitrage, List<decimal> stakePercentages, decimal profitPercentage) 
+        CalculateArbitrageOpportunity(Market market)
+    {
+        if (!market.Outcomes.Any()) 
+            return (false, new List<decimal>(), 0m);
+
         var margin = CalculateMarginPercentage(market.Outcomes);
-        market.Margin = margin;  // Store the margin for reference
+        market.Margin = margin;
 
-        // Calculate total inverse of odds
+        if (margin > MaxAcceptableMargin)
+            return (false, new List<decimal>(), 0m);
+
         var totalInverse = market.Outcomes.Sum(o => 1m / o.Odds);
-
-        // Calculate profit percentage
         var profitPercentage = ((1 / totalInverse) - 1) * 100;
 
-        // Only check for positive profit - this is our main arbitrage indicator
-        if (profitPercentage <= 0) return (false, new List<decimal>(), 0m);
+        if (profitPercentage <= 0) 
+            return (false, new List<decimal>(), 0m);
 
-        // Calculate optimal stake percentages for guaranteed profit
-        var stakePercentages = market.Outcomes
+        var stakePercentages = CalculateStakePercentages(market.Outcomes, totalInverse);
+        return (true, stakePercentages, Math.Round(profitPercentage, 2));
+    }
+
+    private List<decimal> CalculateStakePercentages(List<Outcome> outcomes, decimal totalInverse)
+    {
+        return outcomes
             .Select(o => (1m / o.Odds / totalInverse) * 100m)
             .Select(p => Math.Round(p, 2))
             .ToList();
-
-        return (true, stakePercentages, Math.Round(profitPercentage, 2));
     }
+
     private decimal CalculateMarginPercentage(List<Outcome> outcomes)
     {
         var impliedProbabilities = outcomes.Select(o => 1m / o.Odds);
         var margin = (impliedProbabilities.Sum() - 1m) * 100;
-        return margin;
+        return Math.Round(margin, 2);
+    }
+
+private ArbitrageMatch CreateArbitrageMatch(MatchData match, List<Market> arbitrageMarkets)
+    {
+        return new ArbitrageMatch
+        {
+            Id = ObjectId.GenerateNewId(),
+            MatchId = match.EventId,
+            Teams = new Teams
+            {
+                Home = new Team
+                {
+                    Id = match.HomeTeamId,
+                    Name = match.HomeTeamName
+                },
+                Away = new Team
+                {
+                    Id = match.AwayTeamId,
+                    Name = match.AwayTeamName
+                }
+            },
+            TournamentName = match.Tournament?.Name ?? "Unknown Tournament",
+            Markets = arbitrageMarkets,
+            CreatedAt = DateTime.UtcNow,
+            MatchTime = DateTime.TryParse(match.StartTime, out var matchTime) 
+                ? matchTime 
+                : DateTime.UtcNow
+        };
     }
 
     private async Task StoreArbitrageMatchesAsync(
@@ -410,7 +386,6 @@ public partial class UpcomingArbitrageBackgroundService
             var upsertModels = matches.Select(match =>
             {
                 var filter = Builders<ArbitrageMatch>.Filter.Eq(x => x.MatchId, match.MatchId);
-                // Create an update definition that excludes the _id field
                 var update = Builders<ArbitrageMatch>.Update
                     .Set(x => x.Teams, match.Teams)
                     .Set(x => x.TournamentName, match.TournamentName)
@@ -430,12 +405,7 @@ public partial class UpcomingArbitrageBackgroundService
                 cancellationToken: stoppingToken
             );
 
-            _logger.LogInformation(
-                "Arbitrage matches stored. Matched: {0}, Modified: {1}, Upserts: {2}",
-                result.MatchedCount,
-                result.ModifiedCount,
-                result.Upserts.Count
-            );
+            LogStorageResults(result);
         }
         catch (Exception ex)
         {
@@ -443,7 +413,222 @@ public partial class UpcomingArbitrageBackgroundService
             throw;
         }
     }
+
+    private void LogStorageResults(BulkWriteResult<ArbitrageMatch> result)
+    {
+        _logger.LogInformation(
+            "Arbitrage matches stored. Matched: {0}, Modified: {1}, Upserts: {2}",
+            result.MatchedCount,
+            result.ModifiedCount,
+            result.Upserts.Count
+        );
+    }
 }
+
+public class MarketValidator
+{
+    private readonly ILogger _logger;
+
+    public MarketValidator(ILogger logger)
+    {
+        _logger = logger;
+    }
+
+    public bool ValidateMarket(MarketData market, int? outcomeCount = null)
+    {
+        try
+        {
+            if (!ValidateBasicStructure(market))
+                return false;
+
+            var actualOutcomeCount = outcomeCount ?? market.Outcomes.Count;
+            
+            return market.Desc?.ToLower() switch
+            {
+                // Match Outcomes
+                var m when m.Contains("1x2") => ValidateMatchOutcomes(market),
+                var m when m.Contains("double chance") => ValidateDoubleChance(market),
+                var m when m.Contains("draw no bet") => ValidateDrawNoBet(market),
+                
+                // Goals Markets
+                var m when m.Contains("over/under") => ValidateOverUnder(market),
+                var m when m.Contains("team total goals") => ValidateTeamTotalGoals(market),
+                
+                // Both Teams Markets
+                var m when m.Contains("gg/ng") || m.Contains("btts") => ValidateBothTeamsToScore(market),
+                
+                // Half Markets
+                var m when m.Contains("1st half") || m.Contains("2nd half") => ValidateHalfMarket(market),
+                
+                // Next Goal Markets
+                var m when m.Contains("next goal") => ValidateNextGoal(market),
+                
+                // Combo Markets
+                var m when m.Contains("1x2 & gg/ng") => Validate1X2AndBTTS(market),
+                var m when m.Contains("1x2 & over/under") => Validate1X2AndOverUnder(market),
+                
+                _ => false
+            };
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Error validating market {MarketId}", market.Id);
+            return false;
+        }
+    }
+
+    private bool ValidateBasicStructure(MarketData market)
+    {
+        if (market == null || 
+            string.IsNullOrEmpty(market.Desc) || 
+            market.Outcomes == null || 
+            !market.Outcomes.Any())
+            return false;
+
+        return market.Outcomes.All(o => 
+            !string.IsNullOrEmpty(o.Id) && 
+            !string.IsNullOrEmpty(o.Desc) && 
+            !string.IsNullOrEmpty(o.Odds) &&
+            decimal.TryParse(o.Odds, out var odds) && 
+            odds > 1.0m);
+    }
+
+    private bool ValidateMatchOutcomes(MarketData market)
+    {
+        if (market.Outcomes.Count != 3)
+            return false;
+
+        var descriptions = market.Outcomes.Select(o => o.Desc.ToLower()).ToList();
+        return descriptions.Contains("home") && 
+               descriptions.Contains("draw") && 
+               descriptions.Contains("away");
+    }
+
+    private bool ValidateOverUnder(MarketData market)
+    {
+        if (market.Outcomes.Count != 2 || string.IsNullOrEmpty(market.Specifier))
+            return false;
+
+        if (!market.Specifier.StartsWith("total=") || 
+            !decimal.TryParse(market.Specifier.Substring(6), out var total))
+            return false;
+
+        var descriptions = market.Outcomes.Select(o => o.Desc.ToLower()).ToList();
+        return descriptions.Any(d => d.Contains("over")) && 
+               descriptions.Any(d => d.Contains("under"));
+    }
+
+    private bool ValidateDoubleChance(MarketData market)
+    {
+        if (market.Outcomes.Count != 3)
+            return false;
+
+        var descriptions = market.Outcomes.Select(o => o.Desc.ToLower()).ToList();
+        return descriptions.Contains("home or draw") && 
+               descriptions.Contains("home or away") && 
+               descriptions.Contains("draw or away");
+    }
+
+    private bool ValidateDrawNoBet(MarketData market)
+    {
+        if (market.Outcomes.Count != 2)
+            return false;
+
+        var descriptions = market.Outcomes.Select(o => o.Desc.ToLower()).ToList();
+        return descriptions.Contains("home") && 
+               descriptions.Contains("away");
+    }
+    private bool ValidateTeamTotalGoals(MarketData market)
+    {
+        if (market.Outcomes.Count != 2 || string.IsNullOrEmpty(market.Specifier))
+            return false;
+
+        if (!market.Specifier.StartsWith("total=") || 
+            !decimal.TryParse(market.Specifier.Substring(6), out var total))
+            return false;
+
+        var descriptions = market.Outcomes.Select(o => o.Desc.ToLower()).ToList();
+        return descriptions.Any(d => d.Contains("over")) && 
+               descriptions.Any(d => d.Contains("under"));
+    }
+
+    private bool ValidateBothTeamsToScore(MarketData market)
+    {
+        if (market.Outcomes.Count != 2)
+            return false;
+
+        var descriptions = market.Outcomes.Select(o => o.Desc.ToLower()).ToList();
+        return descriptions.Contains("yes") && descriptions.Contains("no");
+    }
+
+    private bool ValidateHalfMarket(MarketData market)
+    {
+        var marketDesc = market.Desc.ToLower();
+        
+        if (marketDesc.Contains("correct score"))
+        {
+            return market.Outcomes.All(o => 
+                o.Desc.Contains(":") || o.Desc.ToLower() == "other");
+        }
+        
+        if (marketDesc.Contains("result"))
+        {
+            return market.Outcomes.Count == 3;
+        }
+
+        return false;
+    }
+
+    private bool ValidateNextGoal(MarketData market)
+    {
+        if (market.Outcomes.Count != 3 || string.IsNullOrEmpty(market.Specifier))
+            return false;
+
+        if (!market.Specifier.StartsWith("goalnr=") || 
+            !int.TryParse(market.Specifier.Substring(7), out var goalNumber))
+            return false;
+
+        var descriptions = market.Outcomes.Select(o => o.Desc.ToLower()).ToList();
+        return descriptions.Contains("home") && 
+               descriptions.Contains("none") && 
+               descriptions.Contains("away");
+    }
+
+    private bool Validate1X2AndBTTS(MarketData market)
+    {
+        if (market.Outcomes.Count != 6)
+            return false;
+
+        var descriptions = market.Outcomes.Select(o => o.Desc.ToLower()).ToList();
+        return descriptions.Contains("home & yes") &&
+               descriptions.Contains("home & no") &&
+               descriptions.Contains("draw & yes") &&
+               descriptions.Contains("draw & no") &&
+               descriptions.Contains("away & yes") &&
+               descriptions.Contains("away & no");
+    }
+
+    private bool Validate1X2AndOverUnder(MarketData market)
+    {
+        if (market.Outcomes.Count != 6 || string.IsNullOrEmpty(market.Specifier))
+            return false;
+
+        if (!market.Specifier.StartsWith("total=") || 
+            !decimal.TryParse(market.Specifier.Substring(6), out var total))
+            return false;
+
+        var descriptions = market.Outcomes.Select(o => o.Desc.ToLower()).ToList();
+        return descriptions.Contains("home & over") &&
+               descriptions.Contains("home & under") &&
+               descriptions.Contains("draw & over") &&
+               descriptions.Contains("draw & under") &&
+               descriptions.Contains("away & over") &&
+               descriptions.Contains("away & under");
+    }
+}
+
+// Model classes would follow here (ArbitrageMatch, Teams, Team, Market, Outcome, etc.)
+// API response models would follow here (ApiResponse, ApiData, Tournament, MatchData, MarketData, OutcomeData)  
 
 public class ArbitrageMatch
 {
