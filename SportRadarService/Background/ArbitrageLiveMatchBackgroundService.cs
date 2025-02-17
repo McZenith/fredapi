@@ -399,31 +399,162 @@ public class MarketValidator
     }
 
     private bool ValidateBasicStructure(MarketData market)
-    {
-        if (market == null || 
-            string.IsNullOrEmpty(market.Desc) || 
-            market.Outcomes == null || 
-            !market.Outcomes.Any())
-            return false;
+{
+    if (market == null || 
+        string.IsNullOrEmpty(market.Desc) || 
+        market.Outcomes == null)
+        return false;
 
+    // First filter for active outcomes
+    var activeOutcomes = market.Outcomes
+        .Where(o => o != null && 
+                    o.IsActive == 1 && 
+                    !string.IsNullOrEmpty(o.Id) && 
+                    !string.IsNullOrEmpty(o.Desc) && 
+                    !string.IsNullOrEmpty(o.Odds) &&
+                    decimal.TryParse(o.Odds, out var odds) && 
+                    odds > 1.0m)
+        .ToList();
+
+    // If no active outcomes or market is suspended/settled
+    if (!activeOutcomes.Any() || market.Status == 2 || market.Status == 3)
+        return false;
+
+    // Store active outcomes back to market
+    market.Outcomes = activeOutcomes;
+    return true;
+}
+
+private bool ValidateMatchOutcomes(MarketData market)
+{
+    // Must have exactly 3 active outcomes
+    if (market.Outcomes.Count != 3)
+        return false;
+
+    var descriptions = market.Outcomes.Select(o => o.Desc.ToLower()).ToList();
+    
+    // Must have all three required outcomes
+    if (!descriptions.Contains("home") || 
+        !descriptions.Contains("draw") || 
+        !descriptions.Contains("away"))
+        return false;
+
+    // All outcomes must have valid odds
+    return market.Outcomes.All(o => 
+        decimal.TryParse(o.Odds, out var odds) && odds > 1.0m);
+}
+
+private bool ValidateOverUnder(MarketData market)
+{
+    // Must have exactly 2 active outcomes
+    if (market.Outcomes.Count != 2)
+        return false;
+
+    // Must have valid total specifier
+    if (string.IsNullOrEmpty(market.Specifier) || 
+        !market.Specifier.StartsWith("total=") || 
+        !decimal.TryParse(market.Specifier.Substring(6), out var total))
+        return false;
+
+    var descriptions = market.Outcomes.Select(o => o.Desc.ToLower()).ToList();
+    
+    // Must have both over and under
+    var hasOver = descriptions.Any(d => d.Contains("over"));
+    var hasUnder = descriptions.Any(d => d.Contains("under"));
+    
+    if (!hasOver || !hasUnder)
+        return false;
+
+    // All outcomes must have valid odds
+    return market.Outcomes.All(o => 
+        decimal.TryParse(o.Odds, out var odds) && odds > 1.0m);
+}
+
+private bool ValidateNextGoal(MarketData market)
+{
+    // Must have exactly 3 active outcomes
+    if (market.Outcomes.Count != 3)
+        return false;
+
+    // Must have valid goal number specifier
+    if (string.IsNullOrEmpty(market.Specifier) || 
+        !market.Specifier.StartsWith("goalnr=") || 
+        !int.TryParse(market.Specifier.Substring(7), out var goalNumber))
+        return false;
+
+    var descriptions = market.Outcomes.Select(o => o.Desc.ToLower()).ToList();
+    
+    // Must have all three required outcomes
+    if (!descriptions.Contains("home") || 
+        !descriptions.Contains("none") || 
+        !descriptions.Contains("away"))
+        return false;
+
+    // All outcomes must have valid odds
+    return market.Outcomes.All(o => 
+        decimal.TryParse(o.Odds, out var odds) && odds > 1.0m);
+}
+
+private bool Validate1X2AndBTTS(MarketData market)
+{
+    // Must have exactly 6 active outcomes
+    if (market.Outcomes.Count != 6)
+        return false;
+
+    var descriptions = market.Outcomes.Select(o => o.Desc.ToLower()).ToList();
+    
+    // Must have all required combinations
+    var requiredOutcomes = new[]
+    {
+        "home & yes", "home & no",
+        "draw & yes", "draw & no",
+        "away & yes", "away & no"
+    };
+
+    if (!requiredOutcomes.All(description => descriptions.Contains(description)))
+        return false;
+
+    // All outcomes must have valid odds
+    return market.Outcomes.All(o => 
+        decimal.TryParse(o.Odds, out var odds) && odds > 1.0m);
+}
+
+private bool ValidateHalfMarket(MarketData market)
+{
+    var marketDesc = market.Desc.ToLower();
+    
+    if (marketDesc.Contains("correct score"))
+    {
+        // All outcomes must be valid scores or "other"
         return market.Outcomes.All(o => 
-            !string.IsNullOrEmpty(o.Id) && 
-            !string.IsNullOrEmpty(o.Desc) && 
-            !string.IsNullOrEmpty(o.Odds) &&
-            decimal.TryParse(o.Odds, out var odds) && 
-            odds > 1.0m);
+            o.Desc.Contains(":") || 
+            o.Desc.ToLower() == "other") &&
+            market.Outcomes.All(o => 
+                decimal.TryParse(o.Odds, out var odds) && odds > 1.0m);
     }
-
-    private bool ValidateMatchOutcomes(MarketData market)
+    
+    if (marketDesc.Contains("result"))
     {
+        // Must have exactly 3 active outcomes
         if (market.Outcomes.Count != 3)
             return false;
 
         var descriptions = market.Outcomes.Select(o => o.Desc.ToLower()).ToList();
-        return descriptions.Contains("home") && 
-               descriptions.Contains("draw") && 
-               descriptions.Contains("away");
+        
+        // Must have home, draw, away
+        if (!descriptions.Contains("home") || 
+            !descriptions.Contains("draw") || 
+            !descriptions.Contains("away"))
+            return false;
+
+        // All outcomes must have valid odds
+        return market.Outcomes.All(o => 
+            decimal.TryParse(o.Odds, out var odds) && odds > 1.0m);
     }
+
+    return false;
+}
+
 
     private bool ValidateDoubleChance(MarketData market)
     {
@@ -446,19 +577,7 @@ public class MarketValidator
                descriptions.Contains("away");
     }
 
-    private bool ValidateOverUnder(MarketData market)
-    {
-        if (market.Outcomes.Count != 2 || string.IsNullOrEmpty(market.Specifier))
-            return false;
-
-        if (!market.Specifier.StartsWith("total=") || 
-            !decimal.TryParse(market.Specifier.Substring(6), out var total))
-            return false;
-
-        var descriptions = market.Outcomes.Select(o => o.Desc.ToLower()).ToList();
-        return descriptions.Any(d => d.Contains("over")) && 
-               descriptions.Any(d => d.Contains("under"));
-    }
+ 
 
     private bool ValidateTeamTotalGoals(MarketData market)
     {
@@ -483,52 +602,10 @@ public class MarketValidator
         return descriptions.Contains("yes") && descriptions.Contains("no");
     }
 
-    private bool ValidateHalfMarket(MarketData market)
-    {
-        var marketDesc = market.Desc.ToLower();
-        
-        if (marketDesc.Contains("correct score"))
-        {
-            return market.Outcomes.All(o => 
-                o.Desc.Contains(":") || o.Desc.ToLower() == "other");
-        }
-        
-        if (marketDesc.Contains("result"))
-        {
-            return market.Outcomes.Count == 3;
-        }
+  
 
-        return false;
-    }
+ 
 
-    private bool ValidateNextGoal(MarketData market)
-    {
-        if (market.Outcomes.Count != 3 || string.IsNullOrEmpty(market.Specifier))
-            return false;
-
-        if (!market.Specifier.StartsWith("goalnr=") || 
-            !int.TryParse(market.Specifier.Substring(7), out var goalNumber))
-            return false;
-
-        var descriptions = market.Outcomes.Select(o => o.Desc.ToLower()).ToList();
-        return descriptions.Contains("home") && 
-               descriptions.Contains("none") && 
-               descriptions.Contains("away");
-    }
-
-    private bool Validate1X2AndBTTS(MarketData market)
-    {
-        if (market.Outcomes.Count != 6)
-            return false;
-
-        var descriptions = market.Outcomes.Select(o => o.Desc.ToLower()).ToList();
-        return descriptions.Contains("home & yes") &&
-               descriptions.Contains("home & no") &&
-               descriptions.Contains("draw & yes") &&
-               descriptions.Contains("draw & no") &&
-               descriptions.Contains("away & yes") &&
-               descriptions.Contains("away & no");
-    }
 
     private bool Validate1X2AndOverUnder(MarketData market)
     {
