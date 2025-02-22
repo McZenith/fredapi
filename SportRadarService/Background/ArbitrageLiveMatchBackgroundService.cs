@@ -147,7 +147,8 @@ public partial class ArbitrageLiveMatchBackgroundService : BackgroundService
                 Id = marketData.Id,
                 Description = marketData.Desc,
                 Specifier = marketData.Specifier,
-                Outcomes = ProcessOutcomes(marketData.Outcomes)
+                Outcomes = ProcessOutcomes(marketData.Outcomes),
+                Favourite = marketData.Favourite,
             };
 
             if (!market.Outcomes.Any() || 
@@ -315,6 +316,7 @@ public partial class ArbitrageLiveMatchBackgroundService : BackgroundService
                     Description = m.Description,
                     Specifier = m.Specifier,
                     Margin = m.Margin,
+                    Favourite = m.Favourite,
                     ProfitPercentage = m.ProfitPercentage,
                     Outcomes = m.Outcomes.Select(o => new ClientOutcome
                     {
@@ -544,6 +546,7 @@ public class Market
     public string Specifier { get; set; }
     public decimal Margin { get; set; }
     public decimal ProfitPercentage { get; set; }
+    public int Favourite { get; set; }
     public List<Outcome> Outcomes { get; set; } = new();
 }
 
@@ -588,6 +591,7 @@ public class ClientMarket
     public string Description { get; set; }
     public string Specifier { get; set; }
     public decimal Margin { get; set; }
+    public int Favourite { get; set; }
     public decimal ProfitPercentage { get; set; }
     public List<ClientOutcome> Outcomes { get; set; }
 }
