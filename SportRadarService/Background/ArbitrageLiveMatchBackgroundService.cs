@@ -107,7 +107,7 @@ public partial class ArbitrageLiveMatchBackgroundService : BackgroundService
         return events
             .Select(ProcessSingleEvent)
             .Where(m => m.Markets.Any())
-            .Where(m => !m.Teams.Away.Name.Contains("SRL") || !m.Teams.Home.Name.Contains("SRL"))
+            .Where(m => !m.Teams.Away.Name.ToUpper().Contains("SRL") || !m.Teams.Home.Name.ToUpper().Contains("SRL"))
             .ToList();
     }
 
