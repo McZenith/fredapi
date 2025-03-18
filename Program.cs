@@ -95,5 +95,7 @@ sportRadarGroup.MapMatchRoutes();
 sportRadarGroup.MapMatchesEndpoints();
 sportRadarGroup.MapMatchOddsEndpoint();
 sportRadarGroup.MapMatchDetailsEndpoint();
+sportRadarGroup.MapArbitrageRoutes();
+sportRadarGroup.MapSportMatchRoutes();
 
 app.Run();

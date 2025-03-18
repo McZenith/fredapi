@@ -372,7 +372,7 @@ private ArbitrageMatch CreateArbitrageMatch(MatchData match, List<Market> arbitr
             TournamentName = match.Tournament?.Name ?? "Unknown Tournament",
             Markets = arbitrageMarkets,
             CreatedAt = DateTime.UtcNow,
-            MatchTime = DateTime.TryParse(match.StartTime, out var matchTime) 
+            MatchTime = DateTime.TryParse(match.StartTime.ToString(), out DateTime matchTime) 
                 ? matchTime 
                 : DateTime.UtcNow
         };
@@ -522,11 +522,14 @@ public class MatchData
     [JsonPropertyName("awayTeamName")]
     public string AwayTeamName { get; set; }
 
-    [JsonPropertyName("startTime")]
-    public string StartTime { get; set; }
+    [JsonPropertyName("estimateStartTime")]
+    public dynamic StartTime { get; set; }
 
     [JsonPropertyName("tournament")]
     public Tournament Tournament { get; set; }
+
+    [JsonPropertyName("sport")]
+    public Sport Sport { get; set; }
 
     [JsonPropertyName("markets")]
     public List<MarketData> Markets { get; set; }

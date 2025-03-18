@@ -6,7 +6,7 @@ using Microsoft.AspNetCore.Http.HttpResults;
 using MongoDB.Bson;
 using MongoDB.Driver;
 
-namespace fredapi.SportRadarService.Background;
+namespace fredapi.SportRadarService.Background.UpcomingMatchBackgroundService;
 
 public class UpcomingMatchBackgroundService(
     IServiceProvider serviceProvider,

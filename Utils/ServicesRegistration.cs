@@ -16,11 +16,13 @@ public static class ServicesRegistration
         services.AddScoped<IRedisService, RedisService>();
         //services.AddSingleton<ISubscriberTracker, SubscriberTracker>();
         services.AddScoped<ITokenService, TokenService>();
-        //services.AddHostedService<ApiPollingService>();
+        services.AddHostedService<ApiPollingService>();
         //services.AddHostedService<UpcomingMatchBackgroundService>();
+        //services.AddHostedService<EnrichedStatsBackgroundService>();
         //services.AddHostedService<LiveMatchBackgroundService>();
-        services.AddHostedService<ArbitrageLiveMatchBackgroundService>();
-        services.AddHostedService<UpcomingArbitrageBackgroundService>();
+        //services.AddHostedService<ArbitrageLiveMatchBackgroundService>();
+        //services.AddHostedService<UpcomingArbitrageBackgroundService>();
+        services.AddHostedService<UpcomingMatchEnrichmentService>();
         services.AddSingleton<MongoDbService>();
 
 
