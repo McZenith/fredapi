@@ -20,7 +20,7 @@ public static class ServicesRegistration
         //services.AddHostedService<UpcomingMatchBackgroundService>();
         //services.AddHostedService<EnrichedStatsBackgroundService>();
         //services.AddHostedService<LiveMatchBackgroundService>();
-        //services.AddHostedService<ArbitrageLiveMatchBackgroundService>();
+        services.AddHostedService<ArbitrageLiveMatchBackgroundService>();
         //services.AddHostedService<UpcomingArbitrageBackgroundService>();
         services.AddHostedService<UpcomingMatchEnrichmentService>();
         services.AddSingleton<MongoDbService>();
