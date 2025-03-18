@@ -82,7 +82,7 @@ public class UpcomingMatchEnrichmentService : BackgroundService
             {
                 try
                 {
-                    await Task.Delay(TimeSpan.FromMinutes(30), stoppingToken);
+                    await Task.Delay(TimeSpan.FromHours(6), stoppingToken);
                 }
                 catch (OperationCanceledException)
                 {
