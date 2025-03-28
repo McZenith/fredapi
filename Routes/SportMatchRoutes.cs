@@ -392,7 +392,8 @@ public static class SportMatchRoutes
 
     public static RouteGroupBuilder MapSportMatchRoutes(this RouteGroupBuilder group)
     {
-        group.MapGet("/sportmatches", GetEnrichedMatches)
+        group.MapGet("/sportmatches", (MongoDbService mongoDbService, int page = 1, int pageSize = 50) =>
+                GetEnrichedMatches(page, pageSize, mongoDbService))
             .WithName("GetEnrichedMatches")
             .WithDescription("Get all enriched sport matches with additional stats")
             .WithOpenApi();
@@ -410,16 +411,36 @@ public static class SportMatchRoutes
         return group;
     }
 
-    private static async Task<IResult> GetEnrichedMatches(MongoDbService mongoDbService)
+    private static async Task<IResult> GetEnrichedMatches(int page, int pageSize, MongoDbService mongoDbService)
     {
         try
         {
+            // Ensure valid pagination parameters
+            page = Math.Max(1, page);
+            pageSize = Math.Clamp(pageSize, 1, 100);
+
             var collection = mongoDbService.GetCollection<EnrichedSportMatch>("EnrichedSportMatches");
-            var matches = await collection.Find(FilterDefinition<EnrichedSportMatch>.Empty)
-                .SortByDescending(static m => m.MatchTime)
+
+            // Get total count for pagination metadata
+            var totalCount = await collection.CountDocumentsAsync(FilterDefinition<EnrichedSportMatch>.Empty);
+
+            // Configure the query with pagination and allowDiskUse
+            var findOptions = new FindOptions { AllowDiskUse = true };
+            var matches = await collection.Find(FilterDefinition<EnrichedSportMatch>.Empty, findOptions)
+                .SortByDescending(m => m.MatchTime)
+                .Skip((page - 1) * pageSize)
+                .Limit(pageSize)
                 .ToListAsync();
 
-            return Results.Ok(matches);
+            // Return with pagination metadata
+            return Results.Ok(new
+            {
+                totalCount,
+                totalPages = (int)Math.Ceiling((double)totalCount / pageSize),
+                currentPage = page,
+                pageSize,
+                data = matches
+            });
         }
         catch (Exception ex)
         {
@@ -461,8 +482,13 @@ public static class SportMatchRoutes
 
         try
         {
-            // Clear cache to force fresh data
-            _cache.Remove(cacheKey);
+            // Check cache first
+            if (_cache.TryGetValue(cacheKey, out PredictiveResponse cachedResponse))
+            {
+                Console.WriteLine("Returning cached prediction data");
+                return Results.Ok(cachedResponse);
+            }
+
             Console.WriteLine("Fetching fresh prediction data");
 
             var collection = mongoDbService.GetCollection<EnrichedSportMatch>("EnrichedSportMatches");
@@ -471,9 +497,15 @@ public static class SportMatchRoutes
             var totalCount = await collection.CountDocumentsAsync(FilterDefinition<EnrichedSportMatch>.Empty);
             Console.WriteLine($"Total matches in database: {totalCount}");
 
-            // Use minimal filtering to get all matches
-            var matches = await collection.Find(FilterDefinition<EnrichedSportMatch>.Empty)
+            // Limit to most recent matches (last 30 days) to avoid memory issues
+            var thirtyDaysAgo = DateTime.UtcNow.AddDays(-30);
+            var filter = Builders<EnrichedSportMatch>.Filter.Gte(m => m.MatchTime, thirtyDaysAgo);
+
+            // Use minimal filtering with allowDiskUse option
+            var findOptions = new FindOptions { AllowDiskUse = true };
+            var matches = await collection.Find(filter, findOptions)
                 .SortByDescending(m => m.MatchTime)
+                .Limit(500) // Reasonable limit to prevent memory issues
                 .ToListAsync();
 
             Console.WriteLine($"Found {matches.Count} total matches");
