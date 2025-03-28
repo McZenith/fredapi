@@ -1641,15 +1641,15 @@ public static class SportMatchRoutes
                 Logo = "", // We can set a default logo or leave it empty
                 IsHomeTeam = isHomeTeam,
                 OpponentName = opponentName ?? "Unknown Opponent",
-                AvgOdds = avgOdds > 0 ? avgOdds : 0, // No default values
+                AvgOdds = avgOdds > 0 ? avgOdds : 0,
                 LeagueAvgGoals = leagueAvgGoals,
                 Possession = possession
             };
 
             // Only process data if we have valid team statistics
-            if (teamLastX != null && teamLastX.Matches != null && teamLastX.Matches.Any())
+            if (teamLastX?.Matches != null && teamLastX.Matches.Any())
             {
-                // Calculate win percentages
+                // Calculate match counts
                 var totalMatches = teamLastX.Matches.Count;
                 var homeMatches = teamLastX.Matches.Count(m =>
                     m.Teams?.Home?.Id != null &&
@@ -1658,10 +1658,7 @@ public static class SportMatchRoutes
                     m.Teams?.Away?.Id != null &&
                     m.Teams.Away.Id.ToString() == teamId);
 
-                var wins = teamLastX.Matches.Count(m =>
-                    (m.Teams?.Home?.Id != null && m.Teams.Home.Id.ToString() == teamId && m.Result?.Winner == "home") ||
-                    (m.Teams?.Away?.Id != null && m.Teams.Away.Id.ToString() == teamId && m.Result?.Winner == "away"));
-
+                // Calculate wins, draws, and losses
                 var homeWins = teamLastX.Matches.Count(m =>
                     m.Teams?.Home?.Id != null &&
                     m.Teams.Home.Id.ToString() == teamId &&
@@ -1672,26 +1669,38 @@ public static class SportMatchRoutes
                     m.Teams.Away.Id.ToString() == teamId &&
                     m.Result?.Winner == "away");
 
-                var cleanSheets = teamLastX.Matches.Count(m =>
-                    (m.Teams?.Home?.Id != null && m.Teams.Home.Id.ToString() == teamId && (m.Result?.Away ?? 1) == 0) ||
-                    (m.Teams?.Away?.Id != null && m.Teams.Away.Id.ToString() == teamId && (m.Result?.Home ?? 1) == 0));
+                var homeDraws = teamLastX.Matches.Count(m =>
+                    m.Teams?.Home?.Id != null &&
+                    m.Teams.Home.Id.ToString() == teamId &&
+                    m.Result?.Winner == null);
 
-                // Set values without fallbacks
-                team.WinPercentage = totalMatches > 0 ? (double)wins / totalMatches * 100 : 0;
-                team.HomeWinPercentage = homeMatches > 0 ? (double)homeWins / homeMatches * 100 : 0;
-                team.AwayWinPercentage = awayMatches > 0 ? (double)awayWins / awayMatches * 100 : 0;
-                team.CleanSheetPercentage = totalMatches > 0 ? (double)cleanSheets / totalMatches * 100 : 0;
+                var awayDraws = teamLastX.Matches.Count(m =>
+                    m.Teams?.Away?.Id != null &&
+                    m.Teams.Away.Id.ToString() == teamId &&
+                    m.Result?.Winner == null);
 
-                // Track totals
-                team.TotalHomeMatches = homeMatches;
-                team.TotalAwayMatches = awayMatches;
-                team.TotalHomeWins = homeWins;
-                team.TotalAwayWins = awayWins;
-                team.CleanSheets = cleanSheets;
+                var homeLosses = teamLastX.Matches.Count(m =>
+                    m.Teams?.Home?.Id != null &&
+                    m.Teams.Home.Id.ToString() == teamId &&
+                    m.Result?.Winner == "away");
 
-                // Calculate average goals
-                double goalsScored = 0;
-                double goalsConceded = 0;
+                var awayLosses = teamLastX.Matches.Count(m =>
+                    m.Teams?.Away?.Id != null &&
+                    m.Teams.Away.Id.ToString() == teamId &&
+                    m.Result?.Winner == "home");
+
+                // Calculate clean sheets
+                var homeCleanSheets = teamLastX.Matches.Count(m =>
+                    m.Teams?.Home?.Id != null &&
+                    m.Teams.Home.Id.ToString() == teamId &&
+                    (m.Result?.Away ?? 1) == 0);
+
+                var awayCleanSheets = teamLastX.Matches.Count(m =>
+                    m.Teams?.Away?.Id != null &&
+                    m.Teams.Away.Id.ToString() == teamId &&
+                    (m.Result?.Home ?? 1) == 0);
+
+                // Calculate goals
                 double homeGoalsScored = 0;
                 double homeGoalsConceded = 0;
                 double awayGoalsScored = 0;
@@ -1701,31 +1710,47 @@ public static class SportMatchRoutes
                 {
                     if (match.Teams?.Home?.Id != null && match.Teams.Home.Id.ToString() == teamId)
                     {
-                        // Team playing at home
-                        goalsScored += match.Result?.Home ?? 0;
-                        goalsConceded += match.Result?.Away ?? 0;
                         homeGoalsScored += match.Result?.Home ?? 0;
                         homeGoalsConceded += match.Result?.Away ?? 0;
                     }
                     else if (match.Teams?.Away?.Id != null && match.Teams.Away.Id.ToString() == teamId)
                     {
-                        // Team playing away
-                        goalsScored += match.Result?.Away ?? 0;
-                        goalsConceded += match.Result?.Home ?? 0;
                         awayGoalsScored += match.Result?.Away ?? 0;
                         awayGoalsConceded += match.Result?.Home ?? 0;
                     }
                 }
 
-                // Calculate averages without fallbacks
-                team.AverageGoalsScored = totalMatches > 0 ? goalsScored / totalMatches : 0;
-                team.AverageGoalsConceded = totalMatches > 0 ? goalsConceded / totalMatches : 0;
+                // Set match counts
+                team.TotalHomeMatches = homeMatches;
+                team.TotalAwayMatches = awayMatches;
+                team.TotalHomeWins = homeWins;
+                team.TotalAwayWins = awayWins;
+                team.TotalHomeDraws = homeDraws;
+                team.TotalAwayDraws = awayDraws;
+                team.TotalHomeLosses = homeLosses;
+                team.TotalAwayLosses = awayLosses;
+
+                // Set clean sheets
+                team.CleanSheets = homeCleanSheets + awayCleanSheets;
+                team.HomeCleanSheets = homeCleanSheets;
+                team.AwayCleanSheets = awayCleanSheets;
+
+                // Calculate percentages
+                team.WinPercentage = totalMatches > 0 ? ((double)(homeWins + awayWins) / totalMatches) * 100 : 0;
+                team.HomeWinPercentage = homeMatches > 0 ? ((double)homeWins / homeMatches) * 100 : 0;
+                team.AwayWinPercentage = awayMatches > 0 ? ((double)awayWins / awayMatches) * 100 : 0;
+                team.CleanSheetPercentage = totalMatches > 0 ? ((double)(homeCleanSheets + awayCleanSheets) / totalMatches) * 100 : 0;
+
+                // Calculate goal averages
                 team.HomeAverageGoalsScored = homeMatches > 0 ? homeGoalsScored / homeMatches : 0;
                 team.HomeAverageGoalsConceded = homeMatches > 0 ? homeGoalsConceded / homeMatches : 0;
                 team.AwayAverageGoalsScored = awayMatches > 0 ? awayGoalsScored / awayMatches : 0;
                 team.AwayAverageGoalsConceded = awayMatches > 0 ? awayGoalsConceded / awayMatches : 0;
 
-                // Set values for UI display
+                team.AverageGoalsScored = totalMatches > 0 ? (homeGoalsScored + awayGoalsScored) / totalMatches : 0;
+                team.AverageGoalsConceded = totalMatches > 0 ? (homeGoalsConceded + awayGoalsConceded) / totalMatches : 0;
+
+                // Set UI display values
                 team.AvgHomeGoals = team.HomeAverageGoalsScored;
                 team.AvgAwayGoals = team.AwayAverageGoalsScored;
                 team.AvgTotalGoals = team.AverageGoalsScored;
@@ -1735,13 +1760,13 @@ public static class SportMatchRoutes
                 team.HomeForm = CalculateHomeForm(teamLastX.Matches, teamId);
                 team.AwayForm = CalculateAwayForm(teamLastX.Matches, teamId);
 
-                // Calculate form strength as a number (0-100)
+                // Calculate form strength
                 team.FormStrength = CalculateFormStrength(teamLastX.Matches, teamId);
                 team.FormRating = team.FormStrength;
             }
             else
             {
-                // Set everything to zero or empty - no defaults
+                // Set default values when no data is available
                 team.WinPercentage = 0;
                 team.HomeWinPercentage = 0;
                 team.AwayWinPercentage = 0;
@@ -1764,9 +1789,10 @@ public static class SportMatchRoutes
 
             return team;
         }
-        catch (Exception)
+        catch (Exception ex)
         {
-            // Return minimal team data to prevent errors, with no default values
+            Console.WriteLine($"Error in ExtractTeamData: {ex.Message}");
+            // Return minimal team data to prevent errors
             return new TeamData
             {
                 Name = teamName,
