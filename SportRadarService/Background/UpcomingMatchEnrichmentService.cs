@@ -1309,6 +1309,23 @@ public class TeamStats
 
     [JsonPropertyName("totalwins")]
     public MatchCount TotalWins { get; set; }
+    [JsonPropertyName("lossTotal")]
+    public int LossTotal { get; set; }
+
+    [JsonPropertyName("lossAway")]
+    public int LossAway { get; set; }
+
+    [JsonPropertyName("drawTotal")]
+    public int DrawTotal { get; set; }
+
+    [JsonPropertyName("drawHome")]
+    public int DrawHome { get; set; }
+
+    [JsonPropertyName("drawAway")]
+    public int DrawAway { get; set; }
+
+    [JsonPropertyName("lossHome")]
+    public int LossHome { get; set; }
 
     [JsonPropertyName("scoring")]
     public ScoringStats Scoring { get; set; }

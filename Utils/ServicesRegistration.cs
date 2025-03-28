@@ -4,6 +4,7 @@ using fredapi.SportRadarService.Background;
 using fredapi.SportRadarService.Background.ArbitrageLiveMatchBackgroundService;
 using fredapi.SportRadarService.Background.UpcomingArbitrageBackgroundService;
 using fredapi.SportRadarService.TokenService;
+using fredapi.SportRadarService.Transformers;
 
 namespace fredapi.Utils;
 
@@ -25,6 +26,8 @@ public static class ServicesRegistration
         services.AddHostedService<UpcomingMatchEnrichmentService>();
         services.AddSingleton<MongoDbService>();
 
+        // Add SportMatchesPredictionTransformer
+        services.AddScoped<SportMatchesPredictionTransformer>();
 
         return services;
     }

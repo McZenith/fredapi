@@ -92,7 +92,7 @@ using (var scope = app.Services.CreateScope())
     try
     {
         // Create index on MatchTime field (descending) for EnrichedSportMatches collection
-        await mongoDbService.CreateIndexAsync<EnrichedSportMatch>(
+        await mongoDbService.CreateIndexAsync<fredapi.Routes.MongoEnrichedMatch>(
             "EnrichedSportMatches",
             "MatchTime",
             descending: true);
