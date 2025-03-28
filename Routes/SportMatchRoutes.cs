@@ -351,15 +351,6 @@ public class PredictiveResponse
     public MetadataInfo Metadata { get; set; } = new();
 }
 
-public class TimeRange
-{
-    [JsonPropertyName("start")]
-    public string Start { get; set; }
-
-    [JsonPropertyName("end")]
-    public string End { get; set; }
-}
-
 public class MetadataInfo
 {
     [JsonPropertyName("total")]
@@ -367,9 +358,6 @@ public class MetadataInfo
 
     [JsonPropertyName("date")]
     public string Date { get; set; }
-
-    [JsonPropertyName("timeRange")]
-    public object TimeRange { get; set; }
 
     [JsonPropertyName("leagueData")]
     public Dictionary<string, LeagueData> LeagueData { get; set; } = new();
@@ -434,21 +422,13 @@ public static class SportMatchRoutes
 
             var collection = mongoDbService.GetCollection<EnrichedSportMatch>("EnrichedSportMatches");
 
-            // Only include matches in the next 3 hours, filter out past matches
-            var now = DateTime.UtcNow;
-            var threeHoursLater = now.AddHours(3);
-            var filter = Builders<EnrichedSportMatch>.Filter.And(
-                Builders<EnrichedSportMatch>.Filter.Gte(m => m.MatchTime, now),
-                Builders<EnrichedSportMatch>.Filter.Lte(m => m.MatchTime, threeHoursLater)
-            );
-
             // Get total count for pagination metadata
-            var totalCount = await collection.CountDocumentsAsync(filter);
+            var totalCount = await collection.CountDocumentsAsync(FilterDefinition<EnrichedSportMatch>.Empty);
 
             // Configure the query with pagination and allowDiskUse
             var findOptions = new FindOptions { AllowDiskUse = true };
-            var matches = await collection.Find(filter, findOptions)
-                .SortBy(m => m.MatchTime) // Sort by upcoming matches first
+            var matches = await collection.Find(FilterDefinition<EnrichedSportMatch>.Empty, findOptions)
+                .SortByDescending(m => m.MatchTime)
                 .Skip((page - 1) * pageSize)
                 .Limit(pageSize)
                 .ToListAsync();
@@ -460,11 +440,6 @@ public static class SportMatchRoutes
                 totalPages = (int)Math.Ceiling((double)totalCount / pageSize),
                 currentPage = page,
                 pageSize,
-                timeRange = new TimeRange
-                {
-                    Start = now.ToString("yyyy-MM-dd'T'HH:mm:ss'Z'"),
-                    End = threeHoursLater.ToString("yyyy-MM-dd'T'HH:mm:ss'Z'")
-                },
                 data = matches
             });
         }
@@ -503,12 +478,7 @@ public static class SportMatchRoutes
 
     private static async Task<IResult> GetPredictionData(MongoDbService mongoDbService, int days, int limit)
     {
-        // Get current time and 3-hour window
-        var now = DateTime.UtcNow;
-        var threeHoursLater = now.AddHours(3);
-
-        // Include timestamp in cache key to ensure cache is time-sensitive
-        var cacheKey = $"prediction_data_{now:yyyy-MM-dd_HH}_{days}_{limit}";
+        var cacheKey = $"prediction_data_{DateTime.UtcNow:yyyy-MM-dd}_{days}_{limit}";
         var sw = System.Diagnostics.Stopwatch.StartNew();
 
         try
@@ -524,24 +494,22 @@ public static class SportMatchRoutes
                 return Results.Ok(cachedResponse);
             }
 
-            Console.WriteLine($"Fetching fresh prediction data for next 3 hours, limit {limit} matches");
+            Console.WriteLine($"Fetching fresh prediction data for last {days} days, limit {limit} matches");
 
             var collection = mongoDbService.GetCollection<EnrichedSportMatch>("EnrichedSportMatches");
 
-            // Create filter for matches in the next 3 hours
-            var filter = Builders<EnrichedSportMatch>.Filter.And(
-                Builders<EnrichedSportMatch>.Filter.Gte(m => m.MatchTime, now),
-                Builders<EnrichedSportMatch>.Filter.Lte(m => m.MatchTime, threeHoursLater)
-            );
+            // Get a count of all matches
+            var totalCount = await collection.CountDocumentsAsync(FilterDefinition<EnrichedSportMatch>.Empty);
+            Console.WriteLine($"Total matches in database: {totalCount}");
 
-            // Get a count of upcoming matches
-            var totalCount = await collection.CountDocumentsAsync(filter);
-            Console.WriteLine($"Total upcoming matches in the next 3 hours: {totalCount}");
+            // Limit to most recent matches based on user parameter
+            var startDate = DateTime.UtcNow.AddDays(-days);
+            var filter = Builders<EnrichedSportMatch>.Filter.Gte(m => m.MatchTime, startDate);
 
             // Use minimal filtering with allowDiskUse option
             var findOptions = new FindOptions { AllowDiskUse = true };
             var matches = await collection.Find(filter, findOptions)
-                .SortBy(m => m.MatchTime) // Sort by match time ascending
+                .SortByDescending(m => m.MatchTime)
                 .Limit(limit)
                 .ToListAsync();
 
@@ -638,7 +606,6 @@ public static class SportMatchRoutes
                     }
                 );
 
-            // In the response, add the time range info
             var response = new PredictiveResponse
             {
                 UpcomingMatches = transformedMatches,
@@ -646,17 +613,12 @@ public static class SportMatchRoutes
                 {
                     Total = transformedMatches.Count,
                     Date = DateTime.UtcNow.ToString("yyyy-MM-dd"),
-                    TimeRange = new TimeRange
-                    {
-                        Start = now.ToString("yyyy-MM-dd'T'HH:mm:ss'Z'"),
-                        End = threeHoursLater.ToString("yyyy-MM-dd'T'HH:mm:ss'Z'")
-                    },
                     LeagueData = leagueMetadata
                 }
             };
 
-            // Cache the response, but with a shorter expiration time since it's time-sensitive
-            _cache.Set(cacheKey, response, TimeSpan.FromMinutes(15));
+            // Cache the response
+            _cache.Set(cacheKey, response, TimeSpan.FromHours(1));
 
             sw.Stop();
             Console.WriteLine($"Prediction data processed in {sw.ElapsedMilliseconds}ms total");
