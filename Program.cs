@@ -4,8 +4,27 @@ using fredapi.SignalR;
 using fredapi.Utils;
 using Microsoft.AspNetCore.Http.Connections;
 using fredapi.SportRadarService.Background;
+using Microsoft.AspNetCore.ResponseCompression;
 
 var builder = WebApplication.CreateBuilder(args);
+
+// Add response compression
+builder.Services.AddResponseCompression(options =>
+{
+    options.EnableForHttps = true;
+    options.Providers.Add<BrotliCompressionProvider>();
+    options.Providers.Add<GzipCompressionProvider>();
+});
+
+builder.Services.Configure<BrotliCompressionProviderOptions>(options =>
+{
+    options.Level = System.IO.Compression.CompressionLevel.Optimal;
+});
+
+builder.Services.Configure<GzipCompressionProviderOptions>(options =>
+{
+    options.Level = System.IO.Compression.CompressionLevel.Optimal;
+});
 
 builder.Services.AddLogging(logging =>
 {
@@ -55,6 +74,9 @@ builder.Services.AddSportRadarService();
 builder.Services.AddOpenApi();
 
 var app = builder.Build();
+
+// Enable response compression
+app.UseResponseCompression();
 
 if (app.Environment.IsDevelopment()) 
 {
