@@ -339,12 +339,12 @@ public class SportRadarService
         }
     }
 
-    public async Task<IResult> GetStatsSeasonMatchTableSpliceAsync(string seasonId)
+    public async Task<IResult> GetStatsSeasonMatchTableSpliceAsync(string matchId)
     {
         try
         {
-            ValidateId(seasonId, "Season");
-            var url = $"https://widgets.fn.sportradar.com/common/en/Etc:UTC/gismo/stats_match_tableslice/{seasonId}{TokenService.TokenService.ApiToken}";
+            ValidateId(matchId, "Match");
+            var url = $"https://widgets.fn.sportradar.com/common/en/Etc:UTC/gismo/stats_match_tableslice/{matchId}{TokenService.TokenService.ApiToken}";
             var response = await MakeRequestWithRetryAsync(url);
             return Results.Ok(response);
         }

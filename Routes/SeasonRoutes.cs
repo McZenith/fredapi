@@ -18,12 +18,12 @@ public static class SeasonRoutes
                 await service.GetSeasonDynamicTableAsync(seasonId))
             .WithName("GetSeasonDynamicTable")
             .WithDescription("Get season dynamic table data");
-        
-        group.MapGet("/season/stats/season/match/table", async (string seasonId, SportRadarService.SportRadarService service) =>
-                await service.GetStatsSeasonMatchTableSpliceAsync(seasonId))
-            .WithName("GetStatsSeasonMatchTableSplice")
-            .WithDescription("Get season stats season match table splice data");
-        
+
+        group.MapGet("/match/stats/match/table", async (string matchId, SportRadarService.SportRadarService service) =>
+                await service.GetStatsSeasonMatchTableSpliceAsync(matchId))
+            .WithName("GetStatsMatchTableSplice")
+            .WithDescription("Get match table splice data for a specific match");
+
         group.MapGet("/season/live/table", async (string seasonId, SportRadarService.SportRadarService service) =>
                 await service.GetSeasonLiveTableAsync(seasonId))
             .WithName("GetSeasonLiveTable")

@@ -309,7 +309,7 @@ public class UpcomingMatchBackgroundService(
             { "Team1NextX", matchService.GetTeamNextXAsync(enrichedMatch.Team1Id) },
             { "Team2NextX", matchService.GetTeamNextXAsync(enrichedMatch.Team2Id) },
             { "MatchForm", matchService.GetStatsMatchFormAsync(enrichedMatch.MatchId) },
-            { "TableSlice", matchService.GetStatsSeasonMatchTableSpliceAsync(enrichedMatch.SeasonId) },
+            { "TableSlice", matchService.GetStatsSeasonMatchTableSpliceAsync(enrichedMatch.MatchId) },
             { "SeasonGoals", matchService.GetSeasonGoalsAsync(enrichedMatch.SeasonId) },
             { "TopCards", matchService.GetSeasonTopCardsAsync(enrichedMatch.SeasonId) }
         };

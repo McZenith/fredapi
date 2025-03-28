@@ -4,6 +4,10 @@ using Microsoft.Extensions.Options;
 using Microsoft.Extensions.Logging;
 using MongoDB.Driver;
 using MongoDB.Bson;
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading.Tasks;
 
 public class MongoDbSettings
 {
@@ -15,45 +19,125 @@ public class MongoDbService
 {
     private readonly IMongoDatabase _database;
     private readonly ILogger<MongoDbService> _logger;
-    private readonly MongoClient _client;
-    private readonly string _databaseName;
+    private readonly MongoDbSettings _mongoDBSettings;
+    private readonly MongoClient _mongoClient;
 
     public MongoDbService(IOptions<MongoDbSettings> mongoDBSettings, ILogger<MongoDbService> logger)
     {
+        _mongoDBSettings = mongoDBSettings.Value;
         _logger = logger;
-        _databaseName = mongoDBSettings.Value.DatabaseName;
 
         try
         {
             _logger.LogInformation("Attempting to connect to MongoDB...");
-            _client = new MongoClient(mongoDBSettings.Value.ConnectionString);
-            _database = _client.GetDatabase(_databaseName);
 
-            // Verify connection by pinging the database
-            _database.RunCommand((Command<BsonDocument>)"{ping:1}");
-            
-            _logger.LogInformation("Successfully connected to MongoDB database: {DatabaseName}", _databaseName);
-        }
-        catch (MongoException ex)
-        {
-            _logger.LogError(ex, "Failed to connect to MongoDB: {ErrorMessage}", ex.Message);
-            throw;
-        }
-    }
+            // Configure MongoDB client settings with retry options
+            var settings = MongoClientSettings.FromConnectionString(_mongoDBSettings.ConnectionString);
+            settings.ServerSelectionTimeout = TimeSpan.FromSeconds(30);
+            settings.ConnectTimeout = TimeSpan.FromSeconds(30);
+            settings.SocketTimeout = TimeSpan.FromSeconds(30);
+            settings.MaxConnectionPoolSize = 100;
+            settings.RetryReads = true;
+            settings.RetryWrites = true;
 
-    public IMongoCollection<T> GetCollection<T>(string collectionName)
-    {
-        try
+            // Connect to MongoDB
+            _mongoClient = new MongoClient(settings);
+
+            // Test the connection by getting the database
+            _database = _mongoClient.GetDatabase(_mongoDBSettings.DatabaseName);
+
+            // Run a simple command to verify the connection works
+            var result = _database.RunCommand<BsonDocument>(new BsonDocument("ping", 1));
+
+            _logger.LogInformation($"Successfully connected to MongoDB database: {_mongoDBSettings.DatabaseName}");
+        }
+        catch (MongoConnectionException ex)
         {
-            _logger.LogInformation("Accessing collection: {CollectionName}", collectionName);
-            var collection = _database.GetCollection<T>(collectionName);
-            return collection;
+            _logger.LogError(ex, $"Failed to connect to MongoDB: {ex.Message}");
+
+            if (ex.InnerException != null)
+            {
+                _logger.LogError($"Inner exception: {ex.InnerException.Message}");
+            }
+
+            throw; // Re-throw to allow the caller to handle it
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Error accessing collection {CollectionName}: {ErrorMessage}", 
-                collectionName, ex.Message);
-            throw;
+            _logger.LogError(ex, $"An error occurred while initializing MongoDB connection: {ex.Message}");
+            throw; // Re-throw to allow the caller to handle it
+        }
+    }
+
+    public IMongoCollection<T> GetCollection<T>(string name)
+    {
+        _logger.LogInformation("Accessing collection: {Name}", name);
+        return _database.GetCollection<T>(name);
+    }
+
+    public async Task<List<T>> GetAllAsync<T>(string collectionName)
+    {
+        var collection = _database.GetCollection<T>(collectionName);
+        return await collection.Find(new BsonDocument()).ToListAsync();
+    }
+
+    public async Task<T> GetByIdAsync<T>(string collectionName, string id)
+    {
+        var collection = _database.GetCollection<T>(collectionName);
+        var filter = Builders<T>.Filter.Eq("Id", id);
+        return await collection.Find(filter).FirstOrDefaultAsync();
+    }
+
+    public async Task CreateAsync<T>(string collectionName, T document)
+    {
+        var collection = _database.GetCollection<T>(collectionName);
+        await collection.InsertOneAsync(document);
+    }
+
+    public async Task UpdateAsync<T>(string collectionName, string id, T document)
+    {
+        var collection = _database.GetCollection<T>(collectionName);
+        var filter = Builders<T>.Filter.Eq("Id", id);
+        await collection.ReplaceOneAsync(filter, document);
+    }
+
+    public async Task DeleteAsync<T>(string collectionName, string id)
+    {
+        var collection = _database.GetCollection<T>(collectionName);
+        var filter = Builders<T>.Filter.Eq("Id", id);
+        await collection.DeleteOneAsync(filter);
+    }
+
+    public async Task CreateTTLIndexAsync<T>(string collectionName, string fieldName, TimeSpan expireAfter)
+    {
+        var collection = _database.GetCollection<T>(collectionName);
+
+        // Check if index already exists
+        using var cursor = await collection.Indexes.ListAsync();
+        var indexes = await cursor.ToListAsync();
+
+        var indexExists = indexes.Any(index =>
+            index["name"].AsString.Contains(fieldName) &&
+            index.Contains("expireAfterSeconds")
+        );
+
+        if (!indexExists)
+        {
+            var indexKeysDefinition = Builders<T>.IndexKeys.Ascending(fieldName);
+            var indexOptions = new CreateIndexOptions
+            {
+                ExpireAfter = expireAfter,
+                Background = true
+            };
+            var indexModel = new CreateIndexModel<T>(indexKeysDefinition, indexOptions);
+            await collection.Indexes.CreateOneAsync(indexModel);
+
+            _logger.LogInformation("Created TTL index on {FieldName} with expiration after {ExpireAfter}",
+                fieldName, expireAfter);
+        }
+        else
+        {
+            _logger.LogInformation("TTL index already exists on {FieldName}", fieldName);
         }
     }
 

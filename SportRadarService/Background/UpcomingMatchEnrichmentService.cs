@@ -1,12 +1,29 @@
+using System;
+using System.Collections.Generic;
 using System.Text.Json;
+using System.Text.Json.Serialization;
+using System.IO;
+using System.Linq;
+using System.Threading;
+using System.Threading.Tasks;
+using fredapi.Utils;
 using fredapi.Database;
+using MongoDB.Driver;
+using MongoDB.Bson;
+using MongoDB.Bson.Serialization.Attributes;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
+using System.Net.Http;
+using System.Net.Http.Json;
 using fredapi.SportRadarService.Background.ArbitrageLiveMatchBackgroundService;
 using fredapi.SportRadarService.Background.UpcomingArbitrageBackgroundService;
 using fredapi.SportRadarService.TokenService;
-using MongoDB.Bson;
-using MongoDB.Driver;
 using ApiResponse = fredapi.SportRadarService.Background.UpcomingArbitrageBackgroundService.ApiResponse;
 using Market = fredapi.SportRadarService.Background.UpcomingArbitrageBackgroundService.Market;
+using Microsoft.AspNetCore.Http.HttpResults;
+using System.Globalization;
+using System.Runtime.Serialization;
 
 namespace fredapi.SportRadarService.Background;
 
@@ -35,59 +52,165 @@ public class UpcomingMatchEnrichmentService : BackgroundService
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        while (!stoppingToken.IsCancellationRequested)
+        try
         {
-            try
-            {
-                using var scope = _serviceProvider.CreateScope();
-                var mongoDbService = scope.ServiceProvider.GetRequiredService<MongoDbService>();
-                var sportRadarService = scope.ServiceProvider.GetRequiredService<global::fredapi.SportRadarService.SportRadarService>();
-                var tokenService = scope.ServiceProvider.GetRequiredService<ITokenService>();
-                await tokenService.GetSportRadarToken();
+            _logger.LogInformation("UpcomingMatch Enrichment Service starting.");
 
-                var enrichedMatchesCollection = mongoDbService.GetCollection<EnrichedSportMatch>("EnrichedSportMatches");
+            var mongoDbService = _serviceProvider.GetRequiredService<MongoDbService>();
+            var collection = mongoDbService.GetCollection<EnrichedSportMatch>("EnrichedSportMatches");
 
-                // Create TTL index for automatic expiration
-                await CreateTTLIndex(enrichedMatchesCollection, stoppingToken);
+            // Create TTL index (if not exists) to automatically delete old matches
+            await CreateTTLIndex(collection, stoppingToken);
 
-                // Fetch upcoming matches from API
-                var matches = await FetchAllUpcomingMatchesAsync(stoppingToken);
-                _logger.LogInformation($"Fetched {matches.Count} upcoming matches");
-
-                // Filter out matches that have SRL in both teams
-                var filteredMatches = matches
-                    .Where(match => !HasSRLInBothTeams(match))
-                    .ToList();
-
-                _logger.LogInformation($"After filtering out SRL matches, {filteredMatches.Count} matches remain");
-
-                // Skip matches that are already enriched
-                var matchesToEnrich = await FilterOutAlreadyEnrichedMatches(mongoDbService, filteredMatches, stoppingToken);
-                _logger.LogInformation($"After filtering already enriched matches, {matchesToEnrich.Count} matches need enrichment");
-
-                if (matchesToEnrich.Any())
-                {
-                    // Enrich the matches
-                    var enrichedMatches = await EnrichMatchesAsync(matchesToEnrich, sportRadarService, stoppingToken);
-
-                    // Store enriched matches
-                    await StoreEnrichedMatchesAsync(enrichedMatchesCollection, enrichedMatches, stoppingToken);
-                }
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "Error in match enrichment processing");
-            }
-            finally
+            while (!stoppingToken.IsCancellationRequested)
             {
                 try
                 {
-                    await Task.Delay(TimeSpan.FromHours(6), stoppingToken);
+                    _logger.LogInformation("Fetching upcoming matches...");
+
+                    // Create a new instance of SportRadarService for this run
+                    using var scope = _serviceProvider.CreateScope();
+                    var sportRadarService = scope.ServiceProvider.GetRequiredService<global::fredapi.SportRadarService.SportRadarService>();
+
+                    // Fetch matches with retry logic
+                    var matches = await RetryWithExponentialBackoff(
+                        () => FetchAllUpcomingMatchesAsync(stoppingToken),
+                        MaxRetries,
+                        "fetch upcoming matches"
+                    );
+
+                    _logger.LogInformation($"Found {matches.Count} upcoming matches.");
+
+                    if (matches.Count == 0)
+                    {
+                        _logger.LogInformation("No matches found. Waiting before next attempt.");
+                        await Task.Delay(TimeSpan.FromHours(6), stoppingToken);
+                        continue;
+                    }
+
+                    // Get all match IDs for bulk filtering
+                    var allMatchIds = matches.Select(m => m.EventId).ToList();
+
+                    // Filter out matches that have already been enriched (bulk operation)
+                    var existingMatchIds = await collection
+                        .Find(Builders<EnrichedSportMatch>.Filter.In(x => x.MatchId, allMatchIds.Select(id => id.Split(':')[2])))
+                        .Project(x => x.MatchId)
+                        .ToListAsync(stoppingToken);
+
+                    // Find matches that need enrichment
+                    var matchesToEnrich = matches
+                        .Where(m => !existingMatchIds.Contains(m.EventId.Split(':')[2]))
+                        .ToList();
+
+                    _logger.LogInformation($"After filtering, {matchesToEnrich.Count} matches need enrichment.");
+
+                    if (matchesToEnrich.Count > 0)
+                    {
+                        // Process in smaller batches to improve performance
+                        int batchSize = 10; // Process 10 matches per batch
+                        _logger.LogInformation($"Processing {matchesToEnrich.Count} matches in batches of {batchSize}");
+
+                        foreach (var batch in matchesToEnrich.Chunk(batchSize))
+                        {
+                            if (stoppingToken.IsCancellationRequested) break;
+
+                            try
+                            {
+                                // Process matches in parallel within each batch
+                                var enrichmentTasks = batch
+                                    .Where(IsValidMatch)
+                                    .Select(match =>
+                                    {
+                                        var sportMatch = CreateSportMatch(match);
+                                        return EnrichMatchAsync(sportMatch, sportRadarService);
+                                    })
+                                    .ToList();
+
+                                // Wait for all enrichment tasks to complete
+                                var enrichedMatches = await Task.WhenAll(enrichmentTasks);
+                                var validMatches = enrichedMatches.Where(m => m.IsValid).ToList();
+
+                                if (validMatches.Any())
+                                {
+                                    // Store the batch of enriched matches in database
+                                    await StoreEnrichedMatchesAsync(collection, validMatches, stoppingToken);
+                                    _logger.LogInformation($"Successfully stored {validMatches.Count} enriched matches in database");
+                                }
+
+                                // Add delay between batches to avoid overwhelming API
+                                await AddHumanLikeDelay(2000, 3000);
+                            }
+                            catch (Exception ex)
+                            {
+                                _logger.LogError(ex, "Error processing batch of matches");
+                            }
+                        }
+                    }
                 }
-                catch (OperationCanceledException)
+                catch (Exception ex)
                 {
-                    _logger.LogInformation("Match enrichment service is shutting down");
+                    _logger.LogError(ex, "Error in match enrichment process");
                 }
+                finally
+                {
+                    try
+                    {
+                        // Wait for 6 hours before the next run
+                        _logger.LogInformation("Enrichment cycle complete. Next run in 6 hours.");
+                        var nextRunTime = DateTime.Now.AddHours(6);
+                        _logger.LogInformation($"Next enrichment run scheduled for: {nextRunTime}");
+                        await Task.Delay(TimeSpan.FromHours(6), stoppingToken);
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        _logger.LogInformation("UpcomingMatch Enrichment Service is shutting down");
+                    }
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Fatal error in UpcomingMatchEnrichmentService");
+            throw;
+        }
+    }
+
+    private async Task<T> RetryWithExponentialBackoff<T>(
+        Func<Task<T>> action,
+        int maxRetries,
+        string operationName)
+    {
+        var retryCount = 0;
+        var retryDelayMs = 1000; // Start with 1 second delay
+
+        while (true)
+        {
+            try
+            {
+                return await action();
+            }
+            catch (Exception ex)
+            {
+                retryCount++;
+                if (retryCount > maxRetries)
+                {
+                    _logger.LogError(ex,
+                        "Failed {Operation} after {RetryCount} attempts",
+                        operationName,
+                        retryCount);
+                    throw;
+                }
+
+                var delay = retryDelayMs * Math.Pow(2, retryCount - 1);
+                _logger.LogWarning(
+                    "Attempt {RetryCount} of {MaxRetries} for {Operation} failed. Retrying in {Delay}ms. Error: {Error}",
+                    retryCount,
+                    maxRetries,
+                    operationName,
+                    delay,
+                    ex.Message);
+
+                await Task.Delay((int)delay);
             }
         }
     }
@@ -105,6 +228,8 @@ public class UpcomingMatchEnrichmentService : BackgroundService
     {
         var allMatches = new List<MatchData>();
         var timestamp = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+
+        // Create tasks for all pages to fetch concurrently in chunks
         var pageNumbers = Enumerable.Range(1, PageLimit);
         var chunks = pageNumbers.Chunk(3); // Process 3 pages concurrently
 
@@ -158,6 +283,7 @@ public class UpcomingMatchEnrichmentService : BackgroundService
 
                 response.EnsureSuccessStatusCode();
                 var content = await response.Content.ReadAsStringAsync(stoppingToken);
+
                 return JsonSerializer.Deserialize<ApiResponse>(content);
             }
             catch (Exception ex) when (attempt < MaxRetries - 1)
@@ -287,493 +413,228 @@ public class UpcomingMatchEnrichmentService : BackgroundService
         var enrichedMatch = new EnrichedSportMatch
         {
             Id = ObjectId.GenerateNewId(),
+            SeasonId = match.SeasonId,
             MatchId = match.MatchId,
             OriginalMatch = match,
             CreatedAt = DateTime.UtcNow,
-            MatchTime = match.MatchTime,
-            SeasonId = match.SeasonId,
-            Markets = match.Markets,
-            IsValid = true // Start assuming the match is valid
+            MatchTime = match.MatchTime
         };
 
-        // Run tasks in parallel for faster processing
-        var team1Id = enrichedMatch.OriginalMatch.Teams.Home.Id;
-        var team2Id = enrichedMatch.OriginalMatch.Teams.Away.Id;
-        var matchId = match.MatchId;
-        var seasonId = match.SeasonId;
-
-        // Prepare all tasks to run concurrently
-        var tasks = new List<Task>();
-
-        // Task 1: Fetch Team Position History
-        tasks.Add(Task.Run(async () =>
-        {
-            await FetchTeamTableSlice(sportRadarService, enrichedMatch);
-            await AddHumanLikeDelay(200, 400); // Shorter delay between concurrent tasks
-        }));
-
-        // Task 2 & 3: Fetch Team Last X Stats
-        tasks.Add(Task.Run(async () =>
-        {
-            await FetchTeamLastXStats(sportRadarService, enrichedMatch);
-            await AddHumanLikeDelay(200, 400);
-        }));
-
-        // Task 4: Fetch Team Versus Recent
-        tasks.Add(Task.Run(async () =>
-        {
-            await FetchTeamVersusRecent(sportRadarService, enrichedMatch);
-            await AddHumanLikeDelay(200, 400);
-        }));
-
-        // Task 5 & 6: Fetch Team Scoring Conceding
-        tasks.Add(Task.Run(async () =>
-        {
-            await FetchTeamScoringConceding(sportRadarService, enrichedMatch);
-            await AddHumanLikeDelay(200, 400);
-        }));
-
-        // Task 7 & 8: Fetch Team Last X Extended
-        tasks.Add(Task.Run(async () =>
-        {
-            await FetchTeamLastXExtended(sportRadarService, enrichedMatch);
-        }));
-
-        // Wait for all tasks to complete
-        await Task.WhenAll(tasks);
-
-        // Check if we have enough valid data to consider this match properly enriched
-        bool isComplete = true;
-
-        // Check if all data models are present
-        if (enrichedMatch.TeamTableSlice == null) isComplete = false;
-        if (enrichedMatch.LastXStatsTeam1 == null) isComplete = false;
-        if (enrichedMatch.LastXStatsTeam2 == null) isComplete = false;
-        if (enrichedMatch.TeamVersusRecent == null) isComplete = false;
-        if (enrichedMatch.Team1ScoringConceding == null) isComplete = false;
-        if (enrichedMatch.Team2ScoringConceding == null) isComplete = false;
-        if (enrichedMatch.Team1LastX == null) isComplete = false;
-        if (enrichedMatch.Team2LastX == null) isComplete = false;
-
-        // Set isValid flag based on completeness
-        enrichedMatch.IsValid = isComplete;
-
-        if (!isComplete)
-        {
-            _logger.LogWarning($"Match {enrichedMatch.MatchId} is considered invalid due to missing required data");
-        }
-
-        return enrichedMatch;
-    }
-
-    private async Task FetchTeamTableSlice(
-        global::fredapi.SportRadarService.SportRadarService sportRadarService,
-        EnrichedSportMatch enrichedMatch)
-    {
         try
         {
-            var matchId = enrichedMatch.MatchId;
-            if (string.IsNullOrEmpty(matchId))
+            // Organize API calls into groups that can be executed in parallel
+            _logger.LogInformation($"Enriching match {match.MatchId}: {match.Teams.Home.Name} vs {match.Teams.Away.Name}");
+
+            // Get match info to extract the correct seasonId
+            string seasonId = match.SeasonId;
+            try
             {
-                _logger.LogWarning($"Could not get match ID for match {enrichedMatch.MatchId}");
-                return;
-            }
-
-            // Skip known problematic match IDs
-            if (matchId == "57871789" || matchId == "111111111906998")
-            {
-                _logger.LogWarning($"Skipping known problematic match ID {matchId} for table slice");
-                return;
-            }
-
-            // Use the more reliable match table slice API
-            var result = await sportRadarService.GetStatsSeasonMatchTableSpliceAsync(matchId);
-            if (result is Microsoft.AspNetCore.Http.HttpResults.Ok<JsonDocument> okResult)
-            {
-                var rawJson = okResult.Value?.RootElement.GetRawText() ?? "{}";
-
-                // Log sample of raw JSON for debugging
-                var logSample = rawJson.Length > 200 ? rawJson.Substring(0, 200) + "..." : rawJson;
-                _logger.LogDebug($"Raw table slice JSON for match {matchId}: {logSample}");
-
-                if (!IsErrorResponse(rawJson) && TryExtractData(rawJson, out var dataJson))
+                var matchInfoResult = await sportRadarService.GetMatchInfoAsync(match.MatchId.ToString());
+                if (matchInfoResult is Ok<JsonDocument> okResult && okResult.Value != null)
                 {
+                    var json = okResult.Value.RootElement.GetRawText();
+
+                    // Extract seasonId from match info response
                     try
                     {
-                        // Try to deserialize into the model with proper options
-                        var options = new JsonSerializerOptions
+                        var root = JsonDocument.Parse(json).RootElement;
+                        if (root.TryGetProperty("doc", out var docElement) &&
+                            docElement.ValueKind == JsonValueKind.Array &&
+                            docElement.GetArrayLength() > 0)
                         {
-                            PropertyNameCaseInsensitive = true,
-                            PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
-                            NumberHandling = System.Text.Json.Serialization.JsonNumberHandling.AllowReadingFromString,
-                            DefaultIgnoreCondition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull,
-                            IgnoreReadOnlyProperties = true,
-                            ReadCommentHandling = JsonCommentHandling.Skip,
-                            AllowTrailingCommas = true
-                        };
 
-                        // Try parsing the JSON to check if it's valid before deserialization
-                        try
-                        {
-                            using var doc = JsonDocument.Parse(dataJson);
-
-                            // Handle array response
-                            if (doc.RootElement.ValueKind == JsonValueKind.Array)
+                            var firstDoc = docElement[0];
+                            if (firstDoc.TryGetProperty("data", out var dataElement) &&
+                                dataElement.TryGetProperty("match", out var matchElement) &&
+                                matchElement.TryGetProperty("_seasonid", out var seasonIdElement))
                             {
-                                _logger.LogWarning($"Table slice JSON for match {matchId} has array root element. Converting to object format.");
 
-                                // Create a new object with the array as tablerows
-                                var arrayData = JsonSerializer.Deserialize<List<TableRowInfo>>(dataJson, options);
+                                // Handle both string and number types for seasonId
+                                string extractedSeasonId = seasonIdElement.ValueKind == JsonValueKind.String
+                                    ? seasonIdElement.GetString()
+                                    : seasonIdElement.GetRawText().Trim('"');
 
-                                // Create a new table slice model with the array data
-                                enrichedMatch.TeamTableSlice = new TeamTableSliceModel
-                                {
-                                    MatchId = matchId,
-                                    TableRows = arrayData ?? new List<TableRowInfo>(),
-                                    TotalRows = arrayData?.Count ?? 0,
-                                    CurrentRound = 0,
-                                    MaxRounds = 0
-                                };
-
-                                _logger.LogInformation($"Successfully processed array table data for match {matchId} with {arrayData?.Count ?? 0} teams");
-                                return;
+                                seasonId = !string.IsNullOrEmpty(extractedSeasonId) ? extractedSeasonId : seasonId;
+                                _logger.LogInformation($"Extracted seasonId {seasonId} from match_info for match {match.MatchId}");
                             }
-
-                            // Check if it has the expected structure
-                            if (!doc.RootElement.TryGetProperty("tablerows", out var _))
-                            {
-                                _logger.LogWarning($"Table slice JSON for match {matchId} missing tablerows property");
-                                // Create empty fallback model
-                                enrichedMatch.TeamTableSlice = new TeamTableSliceModel
-                                {
-                                    MatchId = matchId,
-                                    TableRows = new List<TableRowInfo>(),
-                                    TotalRows = 0
-                                };
-                                return;
-                            }
-                        }
-                        catch (JsonException ex)
-                        {
-                            _logger.LogWarning(ex, $"Invalid JSON format in table slice for match {matchId}");
-                            return;
-                        }
-
-                        // Add our robust converter
-                        options.Converters.Add(new RootObjectConverter<TeamTableSliceModel>(_logger, $"team table slice for match {enrichedMatch.MatchId}"));
-
-                        var tableSlice = JsonSerializer.Deserialize<TeamTableSliceModel>(dataJson, options);
-
-                        if (tableSlice != null)
-                        {
-                            // Store the table slice directly
-                            enrichedMatch.TeamTableSlice = tableSlice;
-
-                            if (tableSlice.TableRows != null && tableSlice.TableRows.Any())
-                            {
-                                _logger.LogInformation($"Successfully processed table data for match {matchId} with {tableSlice.TableRows.Count} teams");
-                            }
-                            else
-                            {
-                                _logger.LogWarning($"No table rows found for match {matchId}");
-                            }
-                        }
-                        else
-                        {
-                            _logger.LogWarning($"Failed to deserialize table slice for match {matchId}");
-                            // Create empty fallback model
-                            enrichedMatch.TeamTableSlice = new TeamTableSliceModel
-                            {
-                                MatchId = matchId,
-                                TableRows = new List<TableRowInfo>(),
-                                TotalRows = 0
-                            };
                         }
                     }
                     catch (Exception ex)
                     {
-                        _logger.LogError(ex, $"Error processing table data for match {matchId}");
-                        // Create empty fallback model
-                        enrichedMatch.TeamTableSlice = new TeamTableSliceModel
-                        {
-                            MatchId = matchId,
-                            TableRows = new List<TableRowInfo>(),
-                            TotalRows = 0
-                        };
+                        _logger.LogError(ex, $"Error extracting seasonId from match_info for match {match.MatchId}");
                     }
                 }
-                else
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, $"Error getting match_info for match {match.MatchId}");
+            }
+
+            // Small delay between getting seasonId and starting other requests
+            await Task.Delay(300);
+
+            // Create all tasks at once
+            var allTasks = new Dictionary<string, Task<IResult>>
+            {
+                // Essential match and team data
+                { "TeamTableSlice", sportRadarService.GetStatsSeasonMatchTableSpliceAsync(match.MatchId) },
+                { "LastXStatsTeam1", sportRadarService.GetTeamLastXAsync(match.Teams.Home.Id) },
+                { "LastXStatsTeam2", sportRadarService.GetTeamLastXAsync(match.Teams.Away.Id) },
+                { "TeamVersusRecent", sportRadarService.GetTeamVersusRecentAsync(match.Teams.Home.Id, match.Teams.Away.Id) },
+                
+                // Season and team stats with correct seasonId
+                { "Team1ScoringConceding", sportRadarService.GetStatsSeasonTeamscoringConcedingAsync(seasonId, match.Teams.Home.Id) },
+                { "Team2ScoringConceding", sportRadarService.GetStatsSeasonTeamscoringConcedingAsync(seasonId, match.Teams.Away.Id) },
+                { "Team1LastX", sportRadarService.GetTeamLastXExtendedAsync(match.Teams.Home.Id) },
+                { "Team2LastX", sportRadarService.GetTeamLastXExtendedAsync(match.Teams.Away.Id) }
+            };
+
+            // Execute all tasks in parallel and wait for completion
+            await Task.WhenAll(allTasks.Values);
+
+            // Process results
+            foreach (var kvp in allTasks)
+            {
+                try
                 {
-                    _logger.LogWarning($"Invalid response format for team table slice for match {enrichedMatch.MatchId}");
-                    // Create empty fallback model
-                    enrichedMatch.TeamTableSlice = new TeamTableSliceModel
+                    var result = await kvp.Value;
+                    if (result is Ok<JsonDocument> okResult && okResult.Value != null)
                     {
-                        MatchId = matchId,
-                        TableRows = new List<TableRowInfo>(),
-                        TotalRows = 0
-                    };
+                        var json = okResult.Value.RootElement.GetRawText();
+
+                        // Set the property using reflection
+                        var property = typeof(EnrichedSportMatch).GetProperty(kvp.Key);
+                        if (property != null)
+                        {
+                            // Using type-specific deserialization with RootObjectConverter to handle malformed JSON
+                            var options = new JsonSerializerOptions
+                            {
+                                PropertyNameCaseInsensitive = true
+                            };
+
+                            // Add the custom converter for this specific type
+                            options.Converters.Add(new RootObjectConverter<TeamTableSliceModel>(_logger, "TeamTableSlice"));
+                            options.Converters.Add(new RootObjectConverter<TeamLastXStatsModel>(_logger, "TeamLastXStats"));
+                            options.Converters.Add(new RootObjectConverter<TeamVersusRecentModel>(_logger, "TeamVersusRecent"));
+                            options.Converters.Add(new RootObjectConverter<TeamScoringConcedingModel>(_logger, "TeamScoringConceding"));
+                            options.Converters.Add(new RootObjectConverter<TeamLastXExtendedModel>(_logger, "TeamLastXExtended"));
+
+                            // Use SafeDeserialize for null handling and error handling with proper type
+                            switch (kvp.Key)
+                            {
+                                case "TeamTableSlice":
+                                    var tableSliceValue = SafeDeserialize<TeamTableSliceModel>(json, options, kvp.Key);
+                                    property.SetValue(enrichedMatch, tableSliceValue);
+                                    break;
+                                case "LastXStatsTeam1":
+                                case "LastXStatsTeam2":
+                                    var lastXValue = SafeDeserialize<TeamLastXStatsModel>(json, options, kvp.Key);
+                                    property.SetValue(enrichedMatch, lastXValue);
+                                    break;
+                                case "TeamVersusRecent":
+                                    var versusValue = SafeDeserialize<TeamVersusRecentModel>(json, options, kvp.Key);
+                                    property.SetValue(enrichedMatch, versusValue);
+                                    break;
+                                case "Team1ScoringConceding":
+                                case "Team2ScoringConceding":
+                                    var scoringValue = SafeDeserialize<TeamScoringConcedingModel>(json, options, kvp.Key);
+                                    property.SetValue(enrichedMatch, scoringValue);
+                                    break;
+                                case "Team1LastX":
+                                case "Team2LastX":
+                                    var lastXExtValue = SafeDeserialize<TeamLastXExtendedModel>(json, options, kvp.Key);
+                                    property.SetValue(enrichedMatch, lastXExtValue);
+                                    break;
+                            }
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, $"Error processing {kvp.Key} for match {match.MatchId}");
                 }
             }
-            else
-            {
-                _logger.LogWarning($"Failed to get table slice for match {matchId}");
-                // Create empty fallback model
-                enrichedMatch.TeamTableSlice = new TeamTableSliceModel
-                {
-                    MatchId = matchId,
-                    TableRows = new List<TableRowInfo>(),
-                    TotalRows = 0
-                };
-            }
+
+            return enrichedMatch;
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, $"Error fetching team table slice for match {enrichedMatch.MatchId}");
-            // Create empty fallback model
-            enrichedMatch.TeamTableSlice = new TeamTableSliceModel
-            {
-                MatchId = enrichedMatch.MatchId,
-                TableRows = new List<TableRowInfo>(),
-                TotalRows = 0
-            };
+            _logger.LogError(ex, $"Error enriching match {match.MatchId}");
+
+            // Still return the partially enriched match
+            enrichedMatch.IsValid = false;
+            return enrichedMatch;
         }
     }
 
-    private async Task FetchTeamLastXStats(
-        global::fredapi.SportRadarService.SportRadarService sportRadarService,
-        EnrichedSportMatch enrichedMatch)
+    private async Task ProcessTaskGroup(Dictionary<string, Task<IResult>> tasks, EnrichedSportMatch enrichedMatch)
     {
-        try
+        // Process all tasks in parallel
+        await Task.WhenAll(tasks.Values);
+
+        // Process results
+        foreach (var task in tasks)
         {
-            var team1Id = enrichedMatch.OriginalMatch.Teams.Home.Id;
-            var team2Id = enrichedMatch.OriginalMatch.Teams.Away.Id;
-
-            var team1Task = sportRadarService.GetTeamLastXAsync(team1Id);
-            var team2Task = sportRadarService.GetTeamLastXAsync(team2Id);
-
-            await Task.WhenAll(team1Task, team2Task);
-
-            // Create consistent serialization options
-            var options = new JsonSerializerOptions
+            try
             {
-                PropertyNameCaseInsensitive = true,
-                PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
-                NumberHandling = System.Text.Json.Serialization.JsonNumberHandling.AllowReadingFromString
-            };
+                var result = await task.Value;
 
-            if (team1Task.Result is Microsoft.AspNetCore.Http.HttpResults.Ok<JsonDocument> okTeam1Result)
-            {
-                var rawJson = okTeam1Result.Value?.RootElement.GetRawText() ?? "{}";
-
-                if (!IsErrorResponse(rawJson) && TryExtractData(rawJson, out var dataJson))
+                if (result is Ok<JsonDocument> okResult && okResult.Value != null)
                 {
-                    enrichedMatch.LastXStatsTeam1 = SafeDeserialize<TeamLastXStatsModel>(
-                        dataJson,
-                        options,
-                        $"team 1 last X stats for match {enrichedMatch.MatchId}");
-                }
-                else
-                {
-                    _logger.LogWarning($"Invalid response format for team 1 last X stats for match {enrichedMatch.MatchId}");
-                }
-            }
+                    var json = okResult.Value.RootElement.GetRawText();
 
-            if (team2Task.Result is Microsoft.AspNetCore.Http.HttpResults.Ok<JsonDocument> okTeam2Result)
-            {
-                var rawJson = okTeam2Result.Value?.RootElement.GetRawText() ?? "{}";
+                    // Set the property using reflection
+                    var property = typeof(EnrichedSportMatch).GetProperty(task.Key);
 
-                if (!IsErrorResponse(rawJson) && TryExtractData(rawJson, out var dataJson))
-                {
-                    enrichedMatch.LastXStatsTeam2 = SafeDeserialize<TeamLastXStatsModel>(
-                        dataJson,
-                        options,
-                        $"team 2 last X stats for match {enrichedMatch.MatchId}");
-                }
-                else
-                {
-                    _logger.LogWarning($"Invalid response format for team 2 last X stats for match {enrichedMatch.MatchId}");
-                }
-            }
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, $"Error fetching team last X stats for match {enrichedMatch.MatchId}");
-        }
-    }
-
-    private async Task FetchTeamVersusRecent(
-        global::fredapi.SportRadarService.SportRadarService sportRadarService,
-        EnrichedSportMatch enrichedMatch)
-    {
-        try
-        {
-            var team1Id = enrichedMatch.OriginalMatch.Teams.Home.Id;
-            var team2Id = enrichedMatch.OriginalMatch.Teams.Away.Id;
-
-            var result = await sportRadarService.GetTeamVersusRecentAsync(team1Id, team2Id);
-            if (result is Microsoft.AspNetCore.Http.HttpResults.Ok<JsonDocument> okResult)
-            {
-                var rawJson = okResult.Value?.RootElement.GetRawText() ?? "{}";
-
-                if (!IsErrorResponse(rawJson) && TryExtractData(rawJson, out var dataJson))
-                {
-                    // Use consistent serialization options with more lenient settings
-                    var options = new JsonSerializerOptions
+                    if (property != null)
                     {
-                        PropertyNameCaseInsensitive = true,
-                        PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
-                        NumberHandling = System.Text.Json.Serialization.JsonNumberHandling.AllowReadingFromString,
-                        DefaultIgnoreCondition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull,
-                        IgnoreReadOnlyProperties = true,
-                        ReadCommentHandling = JsonCommentHandling.Skip,
-                        AllowTrailingCommas = true
-                    };
+                        // Using type-specific deserialization with RootObjectConverter to handle malformed JSON
+                        var propertyType = property.PropertyType;
+                        var options = new JsonSerializerOptions
+                        {
+                            PropertyNameCaseInsensitive = true
+                        };
 
-                    enrichedMatch.TeamVersusRecent = SafeDeserialize<TeamVersusRecentModel>(
-                        dataJson,
-                        options,
-                        $"team versus recent for match {enrichedMatch.MatchId}");
-                }
-                else
-                {
-                    _logger.LogWarning($"Invalid response format for team versus recent for match {enrichedMatch.MatchId}");
-                }
-            }
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, $"Error fetching team versus recent for match {enrichedMatch.MatchId}");
-        }
-    }
+                        // Add the custom converter for this specific type
+                        options.Converters.Add(new RootObjectConverter<TeamTableSliceModel>(_logger, "TeamTableSlice"));
+                        options.Converters.Add(new RootObjectConverter<TeamLastXStatsModel>(_logger, "TeamLastXStats"));
+                        options.Converters.Add(new RootObjectConverter<TeamVersusRecentModel>(_logger, "TeamVersusRecent"));
+                        options.Converters.Add(new RootObjectConverter<TeamScoringConcedingModel>(_logger, "TeamScoringConceding"));
+                        options.Converters.Add(new RootObjectConverter<TeamLastXExtendedModel>(_logger, "TeamLastXExtended"));
 
-    private async Task FetchTeamScoringConceding(
-        global::fredapi.SportRadarService.SportRadarService sportRadarService,
-        EnrichedSportMatch enrichedMatch)
-    {
-        try
-        {
-            var seasonId = enrichedMatch.SeasonId;
-            if (string.IsNullOrEmpty(seasonId))
-            {
-                _logger.LogWarning($"Could not get season ID for match {enrichedMatch.MatchId}");
-                return;
-            }
-
-            var team1Id = enrichedMatch.OriginalMatch.Teams.Home.Id;
-            var team2Id = enrichedMatch.OriginalMatch.Teams.Away.Id;
-
-            var team1Task = sportRadarService.GetStatsSeasonTeamscoringConcedingAsync(seasonId, team1Id);
-            var team2Task = sportRadarService.GetStatsSeasonTeamscoringConcedingAsync(seasonId, team2Id);
-
-            await Task.WhenAll(team1Task, team2Task);
-
-            // Create consistent serialization options
-            var options = new JsonSerializerOptions
-            {
-                PropertyNameCaseInsensitive = true,
-                PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
-                NumberHandling = System.Text.Json.Serialization.JsonNumberHandling.AllowReadingFromString
-            };
-
-            if (team1Task.Result is Microsoft.AspNetCore.Http.HttpResults.Ok<JsonDocument> okTeam1Result)
-            {
-                var rawJson = okTeam1Result.Value?.RootElement.GetRawText() ?? "{}";
-
-                if (!IsErrorResponse(rawJson) && TryExtractData(rawJson, out var dataJson))
-                {
-                    enrichedMatch.Team1ScoringConceding = SafeDeserialize<TeamScoringConcedingModel>(
-                        dataJson,
-                        options,
-                        $"team 1 scoring conceding for match {enrichedMatch.MatchId}");
-                }
-                else
-                {
-                    _logger.LogWarning($"Invalid response format for team 1 scoring conceding for match {enrichedMatch.MatchId}");
+                        // Use SafeDeserialize for null handling and error handling with proper type
+                        if (task.Key == "TeamTableSlice")
+                        {
+                            var value = SafeDeserialize<TeamTableSliceModel>(json, options, task.Key);
+                            property.SetValue(enrichedMatch, value);
+                        }
+                        else if (task.Key == "LastXStatsTeam1" || task.Key == "LastXStatsTeam2")
+                        {
+                            var value = SafeDeserialize<TeamLastXStatsModel>(json, options, task.Key);
+                            property.SetValue(enrichedMatch, value);
+                        }
+                        else if (task.Key == "TeamVersusRecent")
+                        {
+                            var value = SafeDeserialize<TeamVersusRecentModel>(json, options, task.Key);
+                            property.SetValue(enrichedMatch, value);
+                        }
+                        else if (task.Key == "Team1ScoringConceding" || task.Key == "Team2ScoringConceding")
+                        {
+                            var value = SafeDeserialize<TeamScoringConcedingModel>(json, options, task.Key);
+                            property.SetValue(enrichedMatch, value);
+                        }
+                        else if (task.Key == "Team1LastX" || task.Key == "Team2LastX")
+                        {
+                            var value = SafeDeserialize<TeamLastXExtendedModel>(json, options, task.Key);
+                            property.SetValue(enrichedMatch, value);
+                        }
+                    }
                 }
             }
-
-            if (team2Task.Result is Microsoft.AspNetCore.Http.HttpResults.Ok<JsonDocument> okTeam2Result)
+            catch (Exception ex)
             {
-                var rawJson = okTeam2Result.Value?.RootElement.GetRawText() ?? "{}";
-
-                if (!IsErrorResponse(rawJson) && TryExtractData(rawJson, out var dataJson))
-                {
-                    enrichedMatch.Team2ScoringConceding = SafeDeserialize<TeamScoringConcedingModel>(
-                        dataJson,
-                        options,
-                        $"team 2 scoring conceding for match {enrichedMatch.MatchId}");
-                }
-                else
-                {
-                    _logger.LogWarning($"Invalid response format for team 2 scoring conceding for match {enrichedMatch.MatchId}");
-                }
+                _logger.LogError(ex, $"Error processing {task.Key}");
             }
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, $"Error fetching team scoring conceding for match {enrichedMatch.MatchId}");
-        }
-    }
-
-    private async Task FetchTeamLastXExtended(
-        global::fredapi.SportRadarService.SportRadarService sportRadarService,
-        EnrichedSportMatch enrichedMatch)
-    {
-        try
-        {
-            var team1Id = enrichedMatch.OriginalMatch.Teams.Home.Id;
-            var team2Id = enrichedMatch.OriginalMatch.Teams.Away.Id;
-
-            var team1Task = sportRadarService.GetTeamLastXExtendedAsync(team1Id);
-            var team2Task = sportRadarService.GetTeamLastXExtendedAsync(team2Id);
-
-            await Task.WhenAll(team1Task, team2Task);
-
-            // Create consistent serialization options
-            var options = new JsonSerializerOptions
-            {
-                PropertyNameCaseInsensitive = true,
-                PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
-                NumberHandling = System.Text.Json.Serialization.JsonNumberHandling.AllowReadingFromString
-            };
-
-            if (team1Task.Result is Microsoft.AspNetCore.Http.HttpResults.Ok<JsonDocument> okTeam1Result)
-            {
-                var rawJson = okTeam1Result.Value?.RootElement.GetRawText() ?? "{}";
-
-                if (!IsErrorResponse(rawJson) && TryExtractData(rawJson, out var dataJson))
-                {
-                    enrichedMatch.Team1LastX = SafeDeserialize<TeamLastXExtendedModel>(
-                        dataJson,
-                        options,
-                        $"team 1 last X extended for match {enrichedMatch.MatchId}");
-                }
-                else
-                {
-                    _logger.LogWarning($"Invalid response format for team 1 last X extended for match {enrichedMatch.MatchId}");
-                }
-            }
-
-            if (team2Task.Result is Microsoft.AspNetCore.Http.HttpResults.Ok<JsonDocument> okTeam2Result)
-            {
-                var rawJson = okTeam2Result.Value?.RootElement.GetRawText() ?? "{}";
-
-                if (!IsErrorResponse(rawJson) && TryExtractData(rawJson, out var dataJson))
-                {
-                    enrichedMatch.Team2LastX = SafeDeserialize<TeamLastXExtendedModel>(
-                        dataJson,
-                        options,
-                        $"team 2 last X extended for match {enrichedMatch.MatchId}");
-                }
-                else
-                {
-                    _logger.LogWarning($"Invalid response format for team 2 last X extended for match {enrichedMatch.MatchId}");
-                }
-            }
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, $"Error fetching team last X extended for match {enrichedMatch.MatchId}");
         }
     }
 
@@ -781,140 +642,6 @@ public class UpcomingMatchEnrichmentService : BackgroundService
     {
         var delay = Random.Next(minMs, maxMs);
         await Task.Delay(delay);
-    }
-
-    private async Task StoreEnrichedMatchesAsync(
-        IMongoCollection<EnrichedSportMatch> collection,
-        List<EnrichedSportMatch> matches,
-        CancellationToken stoppingToken)
-    {
-        try
-        {
-            if (!matches.Any())
-            {
-                _logger.LogInformation("No enriched matches to store");
-                return;
-            }
-
-            // Filter out invalid matches
-            var validMatches = matches.Where(m => m.IsValid).ToList();
-            var invalidCount = matches.Count - validMatches.Count;
-
-            if (invalidCount > 0)
-            {
-                _logger.LogInformation($"Filtered out {invalidCount} invalid matches");
-            }
-
-            if (!validMatches.Any())
-            {
-                _logger.LogInformation("No valid enriched matches to store");
-                return;
-            }
-
-            // Save fully enriched matches to data.json for analysis
-            await SaveFullyEnrichedMatchesToJsonAsync(validMatches);
-
-            // First, get existing match documents to preserve their IDs
-            var matchIds = validMatches.Select(m => m.MatchId).ToList();
-            var existingMatches = await collection.Find(
-                Builders<EnrichedSportMatch>.Filter.In(x => x.MatchId, matchIds)
-            ).ToListAsync(stoppingToken);
-
-            // Create a dictionary to quickly look up existing matches by matchId
-            var existingMatchesDict = existingMatches.ToDictionary(m => m.MatchId, m => m);
-
-            // Prepare bulk operations
-            var bulkOps = new List<WriteModel<EnrichedSportMatch>>();
-
-            foreach (var match in validMatches)
-            {
-                // Check if the match already exists
-                if (existingMatchesDict.TryGetValue(match.MatchId, out var existingMatch))
-                {
-                    // Preserve the original ID
-                    match.Id = existingMatch.Id;
-
-                    // Use ReplaceOne with simple matchId filter
-                    var filter = Builders<EnrichedSportMatch>.Filter.Eq(x => x.MatchId, match.MatchId);
-                    bulkOps.Add(new ReplaceOneModel<EnrichedSportMatch>(filter, match));
-                }
-                else
-                {
-                    // For new matches, use InsertOne
-                    bulkOps.Add(new InsertOneModel<EnrichedSportMatch>(match));
-                }
-            }
-
-            if (bulkOps.Count > 0)
-            {
-                var result = await collection.BulkWriteAsync(
-                            bulkOps,
-                    new BulkWriteOptions { IsOrdered = false },
-                    cancellationToken: stoppingToken
-                );
-
-                _logger.LogInformation(
-                            "Enriched matches stored. Matched: {0}, Modified: {1}, Inserted: {2}",
-                    result.MatchedCount,
-                    result.ModifiedCount,
-                            result.InsertedCount
-                );
-            }
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Error storing enriched matches");
-            throw;
-        }
-    }
-
-    private async Task SaveFullyEnrichedMatchesToJsonAsync(List<EnrichedSportMatch> matches)
-    {
-        try
-        {
-            // Find matches that have ALL enrichment data available
-            var fullyEnrichedMatches = matches.Where(m =>
-                m.IsValid &&
-                m.TeamTableSlice != null && m.TeamTableSlice.TableRows?.Count > 0 &&
-                m.LastXStatsTeam1 != null && m.LastXStatsTeam1.LastMatches?.Count > 0 &&
-                m.LastXStatsTeam2 != null && m.LastXStatsTeam2.LastMatches?.Count > 0 &&
-                m.TeamVersusRecent != null && m.TeamVersusRecent.Matches?.Count > 0 &&
-                m.Team1ScoringConceding != null &&
-                m.Team2ScoringConceding != null &&
-                m.Team1LastX != null && m.Team1LastX.Matches?.Count > 0 &&
-                m.Team2LastX != null && m.Team2LastX.Matches?.Count > 0
-            ).ToList();
-
-            if (fullyEnrichedMatches.Count == 0)
-            {
-                _logger.LogInformation("No fully enriched matches found to save to JSON");
-                return;
-            }
-
-            // Select one random match that has all the data
-            var random = new Random();
-            var sampleMatch = fullyEnrichedMatches[random.Next(fullyEnrichedMatches.Count)];
-
-            // Create file path - in the app root directory
-            var directory = AppDomain.CurrentDomain.BaseDirectory;
-            var filePath = Path.Combine(directory, "data.json");
-
-            // Serialize with indented formatting for readability
-            var options = new JsonSerializerOptions
-            {
-                WriteIndented = true,
-                DefaultIgnoreCondition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull
-            };
-
-            var json = JsonSerializer.Serialize(sampleMatch, options);
-            await File.WriteAllTextAsync(filePath, json);
-
-            _logger.LogInformation($"Saved fully enriched match {sampleMatch.MatchId} to {filePath}");
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Error saving fully enriched matches to JSON");
-        }
     }
 
     // Check if response is an error response based on pattern matching
@@ -973,9 +700,33 @@ public class UpcomingMatchEnrichmentService : BackgroundService
         {
             using var document = JsonDocument.Parse(json);
 
-            // Log first 500 chars of JSON for debugging purposes
-            var logSample = json.Length > 500 ? json.Substring(0, 500) + "..." : json;
+            // Log first 200 chars of JSON for debugging purposes
+            var logSample = json.Length > 200 ? json.Substring(0, 200) + "..." : json;
             _logger.LogDebug($"Processing JSON: {logSample}");
+
+            // First check for error messages
+            if (document.RootElement.TryGetProperty("message", out var messageElement) &&
+                document.RootElement.TryGetProperty("code", out var codeElement))
+            {
+                _logger.LogWarning($"API error response: {messageElement.GetString()} (Code: {codeElement.GetInt32()})");
+                dataJson = "{}";
+                return false;
+            }
+
+            // Check for queryUrl which is common in most table data responses
+            if (document.RootElement.TryGetProperty("queryUrl", out _) &&
+                document.RootElement.TryGetProperty("doc", out var queryDocElement) &&
+                queryDocElement.ValueKind == JsonValueKind.Array &&
+                queryDocElement.GetArrayLength() > 0)
+            {
+                var firstQueryDoc = queryDocElement[0];
+                if (firstQueryDoc.TryGetProperty("data", out var queryDataProperty))
+                {
+                    _logger.LogInformation($"Found queryUrl structure with embedded data object.");
+                    dataJson = queryDataProperty.GetRawText();
+                    return true;
+                }
+            }
 
             // Check if response has the expected structure with "doc" array
             if (!document.RootElement.TryGetProperty("doc", out var docElement) ||
@@ -1012,7 +763,7 @@ public class UpcomingMatchEnrichmentService : BackgroundService
         }
     }
 
-    // Update the SafeDeserialize method to use the root object converter
+    // Update the SafeDeserialize method to handle problematic properties
     private T SafeDeserialize<T>(string json, JsonSerializerOptions options, string errorContext) where T : class, new()
     {
         if (string.IsNullOrWhiteSpace(json))
@@ -1044,8 +795,194 @@ public class UpcomingMatchEnrichmentService : BackgroundService
 
         try
         {
+            // Special handling for TeamTableSliceModel
+            if (typeof(T) == typeof(TeamTableSliceModel))
+            {
+                _logger.LogInformation($"Using special handling for TeamTableSliceModel in {errorContext}");
+
+                try
+                {
+                    // Parse document to modify problematic properties
+                    using var doc = JsonDocument.Parse(json);
+                    var modified = false;
+                    var jsonObj = new Dictionary<string, JsonElement>();
+
+                    foreach (var prop in doc.RootElement.EnumerateObject())
+                    {
+                        // Handle special cases for known problematic properties
+                        if (prop.Name == "currentround" && prop.Value.ValueKind == JsonValueKind.Null)
+                        {
+                            // Skip null currentround - the model has it as nullable
+                            jsonObj.Add(prop.Name, prop.Value.Clone());
+                        }
+                        else if (prop.Name == "parenttableids" && prop.Value.ValueKind == JsonValueKind.Object)
+                        {
+                            // Handle parenttableids when it's an empty object but we expect array
+                            if (!prop.Value.EnumerateObject().Any())
+                            {
+                                _logger.LogWarning($"Converting empty parenttableids object to empty array");
+                                jsonObj.Add(prop.Name, JsonDocument.Parse("[]").RootElement);
+                            }
+                            else
+                            {
+                                // If it has properties, convert them to an array of strings
+                                _logger.LogWarning($"Converting parenttableids object to array with properties");
+                                var arrayElements = new List<string>();
+                                foreach (var item in prop.Value.EnumerateObject())
+                                {
+                                    arrayElements.Add(item.Name);
+                                }
+                                jsonObj.Add(prop.Name, JsonSerializer.SerializeToElement(arrayElements));
+                            }
+                            modified = true;
+                        }
+                        else if (prop.Name == "presentationid" && prop.Value.ValueKind == JsonValueKind.Number)
+                        {
+                            // Convert presentationid number to string
+                            _logger.LogWarning($"Converting presentationid from number {prop.Value.GetRawText()} to string");
+                            jsonObj.Add(prop.Name, JsonDocument.Parse($"\"{prop.Value.GetRawText()}\"").RootElement);
+                            modified = true;
+                        }
+                        else if (prop.Name == "rules" && prop.Value.ValueKind == JsonValueKind.Null)
+                        {
+                            // Convert null rules to empty array
+                            _logger.LogWarning($"Converting null rules to empty array");
+                            jsonObj.Add(prop.Name, JsonDocument.Parse("[]").RootElement);
+                            modified = true;
+                        }
+                        else if (prop.Name == "rules" && prop.Value.ValueKind == JsonValueKind.Object)
+                        {
+                            // Convert rules object to array with single object
+                            _logger.LogWarning($"Converting rules from object to array");
+                            jsonObj.Add(prop.Name, JsonDocument.Parse($"[{prop.Value.GetRawText()}]").RootElement);
+                            modified = true;
+                        }
+                        else
+                        {
+                            jsonObj.Add(prop.Name, prop.Value.Clone());
+                        }
+                    }
+
+                    if (modified)
+                    {
+                        // Serialize the modified object and use that for deserialization
+                        var modifiedJson = JsonSerializer.Serialize(jsonObj);
+                        _logger.LogInformation($"Using modified JSON for TeamTableSliceModel");
+
+                        // Add our custom root object converter to handle malformed JSON
+                        var tableSliceOptions = new JsonSerializerOptions(options)
+                        {
+                            PropertyNameCaseInsensitive = true,
+                            PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+                            NumberHandling = JsonNumberHandling.AllowReadingFromString,
+                            DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
+                            IgnoreReadOnlyProperties = true,
+                            ReadCommentHandling = JsonCommentHandling.Skip,
+                            AllowTrailingCommas = true,
+                            MaxDepth = 128
+                        };
+                        tableSliceOptions.Converters.Add(new RootObjectConverter<T>(_logger, errorContext));
+
+                        var tableSliceResult = JsonSerializer.Deserialize<T>(modifiedJson, tableSliceOptions);
+                        return tableSliceResult ?? new T();
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, $"Special handling for TeamTableSliceModel failed: {ex.Message}");
+                    // Fall through to standard deserialization
+                }
+            }
+            // Special handling for TeamScoringConcedingModel
+            else if (typeof(T) == typeof(TeamScoringConcedingModel))
+            {
+                _logger.LogInformation($"Using special handling for TeamScoringConcedingModel in {errorContext}");
+
+                try
+                {
+                    using var doc = JsonDocument.Parse(json);
+
+                    // For debugging
+                    var logSample = json.Length > 200 ? json.Substring(0, 200) + "..." : json;
+                    _logger.LogDebug($"TeamScoringConcedingModel JSON: {logSample}");
+
+                    // First, let's check if this is wrapped in a doc array structure
+                    if (doc.RootElement.TryGetProperty("doc", out var docProperty) &&
+                        docProperty.ValueKind == JsonValueKind.Array &&
+                        docProperty.GetArrayLength() > 0)
+                    {
+                        _logger.LogInformation("Found doc array structure in TeamScoringConcedingModel");
+
+                        // Check if the first doc has data property
+                        var firstDoc = docProperty[0];
+                        if (firstDoc.TryGetProperty("data", out var dataProperty))
+                        {
+                            _logger.LogInformation("Found data property in doc[0], using this for deserialization");
+                            json = dataProperty.GetRawText();
+
+                            // Create new options for deserialization
+                            var scoringOptions = new JsonSerializerOptions(options)
+                            {
+                                PropertyNameCaseInsensitive = true,
+                                PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+                                NumberHandling = JsonNumberHandling.AllowReadingFromString,
+                                DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
+                            };
+
+                            var scoringResult = JsonSerializer.Deserialize<T>(json, scoringOptions);
+                            return scoringResult ?? new T();
+                        }
+                    }
+
+                    // Check for common error patterns
+                    if (doc.RootElement.TryGetProperty("team", out var teamElement) &&
+                        doc.RootElement.TryGetProperty("stats", out _))
+                    {
+                        // Structure looks correct - proceed with standard deserialization
+                    }
+                    else if (doc.RootElement.ValueKind == JsonValueKind.Object && doc.RootElement.EnumerateObject().Count() == 0)
+                    {
+                        // Empty object
+                        _logger.LogWarning($"Empty object for TeamScoringConcedingModel");
+                        return new T();
+                    }
+                    else
+                    {
+                        // Structure doesn't match our model, create a minimal valid object
+                        _logger.LogWarning($"Creating minimal valid object for TeamScoringConcedingModel");
+                        var minimalJson = "{\"team\":{},\"stats\":{\"totalmatches\":{},\"totalwins\":{},\"scoring\":{},\"conceding\":{}}}";
+
+                        var concedingOptions = new JsonSerializerOptions(options)
+                        {
+                            PropertyNameCaseInsensitive = true,
+                            PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+                            NumberHandling = JsonNumberHandling.AllowReadingFromString,
+                            DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
+                        };
+
+                        var concedingResult = JsonSerializer.Deserialize<T>(minimalJson, concedingOptions);
+                        return concedingResult ?? new T();
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, $"Special handling for TeamScoringConcedingModel failed: {ex.Message}");
+                    // Fall through to standard deserialization
+                }
+            }
+
             // Add our custom root object converter to handle malformed JSON
-            var deserializerOptions = new JsonSerializerOptions(options);
+            var deserializerOptions = new JsonSerializerOptions(options)
+            {
+                PropertyNameCaseInsensitive = true,
+                PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+                NumberHandling = JsonNumberHandling.AllowReadingFromString,
+                DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
+                IgnoreReadOnlyProperties = true,
+                ReadCommentHandling = JsonCommentHandling.Skip,
+                AllowTrailingCommas = true,
+                MaxDepth = 128
+            };
             deserializerOptions.Converters.Add(new RootObjectConverter<T>(_logger, errorContext));
 
             // Try to deserialize with our robust converter
@@ -1066,6 +1003,44 @@ public class UpcomingMatchEnrichmentService : BackgroundService
         {
             _logger.LogError(ex, $"Unexpected error during deserialization for {errorContext}: {ex.Message}");
             return new T(); // Return empty object instead of null
+        }
+    }
+
+    // New method to store enriched matches in batches for improved performance
+    private async Task StoreEnrichedMatchesAsync(
+        IMongoCollection<EnrichedSportMatch> collection,
+        List<EnrichedSportMatch> matches,
+        CancellationToken stoppingToken)
+    {
+        if (!matches.Any()) return;
+
+        try
+        {
+            // Prepare bulk write operations
+            var bulkOperations = matches.Select(match =>
+            {
+                var filter = Builders<EnrichedSportMatch>.Filter.Eq(x => x.MatchId, match.MatchId);
+                return new ReplaceOneModel<EnrichedSportMatch>(filter, match) { IsUpsert = true };
+            }).ToList();
+
+            // Execute bulk write
+            var result = await collection.BulkWriteAsync(
+                bulkOperations,
+                new BulkWriteOptions { IsOrdered = false },
+                cancellationToken: stoppingToken
+            );
+
+            _logger.LogInformation(
+                "Batch database operation completed. Matched: {0}, Modified: {1}, Upserted: {2}",
+                result.MatchedCount,
+                result.ModifiedCount,
+                result.Upserts.Count
+            );
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error storing batch of enriched matches");
+            throw;
         }
     }
 }
@@ -1089,7 +1064,10 @@ public class EnrichedSportMatch
     public string MatchId { get; set; }
     public SportMatch OriginalMatch { get; set; }
 
-    public List<MarketData> Markets { get; set; }
+    // Replace direct Markets property with a property that redirects to OriginalMatch.Markets
+    [System.Text.Json.Serialization.JsonIgnore]
+    public List<MarketData> Markets => OriginalMatch?.Markets;
+
     public DateTime CreatedAt { get; set; }
     public DateTime MatchTime { get; set; }
     public bool IsValid { get; set; } = true;
@@ -1252,8 +1230,17 @@ public class JerseyInfo
 
 public class TeamInfo
 {
-    [System.Text.Json.Serialization.JsonPropertyName("id")]
-    public string Id { get; set; }
+    [System.Text.Json.Serialization.JsonPropertyName("_doc")]
+    public string Doc { get; set; }
+
+    [System.Text.Json.Serialization.JsonPropertyName("_id")]
+    public int Id { get; set; }
+
+    [System.Text.Json.Serialization.JsonPropertyName("_rcid")]
+    public int Rcid { get; set; }
+
+    [System.Text.Json.Serialization.JsonPropertyName("_sid")]
+    public int Sid { get; set; }
 
     [System.Text.Json.Serialization.JsonPropertyName("name")]
     public string Name { get; set; }
@@ -1261,156 +1248,426 @@ public class TeamInfo
     [System.Text.Json.Serialization.JsonPropertyName("mediumname")]
     public string MediumName { get; set; }
 
+    [System.Text.Json.Serialization.JsonPropertyName("suffix")]
+    public string? Suffix { get; set; }
+
     [System.Text.Json.Serialization.JsonPropertyName("abbr")]
     public string Abbr { get; set; }
 
+    [System.Text.Json.Serialization.JsonPropertyName("nickname")]
+    public string? Nickname { get; set; }
+
+    [System.Text.Json.Serialization.JsonPropertyName("teamtypeid")]
+    public int TeamTypeId { get; set; }
+
+    [System.Text.Json.Serialization.JsonPropertyName("iscountry")]
+    public bool IsCountry { get; set; }
+
+    [System.Text.Json.Serialization.JsonPropertyName("sex")]
+    public string Sex { get; set; }
+
     [System.Text.Json.Serialization.JsonPropertyName("haslogo")]
     public bool HasLogo { get; set; }
+
+    [System.Text.Json.Serialization.JsonPropertyName("founded")]
+    public string? Founded { get; set; }
+
+    [System.Text.Json.Serialization.JsonPropertyName("website")]
+    public string? Website { get; set; }
 }
 
 // Team Scoring-Conceding models
 public class TeamScoringConcedingModel
 {
-    [System.Text.Json.Serialization.JsonPropertyName("team")]
-    public TeamInfo Team { get; set; }
+    [JsonPropertyName("team")]
+    public TeamInfo? Team { get; set; }
 
-    [System.Text.Json.Serialization.JsonPropertyName("stats")]
-    public TeamStats Stats { get; set; } = new();
+    [JsonPropertyName("stats")]
+    public TeamStats? Stats { get; set; } = new();
+
+    [JsonPropertyName("queryUrl")]
+    public string? QueryUrl { get; set; }
+
+    [JsonPropertyName("event")]
+    public string? Event { get; set; }
+
+    [JsonPropertyName("_dob")]
+    public long? Dob { get; set; }
+
+    [JsonPropertyName("_maxage")]
+    public int? Maxage { get; set; }
 }
 
 public class TeamStats
 {
-    [System.Text.Json.Serialization.JsonPropertyName("totalMatches")]
-    public MatchCount TotalMatches { get; set; } = new();
+    [JsonPropertyName("totalmatches")]
+    public MatchCount TotalMatches { get; set; }
 
-    [System.Text.Json.Serialization.JsonPropertyName("totalWins")]
-    public MatchCount TotalWins { get; set; } = new();
+    [JsonPropertyName("totalwins")]
+    public MatchCount TotalWins { get; set; }
 
-    [System.Text.Json.Serialization.JsonPropertyName("scoring")]
-    public ScoringStats Scoring { get; set; } = new();
+    [JsonPropertyName("scoring")]
+    public ScoringStats Scoring { get; set; }
 
-    [System.Text.Json.Serialization.JsonPropertyName("conceding")]
-    public ConcedingStats Conceding { get; set; } = new();
+    [JsonPropertyName("conceding")]
+    public ConcedingStats Conceding { get; set; }
 
-    [System.Text.Json.Serialization.JsonPropertyName("averageGoalsByMinutes")]
-    public Dictionary<string, double> AverageGoalsByMinutes { get; set; } = new();
+    [JsonPropertyName("averagegoalsbyminutes")]
+    [JsonIgnore]
+    public Dictionary<string, Averages> AverageGoalsByMinutes { get; set; } = new();
+
+    // Add a JsonExtensionData attribute to capture all other properties
+    [JsonExtensionData]
+    public Dictionary<string, JsonElement> ExtensionData { get; set; }
+
+    [System.Text.Json.Serialization.JsonIgnore]
+    public bool IsExtensionDataProcessed { get; private set; }
+
+    [OnDeserialized]
+    internal void OnDeserialized(StreamingContext context)
+    {
+        if (ExtensionData != null && !IsExtensionDataProcessed)
+        {
+            ProcessAverageGoalsByMinutes();
+            IsExtensionDataProcessed = true;
+        }
+    }
+
+    private void ProcessAverageGoalsByMinutes()
+    {
+        if (ExtensionData == null)
+            return;
+
+        // Look for the "averagegoalsbyminutes" property in ExtensionData
+        if (ExtensionData.TryGetValue("averagegoalsbyminutes", out JsonElement element) && element.ValueKind == JsonValueKind.Object)
+        {
+            AverageGoalsByMinutes = new Dictionary<string, Averages>();
+
+            // Process each time range (e.g., "0-15", "16-30", etc.)
+            foreach (JsonProperty timeRange in element.EnumerateObject())
+            {
+                if (timeRange.Value.ValueKind == JsonValueKind.Object)
+                {
+                    // Create a new Averages object
+                    var averages = new Averages();
+
+                    // Try to get total, home, and away values
+                    if (timeRange.Value.TryGetProperty("total", out JsonElement totalElement))
+                    {
+                        averages.Total = ParseDouble(totalElement);
+                    }
+
+                    if (timeRange.Value.TryGetProperty("home", out JsonElement homeElement))
+                    {
+                        averages.Home = ParseDouble(homeElement);
+                    }
+
+                    if (timeRange.Value.TryGetProperty("away", out JsonElement awayElement))
+                    {
+                        averages.Away = ParseDouble(awayElement);
+                    }
+
+                    // Add to the dictionary
+                    AverageGoalsByMinutes[timeRange.Name] = averages;
+                }
+            }
+
+            // Remove the property from ExtensionData to avoid duplication
+            ExtensionData.Remove("averagegoalsbyminutes");
+        }
+    }
+
+    private double ParseDouble(JsonElement element)
+    {
+        switch (element.ValueKind)
+        {
+            case JsonValueKind.Number:
+                if (element.TryGetDouble(out double number))
+                    return number;
+                break;
+            case JsonValueKind.String:
+                if (double.TryParse(element.GetString(), out double parsed))
+                    return parsed;
+                break;
+        }
+        return 0;
+    }
 }
 
 public class MatchCount
 {
-    [System.Text.Json.Serialization.JsonPropertyName("total")]
+    [JsonPropertyName("total")]
     public int Total { get; set; }
 
-    [System.Text.Json.Serialization.JsonPropertyName("home")]
+    [JsonPropertyName("home")]
     public int Home { get; set; }
 
-    [System.Text.Json.Serialization.JsonPropertyName("away")]
+    [JsonPropertyName("away")]
     public int Away { get; set; }
 }
 
 public class ScoringStats
 {
-    [System.Text.Json.Serialization.JsonPropertyName("goalsScored")]
+    [JsonPropertyName("goalsscored")]
     public MatchCount GoalsScored { get; set; } = new();
 
-    [System.Text.Json.Serialization.JsonPropertyName("atLeastOneGoal")]
+    [JsonPropertyName("atleastonegoal")]
     public MatchCount AtLeastOneGoal { get; set; } = new();
 
-    [System.Text.Json.Serialization.JsonPropertyName("failedToScore")]
+    [JsonPropertyName("failedtoscore")]
     public MatchCount FailedToScore { get; set; } = new();
 
-    [System.Text.Json.Serialization.JsonPropertyName("scoringAtHalftime")]
+    [JsonPropertyName("scoringathalftime")]
     public MatchCount ScoringAtHalftime { get; set; } = new();
 
-    [System.Text.Json.Serialization.JsonPropertyName("scoringAtFulltime")]
+    [JsonPropertyName("scoringatfulltime")]
     public MatchCount ScoringAtFulltime { get; set; } = new();
 
-    [System.Text.Json.Serialization.JsonPropertyName("bothTeamsScored")]
+    [JsonPropertyName("bothteamsscored")]
     public MatchCount BothTeamsScored { get; set; } = new();
 
-    [System.Text.Json.Serialization.JsonPropertyName("goalsScoredAverage")]
+    [JsonPropertyName("goalsscoredaverage")]
     public Averages GoalsScoredAverage { get; set; } = new();
 
-    [System.Text.Json.Serialization.JsonPropertyName("atLeastOneGoalAverage")]
+    [JsonPropertyName("atleastonegoalaverage")]
     public Averages AtLeastOneGoalAverage { get; set; } = new();
 
-    [System.Text.Json.Serialization.JsonPropertyName("failedToScoreAverage")]
+    [JsonPropertyName("failedtoscoreaverage")]
     public Averages FailedToScoreAverage { get; set; } = new();
 
-    [System.Text.Json.Serialization.JsonPropertyName("scoringAtHalftimeAverage")]
+    [JsonPropertyName("scoringathalftimeaverage")]
     public Averages ScoringAtHalftimeAverage { get; set; } = new();
 
-    [System.Text.Json.Serialization.JsonPropertyName("scoringAtFulltimeAverage")]
+    [JsonPropertyName("scoringatfulltimeaverage")]
     public Averages ScoringAtFulltimeAverage { get; set; } = new();
 
-    [System.Text.Json.Serialization.JsonPropertyName("goalMarginAtVictoryAverage")]
+    [JsonPropertyName("goalmarginatvictoryaverage")]
     public Averages GoalMarginAtVictoryAverage { get; set; } = new();
 
-    [System.Text.Json.Serialization.JsonPropertyName("halftimeGoalMarginAtVictoryAverage")]
+    [JsonPropertyName("halftimegoalmarginatvictoryaverage")]
     public Averages HalftimeGoalMarginAtVictoryAverage { get; set; } = new();
 
-    [System.Text.Json.Serialization.JsonPropertyName("bothTeamsScoredAverage")]
+    [JsonPropertyName("bothteamsscoredaverage")]
     public Averages BothTeamsScoredAverage { get; set; } = new();
 
-    [System.Text.Json.Serialization.JsonPropertyName("goalsByMinutes")]
+    [JsonPropertyName("goalsbyminutes")]
+    [JsonIgnore]
     public Dictionary<string, Averages> GoalsByMinutes { get; set; } = new();
+
+    // Add a JsonExtensionData attribute to capture all other properties
+    [JsonExtensionData]
+    public Dictionary<string, JsonElement> ExtensionData { get; set; }
+
+    [System.Text.Json.Serialization.JsonIgnore]
+    public bool IsExtensionDataProcessed { get; private set; }
+
+    [OnDeserialized]
+    internal void OnDeserialized(StreamingContext context)
+    {
+        if (ExtensionData != null && !IsExtensionDataProcessed)
+        {
+            ProcessGoalsByMinutes();
+            IsExtensionDataProcessed = true;
+        }
+    }
+
+    private void ProcessGoalsByMinutes()
+    {
+        if (ExtensionData == null)
+            return;
+
+        // Look for the "goalsbyminutes" property in ExtensionData
+        if (ExtensionData.TryGetValue("goalsbyminutes", out JsonElement element) && element.ValueKind == JsonValueKind.Object)
+        {
+            GoalsByMinutes = new Dictionary<string, Averages>();
+
+            // Process each time range
+            foreach (JsonProperty timeRange in element.EnumerateObject())
+            {
+                if (timeRange.Value.ValueKind == JsonValueKind.Object)
+                {
+                    // Create a new Averages object
+                    var averages = new Averages();
+
+                    // Try to get total, home, and away values
+                    if (timeRange.Value.TryGetProperty("total", out JsonElement totalElement))
+                    {
+                        averages.Total = ParseDouble(totalElement);
+                    }
+
+                    if (timeRange.Value.TryGetProperty("home", out JsonElement homeElement))
+                    {
+                        averages.Home = ParseDouble(homeElement);
+                    }
+
+                    if (timeRange.Value.TryGetProperty("away", out JsonElement awayElement))
+                    {
+                        averages.Away = ParseDouble(awayElement);
+                    }
+
+                    // Add to the dictionary
+                    GoalsByMinutes[timeRange.Name] = averages;
+                }
+            }
+
+            // Remove the property from ExtensionData to avoid duplication
+            ExtensionData.Remove("goalsbyminutes");
+        }
+    }
+
+    private double ParseDouble(JsonElement element)
+    {
+        switch (element.ValueKind)
+        {
+            case JsonValueKind.Number:
+                if (element.TryGetDouble(out double number))
+                    return number;
+                break;
+            case JsonValueKind.String:
+                if (double.TryParse(element.GetString(), out double parsed))
+                    return parsed;
+                break;
+        }
+        return 0;
+    }
 }
 
 public class ConcedingStats
 {
-    [System.Text.Json.Serialization.JsonPropertyName("goalsConceded")]
+    [JsonPropertyName("goalsconceded")]
     public MatchCount GoalsConceded { get; set; } = new();
 
-    [System.Text.Json.Serialization.JsonPropertyName("cleanSheets")]
+    [JsonPropertyName("cleansheets")]
     public MatchCount CleanSheets { get; set; } = new();
 
-    [System.Text.Json.Serialization.JsonPropertyName("goalsConcededFirstHalf")]
+    [JsonPropertyName("goalsconcededfirsthalf")]
     public MatchCount GoalsConcededFirstHalf { get; set; } = new();
 
-    [System.Text.Json.Serialization.JsonPropertyName("goalsConcededAverage")]
+    [JsonPropertyName("goalsconcededaverage")]
     public Averages GoalsConcededAverage { get; set; } = new();
 
-    [System.Text.Json.Serialization.JsonPropertyName("cleanSheetsAverage")]
+    [JsonPropertyName("cleansheetsaverage")]
     public Averages CleanSheetsAverage { get; set; } = new();
 
-    [System.Text.Json.Serialization.JsonPropertyName("goalsConcededFirstHalfAverage")]
+    [JsonPropertyName("goalsconcededfirsthalfaverage")]
     public Averages GoalsConcededFirstHalfAverage { get; set; } = new();
 
-    [System.Text.Json.Serialization.JsonPropertyName("minutesPerGoalConceded")]
+    [JsonPropertyName("minutespergoalconceded")]
     public Averages MinutesPerGoalConceded { get; set; } = new();
 
-    [System.Text.Json.Serialization.JsonPropertyName("goalsByMinutes")]
+    [JsonPropertyName("goalsbyminutes")]
+    [JsonIgnore]
     public Dictionary<string, Averages> GoalsByMinutes { get; set; } = new();
+
+    // Add a JsonExtensionData attribute to capture all other properties
+    [JsonExtensionData]
+    public Dictionary<string, JsonElement> ExtensionData { get; set; }
+
+    [System.Text.Json.Serialization.JsonIgnore]
+    public bool IsExtensionDataProcessed { get; private set; }
+
+    [OnDeserialized]
+    internal void OnDeserialized(StreamingContext context)
+    {
+        if (ExtensionData != null && !IsExtensionDataProcessed)
+        {
+            ProcessGoalsByMinutes();
+            IsExtensionDataProcessed = true;
+        }
+    }
+
+    private void ProcessGoalsByMinutes()
+    {
+        if (ExtensionData == null)
+            return;
+
+        // Look for the "goalsbyminutes" property in ExtensionData
+        if (ExtensionData.TryGetValue("goalsbyminutes", out JsonElement element) && element.ValueKind == JsonValueKind.Object)
+        {
+            GoalsByMinutes = new Dictionary<string, Averages>();
+
+            // Process each time range
+            foreach (JsonProperty timeRange in element.EnumerateObject())
+            {
+                if (timeRange.Value.ValueKind == JsonValueKind.Object)
+                {
+                    // Create a new Averages object
+                    var averages = new Averages();
+
+                    // Try to get total, home, and away values
+                    if (timeRange.Value.TryGetProperty("total", out JsonElement totalElement))
+                    {
+                        averages.Total = ParseDouble(totalElement);
+                    }
+
+                    if (timeRange.Value.TryGetProperty("home", out JsonElement homeElement))
+                    {
+                        averages.Home = ParseDouble(homeElement);
+                    }
+
+                    if (timeRange.Value.TryGetProperty("away", out JsonElement awayElement))
+                    {
+                        averages.Away = ParseDouble(awayElement);
+                    }
+
+                    // Add to the dictionary
+                    GoalsByMinutes[timeRange.Name] = averages;
+                }
+            }
+
+            // Remove the property from ExtensionData to avoid duplication
+            ExtensionData.Remove("goalsbyminutes");
+        }
+    }
+
+    private double ParseDouble(JsonElement element)
+    {
+        switch (element.ValueKind)
+        {
+            case JsonValueKind.Number:
+                if (element.TryGetDouble(out double number))
+                    return number;
+                break;
+            case JsonValueKind.String:
+                if (double.TryParse(element.GetString(), out double parsed))
+                    return parsed;
+                break;
+        }
+        return 0;
+    }
 }
 
 public class Averages
 {
-    [System.Text.Json.Serialization.JsonPropertyName("total")]
+    [JsonPropertyName("total")]
+    [JsonConverter(typeof(DoubleConverter))]
     public double Total { get; set; }
 
-    [System.Text.Json.Serialization.JsonPropertyName("home")]
+    [JsonPropertyName("home")]
+    [JsonConverter(typeof(DoubleConverter))]
     public double Home { get; set; }
 
-    [System.Text.Json.Serialization.JsonPropertyName("away")]
+    [JsonPropertyName("away")]
+    [JsonConverter(typeof(DoubleConverter))]
     public double Away { get; set; }
 }
 
 // Team LastX models
 public class TeamLastXStatsModel
 {
-    [System.Text.Json.Serialization.JsonPropertyName("team")]
+    [JsonPropertyName("team")]
     public TeamInfo Team { get; set; }
 
-    [System.Text.Json.Serialization.JsonPropertyName("matches")]
+    [JsonPropertyName("matches")]
     public List<MatchStat> LastMatches { get; set; } = new();
 
-    [System.Text.Json.Serialization.JsonPropertyName("tournaments")]
+    [JsonPropertyName("tournaments")]
     public Dictionary<string, TournamentInfo> Tournaments { get; set; } = new();
 
-    [System.Text.Json.Serialization.JsonPropertyName("uniquetournaments")]
+    [JsonPropertyName("uniquetournaments")]
     public Dictionary<string, UniqueTournamentInfo> UniqueTournaments { get; set; } = new();
 
-    [System.Text.Json.Serialization.JsonPropertyName("realcategories")]
+    [JsonPropertyName("realcategories")]
     public Dictionary<string, RealCategoryInfo> RealCategories { get; set; } = new();
 }
 
@@ -1464,38 +1721,116 @@ public class StadiumIdConverter : System.Text.Json.Serialization.JsonConverter<s
 
 public class MatchStat
 {
-    [System.Text.Json.Serialization.JsonPropertyName("id")]
-    [System.Text.Json.Serialization.JsonConverter(typeof(GenericStringConverter))]
+    [JsonPropertyName("id")]
+    [JsonConverter(typeof(GenericStringConverter))]
     public string Id { get; set; }
 
-    [System.Text.Json.Serialization.JsonPropertyName("time")]
+    [JsonPropertyName("time")]
     public MatchTimeInfo Time { get; set; }
 
-    [System.Text.Json.Serialization.JsonPropertyName("round")]
+    [JsonPropertyName("round")]
     public int? Round { get; set; }
 
-    [System.Text.Json.Serialization.JsonPropertyName("result")]
+    [JsonPropertyName("roundname")]
+    public RoundInfo? RoundName { get; set; }
+
+    [JsonPropertyName("week")]
+    public int? Week { get; set; }
+
+    [JsonPropertyName("result")]
     public ResultInfo Result { get; set; }
 
-    [System.Text.Json.Serialization.JsonPropertyName("periods")]
+    [JsonPropertyName("periods")]
     public Dictionary<string, ScoreInfo> Periods { get; set; } = new();
 
-    [System.Text.Json.Serialization.JsonPropertyName("seasonId")]
-    [System.Text.Json.Serialization.JsonConverter(typeof(GenericStringConverter))]
+    [JsonPropertyName("seasonId")]
+    [JsonConverter(typeof(GenericStringConverter))]
     public string SeasonId { get; set; }
 
-    [System.Text.Json.Serialization.JsonPropertyName("teams")]
+    [JsonPropertyName("_seasonid")]
+    [JsonConverter(typeof(GenericStringConverter))]
+    public string _SeasonId { get; set; }
+
+    [JsonPropertyName("teams")]
     public MatchTeamsInfo Teams { get; set; }
 
-    [System.Text.Json.Serialization.JsonPropertyName("neutralground")]
+    [JsonPropertyName("neutralground")]
     public bool NeutralGround { get; set; }
 
-    [System.Text.Json.Serialization.JsonPropertyName("comment")]
-    public string Comment { get; set; }
+    [JsonPropertyName("comment")]
+    public string? Comment { get; set; }
 
-    [System.Text.Json.Serialization.JsonPropertyName("stadiumid")]
-    [System.Text.Json.Serialization.JsonConverter(typeof(GenericStringConverter))]
-    public string StadiumId { get; set; }
+    [JsonPropertyName("stadiumid")]
+    [JsonConverter(typeof(GenericStringConverter))]
+    public string? StadiumId { get; set; }
+
+    [JsonPropertyName("_doc")]
+    public string? Doc { get; set; }
+
+    [JsonPropertyName("_sid")]
+    public int? Sid { get; set; }
+
+    [JsonPropertyName("_rcid")]
+    public int? Rcid { get; set; }
+
+    [JsonPropertyName("_tid")]
+    public int? Tid { get; set; }
+
+    [JsonPropertyName("_utid")]
+    public int? Utid { get; set; }
+
+    [JsonPropertyName("status")]
+    public string? Status { get; set; }
+
+    [JsonPropertyName("tobeannounced")]
+    public bool? ToBeAnnounced { get; set; }
+
+    [JsonPropertyName("postponed")]
+    public bool? Postponed { get; set; }
+
+    [JsonPropertyName("canceled")]
+    public bool? Canceled { get; set; }
+
+    [JsonPropertyName("inlivescore")]
+    public bool? InLiveScore { get; set; }
+
+    [JsonPropertyName("bestof")]
+    public string? BestOf { get; set; }
+
+    [JsonPropertyName("walkover")]
+    public bool? WalkOver { get; set; }
+
+    [JsonPropertyName("retired")]
+    public bool? Retired { get; set; }
+
+    [JsonPropertyName("disqualified")]
+    public bool? Disqualified { get; set; }
+}
+
+public class RoundInfo
+{
+    [JsonPropertyName("_doc")]
+    public string? Doc { get; set; }
+
+    [JsonPropertyName("_id")]
+    [JsonConverter(typeof(GenericStringConverter))]
+    public string Id { get; set; }
+
+    [JsonPropertyName("name")]
+    [JsonConverter(typeof(GenericStringConverter))]
+    public string Name { get; set; }
+
+    [JsonPropertyName("displaynumber")]
+    public string? DisplayNumber { get; set; }
+
+    [JsonPropertyName("shortname")]
+    public string? ShortName { get; set; }
+
+    [JsonPropertyName("cuproundnumber")]
+    public string? CupRoundNumber { get; set; }
+
+    [JsonPropertyName("statisticssortorder")]
+    public int? StatisticsSortOrder { get; set; }
 }
 
 public class MatchTimeInfo
@@ -1519,10 +1854,10 @@ public class ResultInfo
     public int? Away { get; set; }
 
     [System.Text.Json.Serialization.JsonPropertyName("period")]
-    public string Period { get; set; }
+    public string? Period { get; set; }
 
     [System.Text.Json.Serialization.JsonPropertyName("winner")]
-    public string Winner { get; set; }
+    public string? Winner { get; set; }
 }
 
 public class ScoreInfo
@@ -1596,29 +1931,53 @@ public class UniqueTournamentInfo
 
 public class RealCategoryInfo
 {
-    [System.Text.Json.Serialization.JsonPropertyName("id")]
-    public string Id { get; set; }
+    [System.Text.Json.Serialization.JsonPropertyName("_doc")]
+    public string Doc { get; set; }
+
+    [System.Text.Json.Serialization.JsonPropertyName("_id")]
+    public int Id { get; set; }
+
+    [System.Text.Json.Serialization.JsonPropertyName("_sid")]
+    public int Sid { get; set; }
+
+    [System.Text.Json.Serialization.JsonPropertyName("_rcid")]
+    public int Rcid { get; set; }
 
     [System.Text.Json.Serialization.JsonPropertyName("name")]
     public string Name { get; set; }
 
-    [System.Text.Json.Serialization.JsonPropertyName("countryCode")]
-    public CountryInfo CountryCode { get; set; }
+    [System.Text.Json.Serialization.JsonPropertyName("cc")]
+    public CountryCodeInfo Cc { get; set; }
 }
 
-public class CountryInfo
+public class CountryCodeInfo
 {
-    [System.Text.Json.Serialization.JsonPropertyName("id")]
-    public string Id { get; set; }
+    [System.Text.Json.Serialization.JsonPropertyName("_doc")]
+    public string Doc { get; set; }
 
-    [System.Text.Json.Serialization.JsonPropertyName("code")]
-    public string Code { get; set; }
+    [System.Text.Json.Serialization.JsonPropertyName("_id")]
+    public int Id { get; set; }
+
+    [System.Text.Json.Serialization.JsonPropertyName("a2")]
+    public string A2 { get; set; }
 
     [System.Text.Json.Serialization.JsonPropertyName("name")]
     public string Name { get; set; }
+
+    [System.Text.Json.Serialization.JsonPropertyName("a3")]
+    public string A3 { get; set; }
+
+    [System.Text.Json.Serialization.JsonPropertyName("ioc")]
+    public string Ioc { get; set; }
+
+    [System.Text.Json.Serialization.JsonPropertyName("continentid")]
+    public int ContinentId { get; set; }
 
     [System.Text.Json.Serialization.JsonPropertyName("continent")]
     public string Continent { get; set; }
+
+    [System.Text.Json.Serialization.JsonPropertyName("population")]
+    public int Population { get; set; }
 }
 
 // Team LastX Extended models
@@ -1638,18 +1997,33 @@ public class TeamLastXExtendedModel
 
     [System.Text.Json.Serialization.JsonPropertyName("realcategories")]
     public Dictionary<string, RealCategoryInfo> RealCategories { get; set; } = new();
+
+    [System.Text.Json.Serialization.JsonPropertyName("queryUrl")]
+    public string? QueryUrl { get; set; }
+
+    [System.Text.Json.Serialization.JsonPropertyName("_dob")]
+    public long? Dob { get; set; }
+
+    [System.Text.Json.Serialization.JsonPropertyName("_maxage")]
+    public int? MaxAge { get; set; }
 }
 
 public class ExtendedMatchStat : MatchStat
 {
     [System.Text.Json.Serialization.JsonPropertyName("corners")]
-    public CornersInfo Corners { get; set; } = new();
+    public CornersInfo? Corners { get; set; }
 
     [System.Text.Json.Serialization.JsonPropertyName("firstgoal")]
-    public string FirstGoal { get; set; }
+    public string? FirstGoal { get; set; }
 
     [System.Text.Json.Serialization.JsonPropertyName("lastgoal")]
-    public string LastGoal { get; set; }
+    public string? LastGoal { get; set; }
+
+    [System.Text.Json.Serialization.JsonPropertyName("cuproundmatchnumber")]
+    public string? CupRoundMatchNumber { get; set; }
+
+    [System.Text.Json.Serialization.JsonPropertyName("cuproundnumberofmatches")]
+    public string? CupRoundNumberOfMatches { get; set; }
 }
 
 public class CornersInfo
@@ -1664,99 +2038,143 @@ public class CornersInfo
 // Team Versus Recent models
 public class TeamVersusRecentModel
 {
-    [System.Text.Json.Serialization.JsonPropertyName("livematchid")]
-    public string LiveMatchId { get; set; }
+    [JsonPropertyName("livematchid")]
+    public string? LiveMatchId { get; set; }
 
-    [System.Text.Json.Serialization.JsonPropertyName("matches")]
+    [JsonPropertyName("matches")]
     public List<HeadToHeadMatch> Matches { get; set; } = new();
 
-    [System.Text.Json.Serialization.JsonPropertyName("tournaments")]
+    [JsonPropertyName("tournaments")]
     public Dictionary<string, TournamentInfo> Tournaments { get; set; } = new();
 
-    [System.Text.Json.Serialization.JsonPropertyName("realcategories")]
+    [JsonPropertyName("realcategories")]
     public Dictionary<string, RealCategoryInfo> RealCategories { get; set; } = new();
 
-    [System.Text.Json.Serialization.JsonPropertyName("teams")]
+    [JsonPropertyName("teams")]
     public Dictionary<string, TeamInfo> Teams { get; set; } = new();
 
-    [System.Text.Json.Serialization.JsonPropertyName("currentmanagers")]
+    [JsonPropertyName("currentmanagers")]
     public Dictionary<string, List<ManagerInfo>> CurrentManagers { get; set; } = new();
 
-    [System.Text.Json.Serialization.JsonPropertyName("jersey")]
+    [JsonPropertyName("jersey")]
     public Dictionary<string, JerseyInfo> Jersey { get; set; } = new();
 
-    [System.Text.Json.Serialization.JsonPropertyName("next")]
-    [System.Text.Json.Serialization.JsonConverter(typeof(NextMatchInfoConverter))]
+    [JsonPropertyName("next")]
     public NextMatchInfo? Next { get; set; }
+
+    // Empty constructor to handle empty data arrays
+    public TeamVersusRecentModel() { }
 }
 
 public class HeadToHeadMatch : MatchStat
 {
-    [System.Text.Json.Serialization.JsonPropertyName("manager")]
-    public ManagerData Manager { get; set; }
-
-    [System.Text.Json.Serialization.JsonPropertyName("referee")]
+    [JsonPropertyName("referee")]
     public List<RefereeInfo> Referee { get; set; } = new();
+
+    [JsonPropertyName("manager")]
+    public ManagerData? Manager { get; set; }
+
+    [JsonPropertyName("cuproundmatchnumber")]
+    public string? CupRoundMatchNumber { get; set; }
+
+    [JsonPropertyName("cuproundnumberofmatches")]
+    public string? CupRoundNumberOfMatches { get; set; }
+
+    [JsonPropertyName("matchStatus")]
+    [MongoDB.Bson.Serialization.Attributes.BsonElement("MatchStatus")]
+    public string? Status { get; set; }
+
+    [JsonPropertyName("tobeannounced")]
+    [MongoDB.Bson.Serialization.Attributes.BsonElement("HeadToHeadToBeAnnounced")]
+    public bool ToBeAnnounced { get; set; }
+
+    [JsonPropertyName("postponed")]
+    [MongoDB.Bson.Serialization.Attributes.BsonElement("HeadToHeadPostponed")]
+    public bool Postponed { get; set; }
+
+    [JsonPropertyName("canceled")]
+    [MongoDB.Bson.Serialization.Attributes.BsonElement("HeadToHeadCanceled")]
+    public bool Canceled { get; set; }
+
+    [JsonPropertyName("inlivescore")]
+    [MongoDB.Bson.Serialization.Attributes.BsonElement("HeadToHeadInLiveScore")]
+    public bool InLiveScore { get; set; }
+
+    [JsonPropertyName("bestof")]
+    [MongoDB.Bson.Serialization.Attributes.BsonElement("HeadToHeadBestOf")]
+    public string? BestOf { get; set; }
+
+    [JsonPropertyName("walkover")]
+    [MongoDB.Bson.Serialization.Attributes.BsonElement("HeadToHeadWalkOver")]
+    public bool WalkOver { get; set; }
+
+    [JsonPropertyName("retired")]
+    [MongoDB.Bson.Serialization.Attributes.BsonElement("HeadToHeadRetired")]
+    public bool Retired { get; set; }
+
+    [JsonPropertyName("disqualified")]
+    [MongoDB.Bson.Serialization.Attributes.BsonElement("HeadToHeadDisqualified")]
+    public bool Disqualified { get; set; }
 }
 
 public class ManagerData
 {
-    [System.Text.Json.Serialization.JsonPropertyName("home")]
-    public ManagerInfo Home { get; set; }
+    [JsonPropertyName("home")]
+    public ManagerInfo? Home { get; set; }
 
-    [System.Text.Json.Serialization.JsonPropertyName("away")]
-    public ManagerInfo Away { get; set; }
+    [JsonPropertyName("away")]
+    public ManagerInfo? Away { get; set; }
 }
 
 public class ManagerInfo
 {
-    [System.Text.Json.Serialization.JsonPropertyName("id")]
-    public string Id { get; set; }
+    [System.Text.Json.Serialization.JsonPropertyName("_doc")]
+    public string Doc { get; set; }
+
+    [System.Text.Json.Serialization.JsonPropertyName("_id")]
+    public int Id { get; set; }
 
     [System.Text.Json.Serialization.JsonPropertyName("name")]
     public string Name { get; set; }
 
-    [System.Text.Json.Serialization.JsonPropertyName("fullName")]
-    public string FullName { get; set; }
+    [System.Text.Json.Serialization.JsonPropertyName("fullname")]
+    public string? FullName { get; set; }
 
-    [System.Text.Json.Serialization.JsonPropertyName("birthDate")]
-    public DateInfo BirthDate { get; set; }
+    [System.Text.Json.Serialization.JsonPropertyName("birthdate")]
+    public DateInfo? BirthDate { get; set; }
 
     [System.Text.Json.Serialization.JsonPropertyName("nationality")]
-    public CountryInfo Nationality { get; set; }
+    public CountryCodeInfo Nationality { get; set; }
+
+    [System.Text.Json.Serialization.JsonPropertyName("primarypositiontype")]
+    public string? PrimaryPositionType { get; set; }
 
     [System.Text.Json.Serialization.JsonPropertyName("haslogo")]
     public bool HasLogo { get; set; }
 
     [System.Text.Json.Serialization.JsonPropertyName("membersince")]
-    public DateInfo MemberSince { get; set; }
-}
-
-public class DateInfo
-{
-    [System.Text.Json.Serialization.JsonPropertyName("time")]
-    public string Time { get; set; }
-
-    [System.Text.Json.Serialization.JsonPropertyName("date")]
-    public string Date { get; set; }
-
-    [System.Text.Json.Serialization.JsonPropertyName("timestamp")]
-    public long Timestamp { get; set; }
+    public DateInfo? MemberSince { get; set; }
 }
 
 public class RefereeInfo
 {
-    [System.Text.Json.Serialization.JsonPropertyName("id")]
-    public string Id { get; set; }
+    [System.Text.Json.Serialization.JsonPropertyName("_doc")]
+    public string Doc { get; set; }
+
+    [System.Text.Json.Serialization.JsonPropertyName("_id")]
+    public int Id { get; set; }
 
     [System.Text.Json.Serialization.JsonPropertyName("name")]
     public string Name { get; set; }
 
-    [System.Text.Json.Serialization.JsonPropertyName("fullName")]
+    [System.Text.Json.Serialization.JsonPropertyName("fullname")]
     public string FullName { get; set; }
 
+    [System.Text.Json.Serialization.JsonPropertyName("birthdate")]
+    public DateInfo? BirthDate { get; set; }
+
     [System.Text.Json.Serialization.JsonPropertyName("nationality")]
-    public CountryInfo Nationality { get; set; }
+    public CountryCodeInfo Nationality { get; set; }
 }
 
 public class NextMatchInfo : MatchStat
@@ -1764,17 +2182,24 @@ public class NextMatchInfo : MatchStat
     [System.Text.Json.Serialization.JsonPropertyName("stadium")]
     public StadiumInfo Stadium { get; set; }
 
-    [System.Text.Json.Serialization.JsonPropertyName("matchDifficultyRating")]
+    [System.Text.Json.Serialization.JsonPropertyName("matchdifficultyrating")]
     public Dictionary<string, int> MatchDifficultyRating { get; set; } = new();
 }
 
 public class StadiumInfo
 {
-    [System.Text.Json.Serialization.JsonPropertyName("id")]
-    public string Id { get; set; }
+    [System.Text.Json.Serialization.JsonPropertyName("_doc")]
+    public string Doc { get; set; }
+
+    [System.Text.Json.Serialization.JsonPropertyName("_id")]
+    [System.Text.Json.Serialization.JsonNumberHandling(System.Text.Json.Serialization.JsonNumberHandling.AllowReadingFromString)]
+    public int Id { get; set; }
 
     [System.Text.Json.Serialization.JsonPropertyName("name")]
     public string Name { get; set; }
+
+    [System.Text.Json.Serialization.JsonPropertyName("description")]
+    public string Description { get; set; }
 
     [System.Text.Json.Serialization.JsonPropertyName("city")]
     public string City { get; set; }
@@ -1782,17 +2207,44 @@ public class StadiumInfo
     [System.Text.Json.Serialization.JsonPropertyName("country")]
     public string Country { get; set; }
 
+    [System.Text.Json.Serialization.JsonPropertyName("state")]
+    public string? State { get; set; }
+
+    [System.Text.Json.Serialization.JsonPropertyName("cc")]
+    public CountryCodeInfo CountryCode { get; set; }
+
     [System.Text.Json.Serialization.JsonPropertyName("capacity")]
     public string Capacity { get; set; }
 
-    [System.Text.Json.Serialization.JsonPropertyName("countryCode")]
-    public CountryInfo CountryCode { get; set; }
+    [System.Text.Json.Serialization.JsonPropertyName("hometeams")]
+    public List<TeamInfo> HomeTeams { get; set; } = new();
 
-    [System.Text.Json.Serialization.JsonPropertyName("googleCoords")]
+    [System.Text.Json.Serialization.JsonPropertyName("googlecoords")]
     public string GoogleCoords { get; set; }
 
-    [System.Text.Json.Serialization.JsonPropertyName("homeTeams")]
-    public List<TeamInfo> HomeTeams { get; set; } = new();
+    [System.Text.Json.Serialization.JsonPropertyName("pitchsize")]
+    public JsonElement? PitchSize { get; set; }
+}
+
+public class DateInfo
+{
+    [System.Text.Json.Serialization.JsonPropertyName("_doc")]
+    public string Doc { get; set; }
+
+    [System.Text.Json.Serialization.JsonPropertyName("time")]
+    public string Time { get; set; }
+
+    [System.Text.Json.Serialization.JsonPropertyName("date")]
+    public string Date { get; set; }
+
+    [System.Text.Json.Serialization.JsonPropertyName("tz")]
+    public string Tz { get; set; }
+
+    [System.Text.Json.Serialization.JsonPropertyName("tzoffset")]
+    public int TzOffset { get; set; }
+
+    [System.Text.Json.Serialization.JsonPropertyName("uts")]
+    public long Uts { get; set; }
 }
 
 // Match Form models
@@ -1960,11 +2412,36 @@ public class RootObjectConverter<T> : System.Text.Json.Serialization.JsonConvert
                 newOptions.Converters.Add(converter);
             }
 
-            // Special handling for known problematic match IDs
-            if (_contextName.Contains("111111111841726") || _contextName.Contains("111111111906998"))
+            // Ensure we have JsonStringDictionaryConverter for handling complex nested objects with hyphens
+            bool hasStringDictionaryConverter = convertersToKeep.Any(c => c.GetType().Name.Contains("JsonStringDictionaryConverter"));
+            if (!hasStringDictionaryConverter && typeof(T).GetProperties().Any(p => p.PropertyType.IsGenericType &&
+                p.PropertyType.GetGenericTypeDefinition() == typeof(Dictionary<,>)))
             {
-                _logger.LogWarning($"Using empty object for known problematic match ID in {_contextName}");
-                return new T();
+                _logger.LogInformation($"Adding JsonStringDictionaryConverter to options for {_contextName}");
+
+                // We need to dynamically create the right converter type
+                var valueType = typeof(Averages); // Default to Averages for common use case
+
+                // Try to find actual value type from dictionary properties
+                foreach (var prop in typeof(T).GetProperties()
+                    .Where(p => p.PropertyType.IsGenericType &&
+                           p.PropertyType.GetGenericTypeDefinition() == typeof(Dictionary<,>)))
+                {
+                    var genericArgs = prop.PropertyType.GetGenericArguments();
+                    if (genericArgs.Length == 2 && genericArgs[0] == typeof(string))
+                    {
+                        valueType = genericArgs[1];
+                        break;
+                    }
+                }
+
+                // Create converter dynamically
+                Type converterType = typeof(JsonStringDictionaryConverter<>).MakeGenericType(valueType);
+                var converter = Activator.CreateInstance(converterType) as JsonConverter;
+                if (converter != null)
+                {
+                    newOptions.Converters.Add(converter);
+                }
             }
 
             // Handle array when object expected
@@ -1985,25 +2462,189 @@ public class RootObjectConverter<T> : System.Text.Json.Serialization.JsonConvert
                     var firstElement = doc.RootElement[0];
                     if (firstElement.ValueKind == JsonValueKind.Object)
                     {
+                        _logger.LogInformation($"Found doc array structure in {_contextName}, using first element");
                         return JsonSerializer.Deserialize<T>(firstElement.GetRawText(), newOptions) ?? new T();
                     }
                 }
-                catch
+                catch (Exception ex)
                 {
                     // If extracting first element fails, return empty object
+                    _logger.LogWarning(ex, $"Error extracting first element from array: {ex.Message}");
                     return new T();
                 }
             }
 
-            // Try standard deserialization
+            // Try to handle nested data structure with doc[0].data pattern
+            if (doc.RootElement.TryGetProperty("doc", out var docElement) &&
+                docElement.ValueKind == JsonValueKind.Array &&
+                docElement.GetArrayLength() > 0)
+            {
+                _logger.LogInformation($"Found doc array structure in {_contextName}");
+                var firstDoc = docElement[0];
+
+                // Check if it has the data property
+                if (firstDoc.TryGetProperty("data", out var dataElement) &&
+                    dataElement.ValueKind == JsonValueKind.Object)
+                {
+                    // Extract the actual data we want to deserialize
+                    var dataJson = dataElement.GetRawText();
+                    _logger.LogInformation($"Found data property in doc[0], using this for deserialization");
+
+                    // Use the data element for deserialization
+                    try
+                    {
+                        var docResult = JsonSerializer.Deserialize<T>(dataJson, newOptions);
+
+                        // Add query URL to result if model has QueryUrl property
+                        if (docResult != null)
+                        {
+                            var queryUrlProperty = typeof(T).GetProperty("QueryUrl");
+                            if (queryUrlProperty != null &&
+                                doc.RootElement.TryGetProperty("queryUrl", out var queryUrlElement))
+                            {
+                                queryUrlProperty.SetValue(docResult, queryUrlElement.GetString());
+                            }
+
+                            // Add event name to result if model has Event property
+                            var eventProperty = typeof(T).GetProperty("Event");
+                            if (eventProperty != null &&
+                                firstDoc.TryGetProperty("event", out var eventElement))
+                            {
+                                eventProperty.SetValue(docResult, eventElement.GetString());
+                            }
+
+                            // Add maxage to result if model has Maxage property
+                            var maxageProperty = typeof(T).GetProperty("Maxage");
+                            if (maxageProperty != null &&
+                                firstDoc.TryGetProperty("_maxage", out var maxageElement))
+                            {
+                                maxageProperty.SetValue(docResult, maxageElement.GetInt32());
+                            }
+
+                            // Add dob to result if model has Dob property
+                            var dobProperty = typeof(T).GetProperty("Dob");
+                            if (dobProperty != null &&
+                                firstDoc.TryGetProperty("_dob", out var dobElement))
+                            {
+                                dobProperty.SetValue(docResult, dobElement.GetInt64());
+                            }
+                        }
+
+                        if (docResult != null)
+                        {
+                            _logger.LogInformation($"Successfully deserialized data from doc array for {_contextName}");
+                            return docResult;
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning(ex, $"Failed to deserialize data element: {ex.Message}");
+                        // Continue to standard deserialization
+                    }
+                }
+            }
+
+            // Standard deserialization
             try
             {
+                // Special handling for TeamTableSliceModel and known problematic properties
+                if (typeof(T) == typeof(TeamTableSliceModel) && doc.RootElement.TryGetProperty("parenttableid", out var parentTableIdProp))
+                {
+                    // Check if the property is numeric but model expects string
+                    if (parentTableIdProp.ValueKind == JsonValueKind.Number)
+                    {
+                        _logger.LogInformation($"Applying special handling for numeric parenttableid in {_contextName}");
+
+                        // Create a copy of the JSON with the numeric value converted to string
+                        using var jsonDoc = JsonDocument.Parse(rawJson);
+                        var jsonCopy = new Dictionary<string, JsonElement>();
+
+                        foreach (var property in jsonDoc.RootElement.EnumerateObject())
+                        {
+                            if (property.Name == "parenttableid")
+                            {
+                                // Skip, we'll add this with the correct type
+                                continue;
+                            }
+                            jsonCopy.Add(property.Name, property.Value.Clone());
+                        }
+
+                        // Add parenttableid as string
+                        var jsonOptions = new JsonSerializerOptions { WriteIndented = false };
+                        var jsonString = JsonSerializer.Serialize(jsonCopy, jsonOptions);
+
+                        // Insert the string value of parenttableid
+                        jsonString = jsonString.Insert(jsonString.Length - 1, $",\"parenttableid\":\"{parentTableIdProp.GetRawText()}\"");
+
+                        // Try to deserialize with the fixed JSON
+                        try
+                        {
+                            var specialResult = JsonSerializer.Deserialize<T>(jsonString, newOptions);
+                            return specialResult ?? new T();
+                        }
+                        catch (Exception ex)
+                        {
+                            _logger.LogWarning(ex, $"Special handling for parenttableid failed: {ex.Message}");
+                            // Continue to standard error handling
+                        }
+                    }
+                }
+
                 var result = JsonSerializer.Deserialize<T>(rawJson, newOptions);
                 return result ?? new T();
             }
             catch (JsonException ex)
             {
                 _logger.LogError(ex, $"Error in standard deserialization for {_contextName}: {ex.Message}");
+
+                // Add more detailed logging for type mismatches
+                if (ex.Message.Contains("Cannot get the value of a token type") ||
+                    ex.Message.Contains("could not be converted"))
+                {
+                    _logger.LogWarning($"Type mismatch detected in JSON for {_contextName}. The model properties might need JsonConverter attributes.");
+
+                    // Extract path information if available
+                    var path = "unknown";
+                    if (ex.Message.Contains("Path:"))
+                    {
+                        var pathPart = ex.Message.Split("Path:")[1].Split('|')[0].Trim();
+                        path = pathPart;
+                        _logger.LogWarning($"JSON path with type mismatch: {path}");
+                    }
+
+                    // Try a more lenient approach with JsonNumberHandling
+                    try
+                    {
+                        var lenientOptions = new JsonSerializerOptions
+                        {
+                            PropertyNameCaseInsensitive = true,
+                            PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+                            NumberHandling = JsonNumberHandling.AllowReadingFromString | JsonNumberHandling.WriteAsString,
+                            DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
+                            IgnoreReadOnlyProperties = true,
+                            ReadCommentHandling = JsonCommentHandling.Skip,
+                            AllowTrailingCommas = true
+                        };
+
+                        // Add any converters from newOptions
+                        foreach (var converter in newOptions.Converters)
+                        {
+                            lenientOptions.Converters.Add(converter);
+                        }
+
+                        _logger.LogInformation($"Attempting fallback deserialization with lenient options for {_contextName}");
+                        var lenientResult = JsonSerializer.Deserialize<T>(rawJson, lenientOptions);
+                        if (lenientResult != null)
+                        {
+                            _logger.LogInformation($"Fallback deserialization succeeded for {_contextName}");
+                            return lenientResult;
+                        }
+                    }
+                    catch (Exception lenientEx)
+                    {
+                        _logger.LogWarning(lenientEx, $"Fallback deserialization also failed for {_contextName}: {lenientEx.Message}");
+                    }
+                }
 
                 // Return empty instance as fallback
                 return new T();
@@ -2043,92 +2684,823 @@ public class RootObjectConverter<T> : System.Text.Json.Serialization.JsonConvert
 // First, add a new model class for table data
 public class TeamTableSliceModel
 {
-    [System.Text.Json.Serialization.JsonPropertyName("matchid")]
-    [System.Text.Json.Serialization.JsonConverter(typeof(GenericStringConverter))]
-    public string MatchId { get; set; }
+    [JsonPropertyName("_doc")]
+    public string? Doc { get; set; }
 
-    [System.Text.Json.Serialization.JsonPropertyName("totalrows")]
-    public int TotalRows { get; set; }
+    [JsonPropertyName("_id")]
+    [JsonConverter(typeof(GenericStringConverter))]
+    public string? Id { get; set; }
 
-    [System.Text.Json.Serialization.JsonPropertyName("tablerows")]
-    public List<TableRowInfo> TableRows { get; set; } = new();
+    [JsonPropertyName("parenttableid")]
+    [JsonConverter(typeof(GenericStringConverter))]
+    public string? ParentTableId { get; set; }
 
-    [System.Text.Json.Serialization.JsonPropertyName("tournament")]
-    public TournamentTableInfo Tournament { get; set; }
+    [JsonPropertyName("leaguetypeid")]
+    [JsonConverter(typeof(GenericStringConverter))]
+    public string? LeagueTypeId { get; set; }
 
-    [System.Text.Json.Serialization.JsonPropertyName("currentround")]
+    [JsonPropertyName("parenttableids")]
+    [JsonConverter(typeof(ParentTableIdsConverter))]
+    public List<string> ParentTableIds { get; set; } = new();
+
+    [JsonPropertyName("seasonid")]
+    [JsonConverter(typeof(GenericStringConverter))]
+    public string? SeasonId { get; set; }
+
+    [JsonPropertyName("maxrounds")]
+    [JsonNumberHandling(JsonNumberHandling.AllowReadingFromString)]
+    public int MaxRounds { get; set; }
+
+    [JsonPropertyName("currentround")]
+    [JsonNumberHandling(JsonNumberHandling.AllowReadingFromString)]
     public int? CurrentRound { get; set; }
 
-    [System.Text.Json.Serialization.JsonPropertyName("maxrounds")]
-    public int? MaxRounds { get; set; }
+    [JsonPropertyName("presentationid")]
+    [JsonConverter(typeof(JsonElementToStringConverter))]
+    public string? PresentationId { get; set; }
 
-    // Helper methods to find team positions
-    public TableRowInfo GetTeamPosition(string teamId) =>
-        TableRows?.FirstOrDefault(row => row.Team?.Id == teamId);
+    [JsonPropertyName("name")]
+    public string? Name { get; set; }
+
+    [JsonPropertyName("abbr")]
+    public string? Abbr { get; set; }
+
+    [JsonPropertyName("groupname")]
+    public string? GroupName { get; set; }
+
+    [JsonPropertyName("tournament")]
+    public TournamentTableInfo? Tournament { get; set; }
+
+    [JsonPropertyName("realcategory")]
+    public RealCategoryInfo? RealCategory { get; set; }
+
+    [JsonPropertyName("rules")]
+    [JsonConverter(typeof(JsonElementToObjectConverter<RulesInfo>))]
+    public List<RulesInfo> Rules { get; set; } = new();
+
+    [JsonPropertyName("totalrows")]
+    [JsonNumberHandling(JsonNumberHandling.AllowReadingFromString)]
+    public int TotalRows { get; set; }
+
+    [JsonPropertyName("tablerows")]
+    public List<TableRowInfo> TableRows { get; set; } = new();
+
+    [JsonPropertyName("matchid")]
+    [JsonConverter(typeof(GenericStringConverter))]
+    public string? MatchId { get; set; }
+
+    // Extra fields from the doc wrapper
+    [JsonPropertyName("queryUrl")]
+    public string? QueryUrl { get; set; }
+
+    [JsonPropertyName("event")]
+    public string? Event { get; set; }
+
+    [JsonPropertyName("_dob")]
+    public long? Dob { get; set; }
+
+    [JsonPropertyName("_maxage")]
+    [JsonNumberHandling(JsonNumberHandling.AllowReadingFromString)]
+    public int? Maxage { get; set; }
+}
+
+// Custom converter for ParentTableIds
+public class ParentTableIdsConverter : JsonConverter<List<string>>
+{
+    public override List<string> Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
+    {
+        if (reader.TokenType == JsonTokenType.Null)
+        {
+            return new List<string>();
+        }
+
+        // If we have an empty object {}, return an empty list
+        if (reader.TokenType == JsonTokenType.StartObject)
+        {
+            var doc = JsonDocument.ParseValue(ref reader);
+            if (!doc.RootElement.EnumerateObject().Any())
+            {
+                return new List<string>();
+            }
+
+            // Handle the case where it's an object with properties
+            var result = new List<string>();
+            foreach (var prop in doc.RootElement.EnumerateObject())
+            {
+                result.Add(prop.Name);
+            }
+            return result;
+        }
+
+        // If we have an array, try to parse it as an array of strings
+        if (reader.TokenType == JsonTokenType.StartArray)
+        {
+            var doc = JsonDocument.ParseValue(ref reader);
+            var result = new List<string>();
+
+            foreach (var element in doc.RootElement.EnumerateArray())
+            {
+                if (element.ValueKind == JsonValueKind.String)
+                {
+                    result.Add(element.GetString() ?? "");
+                }
+                else
+                {
+                    result.Add(element.ToString());
+                }
+            }
+
+            return result;
+        }
+
+        // Default case: return empty list
+        return new List<string>();
+    }
+
+    public override void Write(Utf8JsonWriter writer, List<string> value, JsonSerializerOptions options)
+    {
+        if (value == null || !value.Any())
+        {
+            writer.WriteStartArray();
+            writer.WriteEndArray();
+            return;
+        }
+
+        writer.WriteStartArray();
+        foreach (var item in value)
+        {
+            writer.WriteStringValue(item);
+        }
+        writer.WriteEndArray();
+    }
+}
+
+// Then add a new converter to handle object-to-list conversion
+public class JsonElementToObjectConverter<T> : System.Text.Json.Serialization.JsonConverter<List<T>> where T : class, new()
+{
+    public override List<T> Read(ref System.Text.Json.Utf8JsonReader reader, Type typeToConvert, System.Text.Json.JsonSerializerOptions options)
+    {
+        // If we encounter null or an empty array, return empty list
+        if (reader.TokenType == JsonTokenType.Null ||
+            (reader.TokenType == JsonTokenType.StartArray && reader.Read() && reader.TokenType == JsonTokenType.EndArray))
+        {
+            return new List<T>();
+        }
+
+        // If we encounter an object, convert it to a list with a single item
+        if (reader.TokenType == JsonTokenType.StartObject)
+        {
+            using var doc = JsonDocument.ParseValue(ref reader);
+            var singleItem = JsonSerializer.Deserialize<T>(doc.RootElement.GetRawText(), options);
+
+            if (singleItem != null)
+            {
+                return new List<T> { singleItem };
+            }
+        }
+
+        // If we encounter an array, deserialize it normally
+        if (reader.TokenType == JsonTokenType.StartArray)
+        {
+            using var doc = JsonDocument.ParseValue(ref reader);
+            return JsonSerializer.Deserialize<List<T>>(doc.RootElement.GetRawText(), options) ?? new List<T>();
+        }
+
+        // Default: return empty list
+        return new List<T>();
+    }
+
+    public override void Write(System.Text.Json.Utf8JsonWriter writer, List<T> value, System.Text.Json.JsonSerializerOptions options)
+    {
+        if (value == null || value.Count == 0)
+        {
+            writer.WriteStartArray();
+            writer.WriteEndArray();
+            return;
+        }
+
+        writer.WriteStartArray();
+        foreach (var item in value)
+        {
+            JsonSerializer.Serialize(writer, item, options);
+        }
+        writer.WriteEndArray();
+    }
 }
 
 public class TableRowInfo
 {
-    [System.Text.Json.Serialization.JsonPropertyName("pos")]
-    public int Position { get; set; }
+    [JsonPropertyName("_doc")]
+    public string Doc { get; set; }
 
-    [System.Text.Json.Serialization.JsonPropertyName("posHome")]
-    public int HomePosition { get; set; }
-
-    [System.Text.Json.Serialization.JsonPropertyName("posAway")]
-    public int AwayPosition { get; set; }
-
-    [System.Text.Json.Serialization.JsonPropertyName("team")]
-    public TeamTableInfo Team { get; set; }
-
-    [System.Text.Json.Serialization.JsonPropertyName("pointsTotal")]
-    public int Points { get; set; }
-
-    [System.Text.Json.Serialization.JsonPropertyName("winTotal")]
-    public int Wins { get; set; }
-
-    [System.Text.Json.Serialization.JsonPropertyName("drawTotal")]
-    public int Draws { get; set; }
-
-    [System.Text.Json.Serialization.JsonPropertyName("lossTotal")]
-    public int Losses { get; set; }
-
-    [System.Text.Json.Serialization.JsonPropertyName("goalsForTotal")]
-    public int GoalsFor { get; set; }
-
-    [System.Text.Json.Serialization.JsonPropertyName("goalsAgainstTotal")]
-    public int GoalsAgainst { get; set; }
-}
-
-public class TeamTableInfo
-{
-    [System.Text.Json.Serialization.JsonPropertyName("_id")]
-    [System.Text.Json.Serialization.JsonConverter(typeof(GenericStringConverter))]
+    [JsonPropertyName("_id")]
+    [JsonConverter(typeof(GenericStringConverter))]
+    [BsonIgnoreIfNull]
     public string Id { get; set; }
 
-    [System.Text.Json.Serialization.JsonPropertyName("name")]
-    public string Name { get; set; }
+    [JsonPropertyName("promotion")]
+    [BsonIgnoreIfNull]
+    public PromotionInfo Promotion { get; set; }
 
-    [System.Text.Json.Serialization.JsonPropertyName("mediumname")]
-    public string MediumName { get; set; }
+    [JsonPropertyName("changeTotal")]
+    public int ChangeTotal { get; set; }
 
-    [System.Text.Json.Serialization.JsonPropertyName("abbr")]
-    public string Abbr { get; set; }
+    [JsonPropertyName("changeHome")]
+    public int ChangeHome { get; set; }
 
-    [System.Text.Json.Serialization.JsonPropertyName("haslogo")]
-    public bool HasLogo { get; set; }
+    [JsonPropertyName("changeAway")]
+    public int ChangeAway { get; set; }
+
+    [JsonPropertyName("drawTotal")]
+    public int DrawTotal { get; set; }
+
+    [JsonPropertyName("drawHome")]
+    public int DrawHome { get; set; }
+
+    [JsonPropertyName("drawAway")]
+    public int DrawAway { get; set; }
+
+    [JsonPropertyName("goalDiffTotal")]
+    public int GoalDiffTotal { get; set; }
+
+    [JsonPropertyName("goalDiffHome")]
+    public int GoalDiffHome { get; set; }
+
+    [JsonPropertyName("goalDiffAway")]
+    public int GoalDiffAway { get; set; }
+
+    [JsonPropertyName("goalsAgainstTotal")]
+    public int GoalsAgainstTotal { get; set; }
+
+    [JsonPropertyName("goalsAgainstHome")]
+    public int GoalsAgainstHome { get; set; }
+
+    [JsonPropertyName("goalsAgainstAway")]
+    public int GoalsAgainstAway { get; set; }
+
+    [JsonPropertyName("goalsForTotal")]
+    public int GoalsForTotal { get; set; }
+
+    [JsonPropertyName("goalsForHome")]
+    public int GoalsForHome { get; set; }
+
+    [JsonPropertyName("goalsForAway")]
+    public int GoalsForAway { get; set; }
+
+    [JsonPropertyName("lossTotal")]
+    public int LossTotal { get; set; }
+
+    [JsonPropertyName("lossHome")]
+    public int LossHome { get; set; }
+
+    [JsonPropertyName("lossAway")]
+    public int LossAway { get; set; }
+
+    [JsonPropertyName("total")]
+    public int Total { get; set; }
+
+    [JsonPropertyName("home")]
+    public int Home { get; set; }
+
+    [JsonPropertyName("away")]
+    public int Away { get; set; }
+
+    [JsonPropertyName("pointsTotal")]
+    public int PointsTotal { get; set; }
+
+    [JsonPropertyName("pointsHome")]
+    public int PointsHome { get; set; }
+
+    [JsonPropertyName("pointsAway")]
+    public int PointsAway { get; set; }
+
+    [JsonPropertyName("pos")]
+    public int Pos { get; set; }
+
+    [JsonPropertyName("posHome")]
+    public int PosHome { get; set; }
+
+    [JsonPropertyName("posAway")]
+    public int PosAway { get; set; }
+
+    [JsonPropertyName("sortPositionTotal")]
+    public int SortPositionTotal { get; set; }
+
+    [JsonPropertyName("sortPositionHome")]
+    public int SortPositionHome { get; set; }
+
+    [JsonPropertyName("sortPositionAway")]
+    public int SortPositionAway { get; set; }
+
+    [JsonPropertyName("team")]
+    public TeamTableInfo Team { get; set; }
+
+    [JsonPropertyName("winTotal")]
+    public int WinTotal { get; set; }
+
+    [JsonPropertyName("winHome")]
+    public int WinHome { get; set; }
+
+    [JsonPropertyName("winAway")]
+    public int WinAway { get; set; }
 }
 
 public class TournamentTableInfo
 {
-    [System.Text.Json.Serialization.JsonPropertyName("_id")]
-    [System.Text.Json.Serialization.JsonConverter(typeof(GenericStringConverter))]
-    public string Id { get; set; }
+    [JsonPropertyName("_doc")]
+    public string Doc { get; set; }
 
-    [System.Text.Json.Serialization.JsonPropertyName("name")]
+    [JsonPropertyName("_id")]
+    public int Id { get; set; }
+
+    [JsonPropertyName("_sid")]
+    public int Sid { get; set; }
+
+    [JsonPropertyName("_rcid")]
+    public int Rcid { get; set; }
+
+    [JsonPropertyName("_isk")]
+    public int Isk { get; set; }
+
+    [JsonPropertyName("_tid")]
+    public int Tid { get; set; }
+
+    [JsonPropertyName("_utid")]
+    public int Utid { get; set; }
+
+    [JsonPropertyName("_gender")]
+    public string Gender { get; set; }
+
+    [JsonPropertyName("name")]
     public string Name { get; set; }
 
-    [System.Text.Json.Serialization.JsonPropertyName("seasonid")]
-    [System.Text.Json.Serialization.JsonConverter(typeof(GenericStringConverter))]
-    public string SeasonId { get; set; }
+    [JsonPropertyName("abbr")]
+    public string Abbr { get; set; }
+
+    [JsonPropertyName("ground")]
+    public string Ground { get; set; }
+
+    [JsonPropertyName("friendly")]
+    public bool Friendly { get; set; }
+
+    [JsonPropertyName("seasonid")]
+    public int SeasonId { get; set; }
+
+    [JsonPropertyName("currentseason")]
+    public int CurrentSeason { get; set; }
+
+    [JsonPropertyName("year")]
+    public string Year { get; set; }
+
+    [JsonPropertyName("seasontype")]
+    public string SeasonType { get; set; }
+
+    [JsonPropertyName("seasontypename")]
+    public string SeasonTypeName { get; set; }
+
+    [JsonPropertyName("seasontypeunique")]
+    public string SeasonTypeUnique { get; set; }
+
+    [JsonPropertyName("livetable")]
+    [JsonConverter(typeof(JsonElementToStringConverter))]
+    [BsonIgnoreIfNull]
+    public string LiveTable { get; set; }
+
+    [JsonPropertyName("cuprosterid")]
+    public int? CupRosterId { get; set; }
+
+    [JsonPropertyName("roundbyround")]
+    public bool RoundByRound { get; set; }
+
+    [JsonPropertyName("tournamentlevelorder")]
+    public int? TournamentLevelOrder { get; set; }
+
+    [JsonPropertyName("tournamentlevelname")]
+    public string TournamentLevelName { get; set; }
+
+    [JsonPropertyName("outdated")]
+    public bool Outdated { get; set; }
+}
+
+public class TeamTableInfo
+{
+    [JsonPropertyName("_doc")]
+    public string Doc { get; set; }
+
+    [JsonPropertyName("_id")]
+    [JsonConverter(typeof(GenericStringConverter))]
+    public string Id { get; set; }
+
+    [JsonPropertyName("_sid")]
+    public int Sid { get; set; }
+
+    [JsonPropertyName("uid")]
+    public int Uid { get; set; }
+
+    [JsonPropertyName("virtual")]
+    public bool Virtual { get; set; }
+
+    [JsonPropertyName("name")]
+    public string Name { get; set; }
+
+    [JsonPropertyName("mediumname")]
+    public string MediumName { get; set; }
+
+    [JsonPropertyName("abbr")]
+    public string Abbr { get; set; }
+
+    [JsonPropertyName("nickname")]
+    public string Nickname { get; set; }
+
+    [JsonPropertyName("iscountry")]
+    public bool IsCountry { get; set; }
+
+    [JsonPropertyName("haslogo")]
+    public bool HasLogo { get; set; }
+
+    [JsonPropertyName("sex")]
+    public string Sex { get; set; }
+
+    [JsonPropertyName("teamtypeid")]
+    public int TeamTypeId { get; set; }
+
+    [JsonPropertyName("suffix")]
+    public string Suffix { get; set; }
+
+    [JsonPropertyName("founded")]
+    public string Founded { get; set; }
+
+    [JsonPropertyName("website")]
+    public string Website { get; set; }
+}
+
+public class PromotionInfo
+{
+    [JsonPropertyName("_doc")]
+    public string Doc { get; set; }
+
+    [JsonPropertyName("_id")]
+    [JsonConverter(typeof(GenericStringConverter))]
+    [BsonIgnoreIfNull]
+    public string Id { get; set; }
+
+    [JsonPropertyName("name")]
+    public string Name { get; set; }
+
+    [JsonPropertyName("shortname")]
+    public string ShortName { get; set; }
+
+    [JsonPropertyName("cssclass")]
+    public string CssClass { get; set; }
+
+    [JsonPropertyName("position")]
+    public int Position { get; set; }
+}
+
+public class RulesInfo
+{
+    [JsonPropertyName("_doc")]
+    public string Doc { get; set; }
+
+    [JsonPropertyName("_id")]
+    [JsonNumberHandling(JsonNumberHandling.AllowReadingFromString)]
+    public int Id { get; set; }
+
+    [JsonPropertyName("name")]
+    public string Name { get; set; }
+}
+
+public class JsonElementToStringConverter : System.Text.Json.Serialization.JsonConverter<string>
+{
+    public override string Read(ref System.Text.Json.Utf8JsonReader reader, Type typeToConvert, System.Text.Json.JsonSerializerOptions options)
+    {
+        if (reader.TokenType == System.Text.Json.JsonTokenType.Null)
+        {
+            return null;
+        }
+
+        // If it's already a string, just return it
+        if (reader.TokenType == System.Text.Json.JsonTokenType.String)
+        {
+            return reader.GetString();
+        }
+
+        // For any other token type, capture the raw JSON and return as string
+        using var doc = System.Text.Json.JsonDocument.ParseValue(ref reader);
+        return doc.RootElement.GetRawText();
+    }
+
+    public override void Write(System.Text.Json.Utf8JsonWriter writer, string value, System.Text.Json.JsonSerializerOptions options)
+    {
+        if (value == null)
+        {
+            writer.WriteNullValue();
+            return;
+        }
+
+        // Try to write it as a raw JSON string if it's valid JSON
+        try
+        {
+            using var doc = System.Text.Json.JsonDocument.Parse(value);
+            doc.RootElement.WriteTo(writer);
+        }
+        catch
+        {
+            // If not valid JSON, write as a normal string
+            writer.WriteStringValue(value);
+        }
+    }
+}
+
+// Add this class before the next existing class
+public class JsonStringDictionaryConverter<TValue> : JsonConverter<Dictionary<string, TValue>> where TValue : class, new()
+{
+    public override Dictionary<string, TValue> Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
+    {
+        if (reader.TokenType != JsonTokenType.StartObject)
+        {
+            if (reader.TokenType == JsonTokenType.Null)
+            {
+                return new Dictionary<string, TValue>();
+            }
+
+            // Log unexpected token type
+            Console.WriteLine($"JsonStringDictionaryConverter expected StartObject but got {reader.TokenType} for type {typeof(TValue).Name}");
+            throw new JsonException($"Expected StartObject but got {reader.TokenType}");
+        }
+
+        var result = new Dictionary<string, TValue>();
+        var valueOptions = new JsonSerializerOptions(options);
+
+        // Create a new list of converters excluding this specific type to prevent recursion
+        var convertersToKeep = valueOptions.Converters
+            .Where(c => !(c is JsonStringDictionaryConverter<TValue>))
+            .ToList();
+
+        valueOptions.Converters.Clear();
+        foreach (var converter in convertersToKeep)
+        {
+            valueOptions.Converters.Add(converter);
+        }
+
+        while (reader.Read())
+        {
+            if (reader.TokenType == JsonTokenType.EndObject)
+            {
+                return result;
+            }
+
+            if (reader.TokenType != JsonTokenType.PropertyName)
+            {
+                throw new JsonException($"Expected PropertyName but got {reader.TokenType}");
+            }
+
+            var propertyName = reader.GetString();
+            reader.Read();
+
+            if (reader.TokenType == JsonTokenType.Null)
+            {
+                result[propertyName] = null;
+                continue;
+            }
+
+            try
+            {
+                // Create a default value if deserialization fails
+                var value = new TValue();
+
+                // Deserialize the value based on its type
+                if (reader.TokenType == JsonTokenType.StartObject)
+                {
+                    // Skip this object and create a default instance
+                    // We just need to ensure we read past this object properly
+                    int depth = 1;
+                    while (depth > 0 && reader.Read())
+                    {
+                        if (reader.TokenType == JsonTokenType.StartObject || reader.TokenType == JsonTokenType.StartArray)
+                        {
+                            depth++;
+                        }
+                        else if (reader.TokenType == JsonTokenType.EndObject || reader.TokenType == JsonTokenType.EndArray)
+                        {
+                            depth--;
+                        }
+                    }
+                }
+                else
+                {
+                    // For primitive values, try deserializing normally
+                    value = JsonSerializer.Deserialize<TValue>(ref reader, valueOptions);
+                }
+
+                result[propertyName] = value;
+            }
+            catch (JsonException ex)
+            {
+                Console.WriteLine($"Error deserializing property '{propertyName}' of type {typeof(TValue).Name}: {ex.Message}");
+
+                // Create a default instance as a fallback
+                result[propertyName] = new TValue();
+
+                // Skip to the next property
+                int depth = 1;
+                while (depth > 0 && reader.Read())
+                {
+                    if (reader.TokenType == JsonTokenType.StartObject || reader.TokenType == JsonTokenType.StartArray)
+                    {
+                        depth++;
+                    }
+                    else if (reader.TokenType == JsonTokenType.EndObject || reader.TokenType == JsonTokenType.EndArray)
+                    {
+                        depth--;
+                    }
+                }
+            }
+        }
+
+        throw new JsonException("Expected EndObject but reached end of data");
+    }
+
+    public override void Write(Utf8JsonWriter writer, Dictionary<string, TValue> value, JsonSerializerOptions options)
+    {
+        writer.WriteStartObject();
+
+        foreach (var kvp in value)
+        {
+            writer.WritePropertyName(kvp.Key);
+            JsonSerializer.Serialize(writer, kvp.Value, options);
+        }
+
+        writer.WriteEndObject();
+    }
+}
+
+public class DoubleConverter : JsonConverter<double>
+{
+    public override double Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
+    {
+        switch (reader.TokenType)
+        {
+            case JsonTokenType.Number:
+                return reader.GetDouble();
+            case JsonTokenType.String:
+                var stringValue = reader.GetString();
+                if (string.IsNullOrEmpty(stringValue)) return 0;
+                if (double.TryParse(stringValue, out var result))
+                    return result;
+                return 0;
+            case JsonTokenType.True:
+                return 1;
+            case JsonTokenType.False:
+                return 0;
+            case JsonTokenType.Null:
+                return 0;
+            default:
+                throw new JsonException($"Cannot convert {reader.TokenType} to double");
+        }
+    }
+
+    public override void Write(Utf8JsonWriter writer, double value, JsonSerializerOptions options)
+    {
+        writer.WriteNumberValue(value);
+    }
+}
+
+public class AveragesDictionaryConverter : JsonConverter<Dictionary<string, Averages>>
+{
+    public override Dictionary<string, Averages> Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
+    {
+        if (reader.TokenType != JsonTokenType.StartObject)
+        {
+            throw new JsonException("Expected start of object");
+        }
+
+        var result = new Dictionary<string, Averages>();
+
+        while (reader.Read())
+        {
+            if (reader.TokenType == JsonTokenType.EndObject)
+            {
+                return result;
+            }
+
+            if (reader.TokenType != JsonTokenType.PropertyName)
+            {
+                throw new JsonException("Expected property name");
+            }
+
+            string propertyName = reader.GetString();
+            reader.Read();
+
+            try
+            {
+                // For time ranges with hyphens like "0-15"
+                if (reader.TokenType == JsonTokenType.StartObject)
+                {
+                    var averages = new Averages();
+
+                    while (reader.Read())
+                    {
+                        if (reader.TokenType == JsonTokenType.EndObject)
+                        {
+                            break;
+                        }
+
+                        if (reader.TokenType != JsonTokenType.PropertyName)
+                        {
+                            throw new JsonException("Expected property name in Averages object");
+                        }
+
+                        string fieldName = reader.GetString();
+                        reader.Read();
+
+                        // Parse the value as double, handling different token types
+                        double value = 0;
+                        if (reader.TokenType == JsonTokenType.Number)
+                        {
+                            value = reader.GetDouble();
+                        }
+                        else if (reader.TokenType == JsonTokenType.String)
+                        {
+                            if (double.TryParse(reader.GetString(), out double parsedValue))
+                            {
+                                value = parsedValue;
+                            }
+                        }
+
+                        // Set the appropriate property
+                        if (fieldName == "total")
+                        {
+                            averages.Total = value;
+                        }
+                        else if (fieldName == "home")
+                        {
+                            averages.Home = value;
+                        }
+                        else if (fieldName == "away")
+                        {
+                            averages.Away = value;
+                        }
+                    }
+
+                    result[propertyName] = averages;
+                }
+                else
+                {
+                    // Skip non-object values
+                    reader.Skip();
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error deserializing time range '{propertyName}': {ex.Message}");
+
+                // Add default values and continue
+                result[propertyName] = new Averages();
+
+                // Skip to the end of this property if needed
+                if (reader.TokenType == JsonTokenType.StartObject || reader.TokenType == JsonTokenType.StartArray)
+                {
+                    int depth = 1;
+                    while (depth > 0 && reader.Read())
+                    {
+                        if (reader.TokenType == JsonTokenType.StartObject || reader.TokenType == JsonTokenType.StartArray)
+                        {
+                            depth++;
+                        }
+                        else if (reader.TokenType == JsonTokenType.EndObject || reader.TokenType == JsonTokenType.EndArray)
+                        {
+                            depth--;
+                        }
+                    }
+                }
+            }
+        }
+
+        throw new JsonException("Expected end of object");
+    }
+
+    public override void Write(Utf8JsonWriter writer, Dictionary<string, Averages> value, JsonSerializerOptions options)
+    {
+        writer.WriteStartObject();
+
+        foreach (var kvp in value)
+        {
+            writer.WritePropertyName(kvp.Key);
+            writer.WriteStartObject();
+
+            writer.WritePropertyName("total");
+            writer.WriteNumberValue(kvp.Value.Total);
+
+            writer.WritePropertyName("home");
+            writer.WriteNumberValue(kvp.Value.Home);
+
+            writer.WritePropertyName("away");
+            writer.WriteNumberValue(kvp.Value.Away);
+
+            writer.WriteEndObject();
+        }
+
+        writer.WriteEndObject();
+    }
 }
