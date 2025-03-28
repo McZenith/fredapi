@@ -635,7 +635,7 @@ public static class SportMatchRoutes
                         avgGoals,
                         homePosition,
                         awayTeamName,
-                        0, // Possession data unavailable in this model, using default value
+                        match.LastXStatsTeam1?.Possession?.Total ?? 0,
                         match.OriginalMatch
                     );
 
@@ -649,7 +649,7 @@ public static class SportMatchRoutes
                         avgGoals,
                         awayPosition,
                         homeTeamName,
-                        0, // Possession data unavailable in this model, using default value
+                        match.LastXStatsTeam2?.Possession?.Total ?? 0,
                         match.OriginalMatch
                     );
 
@@ -1396,7 +1396,19 @@ public static class SportMatchRoutes
         if (away > 0)
             return away * 2;
 
-        // Default fallback value for when we don't have enough corner data
+        // If we have H2H data with corners, use that
+        if (team1LastX?.TeamVersusRecent?.Matches != null && team1LastX.TeamVersusRecent.Matches.Any())
+        {
+            var h2hCorners = team1LastX.TeamVersusRecent.Matches
+                .Where(m => m.Corners != null)
+                .Select(m => (m.Corners.Home + m.Corners.Away))
+                .ToList();
+
+            if (h2hCorners.Any())
+                return h2hCorners.Average();
+        }
+
+        // Default fallback value
         return 9.0; // Average number of corners in a match
     }
 
@@ -1428,20 +1440,8 @@ public static class SportMatchRoutes
                 if (homeId == teamId)
                 {
                     homeTotalMatches++;
-
-                    // Check if FirstGoal property exists and is "home"
                     if (match.FirstGoal == "home")
                         homeFirstCount++;
-                    // Alternative calculation based on result and periods if FirstGoal is not available
-                    else if (match.Result?.Home != null && match.Result?.Away != null &&
-                            match.Periods != null && match.Periods.TryGetValue("P1", out var firstHalf))
-                    {
-                        // If home team scored in first half and away didn't, assume home team scored first
-                        int homeGoals = firstHalf.Home;
-                        int awayGoals = firstHalf.Away;
-                        if (homeGoals > 0 && awayGoals == 0)
-                            homeFirstCount++;
-                    }
                 }
             }
 
@@ -1471,20 +1471,8 @@ public static class SportMatchRoutes
                 if (awayId == teamId)
                 {
                     awayTotalMatches++;
-
-                    // Check if FirstGoal property exists and is "away"
                     if (match.FirstGoal == "away")
                         awayFirstCount++;
-                    // Alternative calculation based on result and periods if FirstGoal is not available
-                    else if (match.Result?.Home != null && match.Result?.Away != null &&
-                            match.Periods != null && match.Periods.TryGetValue("P1", out var firstHalf))
-                    {
-                        // If away team scored in first half and home didn't, assume away team scored first
-                        int homeGoals = firstHalf.Home;
-                        int awayGoals = firstHalf.Away;
-                        if (awayGoals > 0 && homeGoals == 0)
-                            awayFirstCount++;
-                    }
                 }
             }
 
@@ -1514,22 +1502,8 @@ public static class SportMatchRoutes
                 if (homeId == teamId)
                 {
                     homeTotalMatches++;
-
-                    // Check if LastGoal property exists and is "home"
                     if (match.LastGoal == "home")
                         homeLateCount++;
-                    // Alternative calculation based on result and periods if LastGoal is not available
-                    else if (match.Result?.Home != null && match.Result?.Away != null &&
-                             match.Periods != null)
-                    {
-                        // Check if there was a second half goal by home team
-                        if (match.Periods.TryGetValue("P2", out var secondHalf))
-                        {
-                            int homeGoals = secondHalf.Home;
-                            if (homeGoals > 0)
-                                homeLateCount++;
-                        }
-                    }
                 }
             }
 
@@ -1559,22 +1533,8 @@ public static class SportMatchRoutes
                 if (awayId == teamId)
                 {
                     awayTotalMatches++;
-
-                    // Check if LastGoal property exists and is "away"
                     if (match.LastGoal == "away")
                         awayLateCount++;
-                    // Alternative calculation based on result and periods if LastGoal is not available
-                    else if (match.Result?.Home != null && match.Result?.Away != null &&
-                             match.Periods != null)
-                    {
-                        // Check if there was a second half goal by away team
-                        if (match.Periods.TryGetValue("P2", out var secondHalf))
-                        {
-                            int awayGoals = secondHalf.Away;
-                            if (awayGoals > 0)
-                                awayLateCount++;
-                        }
-                    }
                 }
             }
 
@@ -1590,11 +1550,21 @@ public static class SportMatchRoutes
     private static double CalculateAverageGoals(EnrichedSportMatch match)
     {
         // Try different methods to calculate average goals, with fallbacks
-        double calculatedAvg = 0;
-        bool hasCalculated = false;
 
-        // Method 1: Calculate from recent matches
-        if (match.Team1LastX?.Matches != null && match.Team2LastX?.Matches != null)
+        // Method 1: Use team stats from LastXStats if available
+        if (match.LastXStatsTeam1?.Scoring?.GoalsScoredAverage?.Total != null &&
+            match.LastXStatsTeam2?.Scoring?.GoalsScoredAverage?.Total != null)
+        {
+            double team1Avg = match.LastXStatsTeam1.Scoring.GoalsScoredAverage.Total ?? 0;
+            double team2Avg = match.LastXStatsTeam2.Scoring.GoalsScoredAverage.Total ?? 0;
+
+            if (team1Avg > 0 && team2Avg > 0)
+                return (team1Avg + team2Avg) / 2;
+        }
+
+        // Method 2: Calculate from recent matches
+        if (match.Team1LastX?.Matches != null && match.Team2LastX?.Matches != null &&
+            match.Team1LastX.Team?.Id != null && match.Team2LastX.Team?.Id != null)
         {
             double totalGoals = 0;
             int totalMatches = 0;
@@ -1630,14 +1600,11 @@ public static class SportMatchRoutes
             }
 
             if (totalMatches > 0)
-            {
-                calculatedAvg = totalGoals / totalMatches;
-                hasCalculated = true;
-            }
+                return totalGoals / totalMatches;
         }
 
-        // Method 2: Check head to head matches
-        if (!hasCalculated && match.TeamVersusRecent?.Matches != null && match.TeamVersusRecent.Matches.Any())
+        // Method 3: Check head to head matches
+        if (match.TeamVersusRecent?.Matches != null && match.TeamVersusRecent.Matches.Any())
         {
             var h2hMatches = match.TeamVersusRecent.Matches
                 .Where(m => m.Result?.Home != null && m.Result?.Away != null)
@@ -1646,89 +1613,30 @@ public static class SportMatchRoutes
             if (h2hMatches.Any())
             {
                 double totalGoals = h2hMatches.Sum(m => (m.Result.Home ?? 0) + (m.Result.Away ?? 0));
-                calculatedAvg = totalGoals / h2hMatches.Count;
-                hasCalculated = true;
+                return totalGoals / h2hMatches.Count;
             }
         }
 
-        // Method 3: Use odds data to estimate
-        if (!hasCalculated && match.Markets != null && match.Markets.Any())
+        // Method 4: Use odds data to estimate
+        if (match.Markets != null && match.Markets.Any())
         {
-            // Try Over/Under market
-            var overUnderMarket = match.Markets.FirstOrDefault(m => m.Name == "Over/Under");
-            if (overUnderMarket?.Outcomes != null && overUnderMarket.Outcomes.Any())
+            var over25Market = match.Markets.FirstOrDefault(m => m.Name == "Over/Under" && m.Specifier == "total=2.5");
+            if (over25Market?.Outcomes != null)
             {
-                // First try to get the line value from the specifier
-                double lineValue = 2.5; // Default
-                if (overUnderMarket.Specifier != null &&
-                    overUnderMarket.Specifier.StartsWith("total=") &&
-                    double.TryParse(overUnderMarket.Specifier.Substring(6), out double parsedLine))
+                var over25Probability = over25Market.Outcomes
+                    .FirstOrDefault(o => o.Desc == "Over 2.5")?.Probability;
+
+                if (double.TryParse(over25Probability, out double over25Prob))
                 {
-                    lineValue = parsedLine;
-                }
-
-                var overProb = overUnderMarket.Outcomes
-                    .FirstOrDefault(o => o.Desc?.StartsWith("Over") == true)?.Probability;
-
-                if (double.TryParse(overProb, out double overProbability))
-                {
-                    // Adjust expected goals based on probability of going over the line
-                    calculatedAvg = lineValue * (0.8 + (overProbability * 0.4)); // Scale between 0.8 and 1.2 times the line
-                    hasCalculated = true;
-                }
-            }
-
-            // If still not calculated, try 1X2 market odds for goal estimation
-            if (!hasCalculated)
-            {
-                var x12Market = match.Markets.FirstOrDefault(m => m.Name == "1X2");
-                if (x12Market?.Outcomes != null && x12Market.Outcomes.Count >= 3)
-                {
-                    double homeOdds = 0, drawOdds = 0, awayOdds = 0;
-
-                    foreach (var outcome in x12Market.Outcomes)
-                    {
-                        if (outcome.Desc == "Home" && double.TryParse(outcome.Odds, out double homeOddsValue))
-                            homeOdds = homeOddsValue;
-                        else if (outcome.Desc == "Draw" && double.TryParse(outcome.Odds, out double drawOddsValue))
-                            drawOdds = drawOddsValue;
-                        else if (outcome.Desc == "Away" && double.TryParse(outcome.Odds, out double awayOddsValue))
-                            awayOdds = awayOddsValue;
-                    }
-
-                    if (homeOdds > 0 && drawOdds > 0 && awayOdds > 0)
-                    {
-                        // Lower draw odds correlate with fewer goals
-                        // Lower home/away odds correlate with more goals for that team
-                        double avgEstimate = 2.5;
-                        if (drawOdds < 3.0) avgEstimate -= 0.3; // Likely fewer goals if draw odds are low
-                        if (Math.Min(homeOdds, awayOdds) < 2.0) avgEstimate += 0.4; // Likely more goals if one team is heavily favored
-
-                        calculatedAvg = avgEstimate;
-                        hasCalculated = true;
-                    }
+                    // Estimate expected goals based on the over 2.5 probability
+                    // Higher probability = higher expected goals
+                    return 2.5 + (over25Prob * 1.5); // Range from 2.5 to 4.0
                 }
             }
         }
 
-        // Method 4: Use default values since we can't access SportMatch.Result
-        if (!hasCalculated)
-        {
-            // Using reasonable default values based on tournament/competition 
-            string venue = match.OriginalMatch?.TournamentName ?? "";
-
-            // Different leagues have different scoring patterns
-            if (venue.Contains("Premier League") || venue.Contains("Bundesliga"))
-                return 2.8; // Higher scoring leagues
-            else if (venue.Contains("Serie A") || venue.Contains("La Liga"))
-                return 2.4; // Medium scoring leagues
-            else if (venue.Contains("Ligue 1") || venue.Contains("Championship"))
-                return 2.3; // Lower scoring leagues
-            else
-                return 2.5; // Average across all leagues
-        }
-
-        return Math.Max(calculatedAvg, 1.0); // Ensure we never return less than 1.0 goals
+        // Default fallback: average number of goals in soccer match
+        return 2.5;
     }
 
     private static bool CompareTeamIds(string id1, string id2)
@@ -1833,40 +1741,14 @@ public static class SportMatchRoutes
     private static int GetTeamPositionFromTable(fredapi.SportRadarService.Background.TeamTableSliceModel tableSlice, string teamId)
     {
         if (tableSlice?.TableRows == null || string.IsNullOrEmpty(teamId))
-            return 10; // Default to middle of the table as fallback
+            return 0;
 
         var teamRow = tableSlice.TableRows.FirstOrDefault(row =>
             row?.Team?.Id != null && (
                 row.Team.Id.ToString() == teamId ||
                 (int.TryParse(teamId, out var parsedId) && row.Team.Id.ToString() == parsedId.ToString())
             ));
-
-        // If found, return actual position
-        if (teamRow?.Pos != null)
-            return teamRow.Pos;
-
-        // If not found but we have table rows, try to estimate position based on team name
-        if (tableSlice.TableRows.Count > 0 && !string.IsNullOrEmpty(teamId))
-        {
-            // Try to match by team name substring (may not be exact)
-            foreach (var row in tableSlice.TableRows)
-            {
-                if (row?.Team?.Name != null &&
-                    !string.IsNullOrEmpty(row.Team.Name) &&
-                    !string.IsNullOrEmpty(teamId) &&
-                    (teamId.Contains(row.Team.Name) || row.Team.Name.Contains(teamId)))
-                {
-                    return row.Pos;
-                }
-            }
-
-            // If still nothing, just return a position based on position in array
-            return tableSlice.TableRows.Count > 5 ?
-                tableSlice.TableRows.Count / 2 : // Middle of table
-                tableSlice.TableRows.Count; // Bottom of a small table
-        }
-
-        return 10; // Default to middle of table as fallback
+        return teamRow?.Pos ?? 0;
     }
 
     private static string DetermineFavorite(List<MarketData> markets)
@@ -1918,7 +1800,7 @@ public static class SportMatchRoutes
             var team = new TeamData
             {
                 Name = teamName ?? "Unknown Team",
-                Position = position,
+                Position = position > 0 ? position : 0,
                 Logo = "", // We can set a default logo or leave it empty
                 IsHomeTeam = isHomeTeam,
                 OpponentName = opponentName ?? "Unknown Opponent",
@@ -1927,22 +1809,32 @@ public static class SportMatchRoutes
                 Possession = possession
             };
 
-            // Initialize default values for team statistics
-            team.AvgTotalGoals = 0;
-            team.AvgHomeGoals = 0;
-            team.AvgAwayGoals = 0;
-            team.HomeMatchesOver15 = 0;
-            team.AwayMatchesOver15 = 0;
-            team.TotalHomeMatches = 0;
-            team.TotalAwayMatches = 0;
-            team.CleanSheets = 0;
-            team.HomeCleanSheets = 0;
-            team.AwayCleanSheets = 0;
-            team.FirstHalfGoalsPercent = null;
-            team.SecondHalfGoalsPercent = null;
-            team.BttsRate = null;
-            team.HomeBttsRate = null;
-            team.AwayBttsRate = null;
+            // Process data from teamLastXStats first if available
+            if (teamLastXStats != null)
+            {
+                // Attempt to get scoring data
+                if (teamLastXStats.Scoring != null)
+                {
+                    team.AvgTotalGoals = teamLastXStats.Scoring.GoalsScoredAverage?.Total ?? 0;
+                    team.AvgHomeGoals = teamLastXStats.Scoring.GoalsScoredAverage?.Home ?? 0;
+                    team.AvgAwayGoals = teamLastXStats.Scoring.GoalsScoredAverage?.Away ?? 0;
+
+                    // Try to get distribution data
+                    if (teamLastXStats.Scoring.GoalsDistribution != null)
+                    {
+                        team.FirstHalfGoalsPercent = (int?)(teamLastXStats.Scoring.GoalsDistribution.FirstHalf * 100);
+                        team.SecondHalfGoalsPercent = (int?)(teamLastXStats.Scoring.GoalsDistribution.SecondHalf * 100);
+                    }
+                }
+
+                // Try to get BTTS stats
+                if (teamLastXStats.Trends != null)
+                {
+                    team.BttsRate = (int?)(teamLastXStats.Trends.BothTeamsToScore?.Total * 100) ?? 0;
+                    team.HomeBttsRate = (int?)(teamLastXStats.Trends.BothTeamsToScore?.Home * 100) ?? 0;
+                    team.AwayBttsRate = (int?)(teamLastXStats.Trends.BothTeamsToScore?.Away * 100) ?? 0;
+                }
+            }
 
             // Only process match data if we have valid team matches
             if (teamLastX?.Matches != null && teamLastX.Matches.Any())
@@ -2059,114 +1951,60 @@ public static class SportMatchRoutes
                 team.AverageGoalsScored = totalMatches > 0 ? (homeGoalsScored + awayGoalsScored) / totalMatches : 0;
                 team.AverageGoalsConceded = totalMatches > 0 ? (homeGoalsConceded + awayGoalsConceded) / totalMatches : 0;
 
-                // Calculate and set average goals
-                team.AvgHomeGoals = homeMatches > 0 ? (homeGoalsScored + homeGoalsConceded) / homeMatches : 0;
-                team.AvgAwayGoals = awayMatches > 0 ? (awayGoalsScored + awayGoalsConceded) / awayMatches : 0;
-                team.AvgTotalGoals = totalMatches > 0 ? (homeGoalsScored + homeGoalsConceded + awayGoalsScored + awayGoalsConceded) / totalMatches : 0;
-
-                // Set goal scoring/conceding averages for compatibility
-                team.GoalsScoredAverage = team.AverageGoalsScored;
-                team.GoalsConcededAverage = team.AverageGoalsConceded;
-
-                // Calculate BTTS rate
-                int homeGamesBtts = teamLastX.Matches.Count(m =>
-                    m.Teams?.Home?.Id != null &&
-                    CompareTeamIdWithString(teamLastX.Team?.Id, m.Teams.Home.Id) &&
-                    (m.Result?.Home ?? 0) > 0 && (m.Result?.Away ?? 0) > 0);
-
-                int awayGamesBtts = teamLastX.Matches.Count(m =>
-                    m.Teams?.Away?.Id != null &&
-                    CompareTeamIdWithString(teamLastX.Team?.Id, m.Teams.Away.Id) &&
-                    (m.Result?.Home ?? 0) > 0 && (m.Result?.Away ?? 0) > 0);
-
-                team.BttsRate = totalMatches > 0 ? (int?)Math.Round(((double)(homeGamesBtts + awayGamesBtts) / totalMatches) * 100) : null;
-                team.HomeBttsRate = homeMatches > 0 ? (int?)Math.Round(((double)homeGamesBtts / homeMatches) * 100) : null;
-                team.AwayBttsRate = awayMatches > 0 ? (int?)Math.Round(((double)awayGamesBtts / awayMatches) * 100) : null;
+                // Set UI display values if not already set from teamLastXStats
+                if (team.AvgHomeGoals == 0)
+                    team.AvgHomeGoals = team.HomeAverageGoalsScored;
+                if (team.AvgAwayGoals == 0)
+                    team.AvgAwayGoals = team.AwayAverageGoalsScored;
+                if (team.AvgTotalGoals == 0)
+                    team.AvgTotalGoals = team.AverageGoalsScored;
 
                 // Calculate form
-                team.Form = CalculateForm(teamLastX.Matches, teamId);
-                team.HomeForm = CalculateHomeForm(teamLastX.Matches, teamId);
-                team.AwayForm = CalculateAwayForm(teamLastX.Matches, teamId);
-                team.FormStrength = CalculateFormStrength(teamLastX.Matches, teamId);
+                team.Form = CalculateForm(teamLastX.Matches, teamLastX.Team?.Id.ToString());
+                team.HomeForm = CalculateHomeForm(teamLastX.Matches, teamLastX.Team?.Id.ToString());
+                team.AwayForm = CalculateAwayForm(teamLastX.Matches, teamLastX.Team?.Id.ToString());
+
+                // Calculate form strength
+                team.FormStrength = CalculateFormStrength(teamLastX.Matches, teamLastX.Team?.Id.ToString());
                 team.FormRating = team.FormStrength;
 
-                // Calculate corner stats
+                // Try to calculate corner stats
                 team.AvgCorners = CalculateAverageCorners(teamLastX.Matches, teamLastX.Team?.Id);
-                team.AverageCorners = team.AvgCorners != null ? team.AvgCorners.Value : 0;
 
-                // Calculate scoring patterns
-                team.ScoringFirstWinRate = CalculateScoringFirstWinRate(teamLastX.Matches, teamId);
-                team.ConcedingFirstWinRate = CalculateConcedingFirstWinRate(teamLastX.Matches, teamId);
-                team.LateGoalRate = CalculateLateGoalRate(teamLastX.Matches, teamId);
+                // Calculate scoring/conceding rates
+                team.ScoringFirstWinRate = CalculateScoringFirstWinRate(teamLastX.Matches, teamLastX.Team?.Id.ToString());
+                team.ConcedingFirstWinRate = CalculateConcedingFirstWinRate(teamLastX.Matches, teamLastX.Team?.Id.ToString());
 
-                // Calculate half goals
-                int firstHalfGoals = 0, secondHalfGoals = 0, totalGoals = 0;
-                foreach (var match in teamLastX.Matches)
-                {
-                    if (match.Periods != null)
-                    {
-                        // Check if periods dictionary contains values for first half (P1)
-                        if (match.Periods.ContainsKey("P1") && match.Periods["P1"] != null)
-                        {
-                            firstHalfGoals += match.Periods["P1"].Home;
-                            firstHalfGoals += match.Periods["P1"].Away;
-                        }
-
-                        // Check if periods dictionary contains values for second half (P2)
-                        if (match.Periods.ContainsKey("P2") && match.Periods["P2"] != null)
-                        {
-                            secondHalfGoals += match.Periods["P2"].Home;
-                            secondHalfGoals += match.Periods["P2"].Away;
-                        }
-                    }
-
-                    if (match.Result != null)
-                    {
-                        totalGoals += match.Result.Home ?? 0;
-                        totalGoals += match.Result.Away ?? 0;
-                    }
-                }
-
-                team.FirstHalfGoalsPercent = totalGoals > 0 ? (int?)(int)(firstHalfGoals * 100 / totalGoals) : null;
-                team.SecondHalfGoalsPercent = totalGoals > 0 ? (int?)(int)(secondHalfGoals * 100 / totalGoals) : null;
-            }
-
-            // Fallback for values that might still be null/zero
-            if (team.Form == null) team.Form = "";
-            if (team.HomeForm == null) team.HomeForm = "";
-            if (team.AwayForm == null) team.AwayForm = "";
-
-            if (team.AvgTotalGoals <= 0 && teamLastXStats != null)
-            {
-                // Try to get from original match data if available
-                if (originalMatch?.Teams?.Home != null && originalMatch?.Teams?.Away != null)
-                {
-                    // Since we can't directly access Result, use default average values
-                    team.AvgTotalGoals = isHomeTeam ? 2.7 : 2.3;
-                    team.AvgHomeGoals = isHomeTeam ? 1.5 : 1.2;
-                    team.AvgAwayGoals = isHomeTeam ? 1.2 : 1.1;
-                }
-                else
-                {
-                    // Default fallback values based on whether team is home or away
-                    team.AvgTotalGoals = isHomeTeam ? 2.7 : 2.3;
-                    team.AvgHomeGoals = isHomeTeam ? 1.5 : 1.2;
-                    team.AvgAwayGoals = isHomeTeam ? 1.2 : 1.1;
-                }
+                // Calculate late goal rate
+                team.LateGoalRate = CalculateLateGoalRate(teamLastX.Matches, teamLastX.Team?.Id.ToString());
             }
 
             return team;
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"Error extracting team data: {ex.Message}");
+            Console.WriteLine($"Error in ExtractTeamData: {ex.Message}");
+            // Return minimal team data to prevent errors
             return new TeamData
             {
-                Name = teamName ?? "Unknown Team",
-                Position = position,
+                Name = teamName,
+                Position = position > 0 ? position : 0,
+                FormStrength = 0,
+                WinPercentage = 0,
+                HomeWinPercentage = 0,
+                AwayWinPercentage = 0,
+                AverageGoalsScored = 0,
+                AverageGoalsConceded = 0,
+                HomeAverageGoalsScored = 0,
+                HomeAverageGoalsConceded = 0,
+                AwayAverageGoalsScored = 0,
+                AwayAverageGoalsConceded = 0,
+                AvgHomeGoals = 0,
+                AvgAwayGoals = 0,
+                AvgTotalGoals = 0,
                 Form = "",
-                HomeForm = "",
-                AwayForm = ""
+                IsHomeTeam = isHomeTeam,
+                OpponentName = opponentName
             };
         }
     }
