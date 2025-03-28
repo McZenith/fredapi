@@ -93,7 +93,7 @@ public class UpcomingMatchEnrichmentService : BackgroundService
 
                     // Filter out matches that have already been enriched (bulk operation)
                     var existingMatchIds = await collection
-                        .Find(Builders<EnrichedSportMatch>.Filter.In(x => x.MatchId, allMatchIds.Select(id => id.Split(':')[2])))
+                        .FindWithDiskUse(Builders<EnrichedSportMatch>.Filter.In(x => x.MatchId, allMatchIds.Select(id => id.Split(':')[2])))
                         .Project(x => x.MatchId)
                         .ToListAsync(stoppingToken);
 
@@ -351,7 +351,7 @@ public class UpcomingMatchEnrichmentService : BackgroundService
             var enrichedCollection = mongoDbService.GetCollection<EnrichedSportMatch>("EnrichedSportMatches");
 
             // Get IDs of matches that are already enriched
-            var enrichedMatchIds = await enrichedCollection.Find(FilterDefinition<EnrichedSportMatch>.Empty)
+            var enrichedMatchIds = await enrichedCollection.FindWithDiskUse(FilterDefinition<EnrichedSportMatch>.Empty)
                 .Project(x => x.MatchId)
                 .ToListAsync(stoppingToken);
 

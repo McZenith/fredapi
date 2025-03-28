@@ -40,15 +40,8 @@ public static class MatchesEndpoints
                     new CreateIndexModel<EnrichedMatch>(indexKeysDefinition),
                     cancellationToken: cancellationToken);
 
-                var findOptions = new FindOptions 
-                {
-                    BatchSize = 1000,
-                    NoCursorTimeout = false,
-                    MaxTime = TimeSpan.FromSeconds(30)
-                };
-
                 var matches = await collection
-                    .Find(filter, findOptions)
+                    .FindWithDiskUse(filter)
                     .Skip(skip)
                     .Limit(limit)
                     .SortByDescending(x => x.MatchId)

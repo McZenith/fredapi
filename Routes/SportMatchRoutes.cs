@@ -21,6 +21,7 @@ using MongoDB.Driver;
 using Microsoft.Extensions.Caching.Memory;
 using TeamTableSliceModel = fredapi.SportRadarService.Background.TeamTableSliceModel;
 using RulesInfo = fredapi.SportRadarService.Background.RulesInfo;
+using MongoDB.Bson;
 
 namespace fredapi.Routes;
 
@@ -416,16 +417,9 @@ public static class SportMatchRoutes
         {
             var collection = mongoDbService.GetCollection<EnrichedSportMatch>("EnrichedSportMatches");
 
-            // Create find options with allowDiskUse to handle large sorts
-            var findOptions = new FindOptions
-            {
-                AllowDiskUse = true,
-                MaxTime = TimeSpan.FromSeconds(60)
-            };
-
-            var matches = await collection.Find(
-                    FilterDefinition<EnrichedSportMatch>.Empty,
-                    findOptions)
+            // Use our extension method to ensure AllowDiskUse is enabled
+            var matches = await collection
+                .FindWithDiskUse(FilterDefinition<EnrichedSportMatch>.Empty)
                 .SortByDescending(static m => m.MatchTime)
                 .ToListAsync();
 
@@ -446,7 +440,8 @@ public static class SportMatchRoutes
         {
             var collection = mongoDbService.GetCollection<EnrichedSportMatch>("EnrichedSportMatches");
             var filter = Builders<EnrichedSportMatch>.Filter.Eq(static m => m.MatchId, matchId);
-            var match = await collection.Find(filter).FirstOrDefaultAsync();
+            // Use our extension method to ensure AllowDiskUse is enabled
+            var match = await collection.FindWithDiskUse(filter).FirstOrDefaultAsync();
 
             if (match == null)
             {
@@ -481,16 +476,9 @@ public static class SportMatchRoutes
             var totalCount = await collection.CountDocumentsAsync(FilterDefinition<EnrichedSportMatch>.Empty);
             Console.WriteLine($"Total matches in database: {totalCount}");
 
-            // Use minimal filtering to get all matches with AllowDiskUse option
-            var findOptions = new FindOptions
-            {
-                AllowDiskUse = true,
-                MaxTime = TimeSpan.FromSeconds(60)
-            };
-
-            var matches = await collection.Find(
-                    FilterDefinition<EnrichedSportMatch>.Empty,
-                    findOptions)
+            // Use our extension method to ensure AllowDiskUse is enabled
+            var matches = await collection
+                .FindWithDiskUse(FilterDefinition<EnrichedSportMatch>.Empty)
                 .SortByDescending(m => m.MatchTime)
                 .ToListAsync();
 
@@ -1076,7 +1064,7 @@ public static class SportMatchRoutes
                 {
                     string dateStr = match.Time.Date;
                     if (DateTime.TryParse(dateStr, out DateTime dt))
-                    dateStr = dt.ToString("yyyy-MM-dd");
+                        dateStr = dt.ToString("yyyy-MM-dd");
                     else
                         dateStr = "Unknown Date";
 
@@ -1084,12 +1072,12 @@ public static class SportMatchRoutes
                     ? $"{homeAbbr} {homeTeamScore}-{awayTeamScore} {awayAbbr}"
                     : $"{awayAbbr} {awayTeamScore}-{homeTeamScore} {homeAbbr}";
 
-                h2h.RecentMatches.Add(new RecentMatchData
-                {
-                    Date = dateStr,
-                    Result = resultStr
-                });
-            }
+                    h2h.RecentMatches.Add(new RecentMatchData
+                    {
+                        Date = dateStr,
+                        Result = resultStr
+                    });
+                }
             }
         }
         catch (Exception ex)
@@ -2148,9 +2136,8 @@ public static class SportMatchRoutes
                     {
                         // If probability of over 2.5 is high, expected goals is higher
                         var goalsFrom25 = 2.5 + (over25Prob * 1.5); // Scale from 2.5 to 4.0
-                        expectedGoals += goalsFrom25 * 0.6; // 60% weight
-                        weight += 0.6;
-                        Console.WriteLine($"Using Over 2.5 odds with probability {over25Prob}, adding {goalsFrom25 * 0.6} weighted goals");
+                        expectedGoals += goalsFrom25;
+                        weight += 3;  // Higher weight for odds-based expectations
                     }
                 }
 

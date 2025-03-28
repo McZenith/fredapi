@@ -66,7 +66,7 @@ public class UpcomingMatchBackgroundService(
                         // 5) Check which matches already exist in DB (bulk operation)
                         var filter = Builders<Model.EnrichedMatch>.Filter.In(x => x.MatchId, allMatchIds);
                         var existingMatches = await matchesCollection
-                            .Find(filter)
+                            .FindWithDiskUse(filter)
                             .Project(x => x.MatchId)
                             .ToListAsync(stoppingToken);
 

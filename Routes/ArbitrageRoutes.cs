@@ -8,7 +8,7 @@ public static class ArbitrageRoutes
 {
     public static RouteGroupBuilder MapArbitrageRoutes(this RouteGroupBuilder group)
     {
-        group.MapGet("/arbitrage", GetArbitrageMatches)
+        group.MapGet("/arbitrage", GetUpcomingArbitrageMatches)
             .WithName("GetArbitrageMatches")
             .WithDescription("Get all upcoming arbitrage matches")
             .WithOpenApi();
@@ -26,12 +26,15 @@ public static class ArbitrageRoutes
         return group;
     }
 
-    private static async Task<IResult> GetArbitrageMatches(MongoDbService mongoDbService)
+    private static async Task<IResult> GetUpcomingArbitrageMatches(MongoDbService mongoDbService)
     {
         try
         {
             var collection = mongoDbService.GetCollection<ArbitrageMatch>("UpcomingArbitrageMatches");
-            var matches = await collection.Find(FilterDefinition<ArbitrageMatch>.Empty)
+
+            // Use our extension method to ensure AllowDiskUse is enabled
+            var matches = await collection
+                .FindWithDiskUse(FilterDefinition<ArbitrageMatch>.Empty)
                 .SortByDescending(m => m.Markets.Any() ? m.Markets.Max(market => market.ProfitPercentage) : 0)
                 .ToListAsync();
 
@@ -51,7 +54,10 @@ public static class ArbitrageRoutes
         try
         {
             var collection = mongoDbService.GetCollection<ArbitrageMatch>("EnrichedArbitrageMatches");
-            var matches = await collection.Find(FilterDefinition<ArbitrageMatch>.Empty)
+
+            // Use our extension method to ensure AllowDiskUse is enabled
+            var matches = await collection
+                .FindWithDiskUse(FilterDefinition<ArbitrageMatch>.Empty)
                 .ToListAsync();
 
             return Results.Ok(matches);
@@ -71,7 +77,9 @@ public static class ArbitrageRoutes
         {
             var collection = mongoDbService.GetCollection<ArbitrageMatch>("EnrichedArbitrageMatches");
             var filter = Builders<ArbitrageMatch>.Filter.Eq(m => m.MatchId, matchId);
-            var match = await collection.Find(filter).FirstOrDefaultAsync();
+
+            // Use our extension method to ensure AllowDiskUse is enabled
+            var match = await collection.FindWithDiskUse(filter).FirstOrDefaultAsync();
 
             if (match == null)
             {

@@ -18,8 +18,9 @@ public static class MatchDetailsEndpoint
                 try
                 {
                     var collection = mongoDbService.GetCollection<EnrichedMatch>("DailyMatches");
+                    var filter = Builders<EnrichedMatch>.Filter.Eq(x => x.MatchId, matchId);
                     var match = await collection
-                        .Find(x => x.MatchId == matchId)
+                        .FindWithDiskUse(filter)
                         .FirstOrDefaultAsync(cancellationToken);
 
                     return match == null ? Results.NotFound() : Results.Ok(match);

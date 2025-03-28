@@ -3,6 +3,7 @@ using fredapi.Routes;
 using fredapi.SignalR;
 using fredapi.Utils;
 using Microsoft.AspNetCore.Http.Connections;
+using fredapi.SportRadarService.Background;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -58,6 +59,28 @@ var app = builder.Build();
 if (app.Environment.IsDevelopment()) 
 {
     app.MapOpenApi();
+}
+
+// Create MongoDB indexes for optimizing sort operations
+using (var scope = app.Services.CreateScope())
+{
+    var mongoDbService = scope.ServiceProvider.GetRequiredService<MongoDbService>();
+    var logger = scope.ServiceProvider.GetRequiredService<ILogger<Program>>();
+
+    try
+    {
+        // Create index on MatchTime field (descending) for EnrichedSportMatches collection
+        await mongoDbService.CreateIndexAsync<EnrichedSportMatch>(
+            "EnrichedSportMatches",
+            "MatchTime",
+            descending: true);
+
+        logger.LogInformation("Successfully created MongoDB indexes at startup");
+    }
+    catch (Exception ex)
+    {
+        logger.LogError(ex, "Error creating MongoDB indexes at startup");
+    }
 }
 
 // Order is important for middleware
