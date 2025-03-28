@@ -392,8 +392,7 @@ public static class SportMatchRoutes
 
     public static RouteGroupBuilder MapSportMatchRoutes(this RouteGroupBuilder group)
     {
-        group.MapGet("/sportmatches", (MongoDbService mongoDbService, int page = 1, int pageSize = 50) =>
-                GetEnrichedMatches(page, pageSize, mongoDbService))
+        group.MapGet("/sportmatches", GetEnrichedMatches)
             .WithName("GetEnrichedMatches")
             .WithDescription("Get all enriched sport matches with additional stats")
             .WithOpenApi();
@@ -403,8 +402,7 @@ public static class SportMatchRoutes
             .WithDescription("Get an enriched sport match by its ID")
             .WithOpenApi();
 
-        group.MapGet("/prediction-data", (MongoDbService mongoDbService, int days = 30, int limit = 500) =>
-                GetPredictionData(mongoDbService, days, limit))
+        group.MapGet("/prediction-data", GetPredictionData)
             .WithName("GetPredictionData")
             .WithDescription("Get enriched sports match data transformed for prediction UI")
             .WithOpenApi();
@@ -412,36 +410,26 @@ public static class SportMatchRoutes
         return group;
     }
 
-    private static async Task<IResult> GetEnrichedMatches(int page, int pageSize, MongoDbService mongoDbService)
+    private static async Task<IResult> GetEnrichedMatches(MongoDbService mongoDbService)
     {
         try
         {
-            // Ensure valid pagination parameters
-            page = Math.Max(1, page);
-            pageSize = Math.Clamp(pageSize, 1, 100);
-
             var collection = mongoDbService.GetCollection<EnrichedSportMatch>("EnrichedSportMatches");
 
-            // Get total count for pagination metadata
-            var totalCount = await collection.CountDocumentsAsync(FilterDefinition<EnrichedSportMatch>.Empty);
+            // Create find options with allowDiskUse to handle large sorts
+            var findOptions = new FindOptions
+            {
+                AllowDiskUse = true,
+                MaxTime = TimeSpan.FromSeconds(60)
+            };
 
-            // Configure the query with pagination and allowDiskUse
-            var findOptions = new FindOptions { AllowDiskUse = true };
-            var matches = await collection.Find(FilterDefinition<EnrichedSportMatch>.Empty, findOptions)
-                .SortByDescending(m => m.MatchTime)
-                .Skip((page - 1) * pageSize)
-                .Limit(pageSize)
+            var matches = await collection.Find(
+                    FilterDefinition<EnrichedSportMatch>.Empty,
+                    findOptions)
+                .SortByDescending(static m => m.MatchTime)
                 .ToListAsync();
 
-            // Return with pagination metadata
-            return Results.Ok(new
-            {
-                totalCount,
-                totalPages = (int)Math.Ceiling((double)totalCount / pageSize),
-                currentPage = page,
-                pageSize,
-                data = matches
-            });
+            return Results.Ok(matches);
         }
         catch (Exception ex)
         {
@@ -476,25 +464,16 @@ public static class SportMatchRoutes
         }
     }
 
-    private static async Task<IResult> GetPredictionData(MongoDbService mongoDbService, int days, int limit)
+    private static async Task<IResult> GetPredictionData(MongoDbService mongoDbService)
     {
-        var cacheKey = $"prediction_data_{DateTime.UtcNow:yyyy-MM-dd}_{days}_{limit}";
+        var cacheKey = $"prediction_data_{DateTime.UtcNow:yyyy-MM-dd}";
         var sw = System.Diagnostics.Stopwatch.StartNew();
 
         try
         {
-            // Ensure valid parameters
-            days = Math.Max(1, Math.Min(days, 365)); // Between 1 and 365 days
-            limit = Math.Max(10, Math.Min(limit, 1000)); // Between 10 and 1000 matches
-
-            // Check cache first
-            if (_cache.TryGetValue(cacheKey, out PredictiveResponse cachedResponse))
-            {
-                Console.WriteLine("Returning cached prediction data");
-                return Results.Ok(cachedResponse);
-            }
-
-            Console.WriteLine($"Fetching fresh prediction data for last {days} days, limit {limit} matches");
+            // Clear cache to force fresh data
+            _cache.Remove(cacheKey);
+            Console.WriteLine("Fetching fresh prediction data");
 
             var collection = mongoDbService.GetCollection<EnrichedSportMatch>("EnrichedSportMatches");
 
@@ -502,15 +481,17 @@ public static class SportMatchRoutes
             var totalCount = await collection.CountDocumentsAsync(FilterDefinition<EnrichedSportMatch>.Empty);
             Console.WriteLine($"Total matches in database: {totalCount}");
 
-            // Limit to most recent matches based on user parameter
-            var startDate = DateTime.UtcNow.AddDays(-days);
-            var filter = Builders<EnrichedSportMatch>.Filter.Gte(m => m.MatchTime, startDate);
+            // Use minimal filtering to get all matches with AllowDiskUse option
+            var findOptions = new FindOptions
+            {
+                AllowDiskUse = true,
+                MaxTime = TimeSpan.FromSeconds(60)
+            };
 
-            // Use minimal filtering with allowDiskUse option
-            var findOptions = new FindOptions { AllowDiskUse = true };
-            var matches = await collection.Find(filter, findOptions)
+            var matches = await collection.Find(
+                    FilterDefinition<EnrichedSportMatch>.Empty,
+                    findOptions)
                 .SortByDescending(m => m.MatchTime)
-                .Limit(limit)
                 .ToListAsync();
 
             Console.WriteLine($"Found {matches.Count} total matches");
@@ -763,16 +744,8 @@ public static class SportMatchRoutes
     private static int CalculateConfidenceScore(EnrichedSportMatch match)
     {
         // If we're missing critical data, return 0
-        if (match == null || string.IsNullOrEmpty(match.MatchId))
+        if (match == null)
             return 0;
-
-        // Check if we have a cached result
-        if (_calculationCache.TryGetValue(match.MatchId, out var cachedValues) &&
-            cachedValues.ConfidenceScore.HasValue)
-        {
-            Console.WriteLine($"Using cached confidence score for match {match.MatchId}");
-            return cachedValues.ConfidenceScore.Value;
-        }
 
         int totalWeight = 0;
         int totalScore = 0;
@@ -943,15 +916,7 @@ public static class SportMatchRoutes
 
             var totalConfidence = totalScore / totalWeight;
             Console.WriteLine($"Final confidence score: {totalConfidence}% (total: {totalScore}, weight: {totalWeight})");
-
-            // Cache the result before returning
-            var confidenceScore = Math.Max(0, Math.Min(100, totalConfidence));
-            var cachedExpectedGoals = _calculationCache.TryGetValue(match.MatchId, out var existingValues) ?
-                existingValues.ExpectedGoals : null;
-
-            _calculationCache[match.MatchId] = (cachedExpectedGoals, confidenceScore);
-
-            return confidenceScore; // Ensure value is between 0-100
+            return Math.Max(0, Math.Min(100, totalConfidence)); // Ensure value is between 0-100
         }
         catch (Exception ex)
         {
@@ -2155,16 +2120,8 @@ public static class SportMatchRoutes
 
     private static double CalculateExpectedGoals(EnrichedSportMatch match)
     {
-        if (match == null || string.IsNullOrEmpty(match.MatchId))
+        if (match == null)
             return 0;
-
-        // Check if we have a cached result
-        if (_calculationCache.TryGetValue(match.MatchId, out var cachedValues) &&
-            cachedValues.ExpectedGoals.HasValue)
-        {
-            Console.WriteLine($"Using cached expected goals for match {match.MatchId}");
-            return cachedValues.ExpectedGoals.Value;
-        }
 
         double expectedGoals = 0;
         double weight = 0;
@@ -2344,19 +2301,12 @@ public static class SportMatchRoutes
             // Calculate final expected goals as weighted average
             var finalExpectedGoals = Math.Round(expectedGoals / weight, 2);
             Console.WriteLine($"Final expected goals: {finalExpectedGoals} (total: {expectedGoals}, weight: {weight})");
-
-            // Cache the result before returning
-            var confidenceScore = _calculationCache.TryGetValue(match.MatchId, out var existingValues) ?
-                existingValues.ConfidenceScore : null;
-
-            _calculationCache[match.MatchId] = (finalExpectedGoals, confidenceScore);
-
             return finalExpectedGoals;
         }
         catch (Exception ex)
         {
             Console.WriteLine($"Error calculating expected goals: {ex.Message}");
-            return 2.5; // Default to 2.5 expected goals on error
+            return 2.5; // Reasonable default
         }
     }
 }
