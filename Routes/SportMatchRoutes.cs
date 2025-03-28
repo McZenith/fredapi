@@ -2,6 +2,7 @@ using System.Text.Json;
 using System.Text.Json.Serialization;
 using fredapi.Database;
 using fredapi.SportRadarService.Background;
+using fredapi.SportRadarService.Transformers;
 using MongoDB.Driver;
 using MarketData = fredapi.SportRadarService.Background.ArbitrageLiveMatchBackgroundService.MarketData;
 using Microsoft.Extensions.Caching.Memory;
@@ -9,7 +10,6 @@ using Microsoft.Extensions.Caching.Memory;
 
 using TeamTableSliceModel = fredapi.SportRadarService.Background.TeamTableSliceModel;
 using MongoDB.Bson;
-using fredapi.SportRadarService.Transformers;
 using MongoDB.Bson.Serialization.Attributes;
 
 namespace fredapi.Routes;
@@ -24,6 +24,15 @@ public static class SportMatchRoutes
 {
     private static readonly IMemoryCache _cache = new MemoryCache(new MemoryCacheOptions());
     private static readonly TimeSpan _defaultCacheDuration = TimeSpan.FromMinutes(5);
+
+    // Add a reusable method for clean serialization options
+    private static JsonSerializerOptions GetCleanSerializerOptions() => new()
+    {
+        ReferenceHandler = ReferenceHandler.IgnoreCycles,
+        DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
+        WriteIndented = false,
+        Converters = { new JsonElementInvalidHandlingConverter() }
+    };
 
     public static RouteGroupBuilder MapSportMatchRoutes(this RouteGroupBuilder group)
     {
@@ -66,7 +75,8 @@ public static class SportMatchRoutes
         {
             if (_cache.TryGetValue(cacheKey, out PaginatedResponse<List<EnrichedSportMatch>> cachedResponse))
             {
-                return Results.Ok(cachedResponse);
+                // Use the clean serialization options for cached response
+                return Results.Json(cachedResponse, GetCleanSerializerOptions());
             }
 
             var collection = mongoDbService.GetCollection<EnrichedSportMatch>("EnrichedSportMatches");
@@ -107,7 +117,8 @@ public static class SportMatchRoutes
                 .SetAbsoluteExpiration(_defaultCacheDuration);
             _cache.Set(cacheKey, response, cacheOptions);
 
-            return Results.Ok(response);
+            // Use clean serialization options
+            return Results.Json(response, GetCleanSerializerOptions());
         }
         catch (Exception ex)
         {
@@ -126,7 +137,8 @@ public static class SportMatchRoutes
         {
             if (_cache.TryGetValue(cacheKey, out PaginatedResponse<EnrichedSportMatch> cachedResponse))
             {
-                return Results.Ok(cachedResponse);
+                // Use clean serialization options for cached response
+                return Results.Json(cachedResponse, GetCleanSerializerOptions());
             }
 
             var collection = mongoDbService.GetCollection<EnrichedSportMatch>("EnrichedSportMatches");
@@ -154,7 +166,8 @@ public static class SportMatchRoutes
                 .SetAbsoluteExpiration(_defaultCacheDuration);
             _cache.Set(cacheKey, response, cacheOptions);
 
-            return Results.Ok(response);
+            // Use clean serialization options
+            return Results.Json(response, GetCleanSerializerOptions());
         }
         catch (Exception ex)
         {
@@ -186,7 +199,7 @@ public static class SportMatchRoutes
             var enrichedMatches = mongoMatches
                 .Select(m => m.ToEnrichedSportMatch())
                 .Where(m => m != null)
-                                .ToList();
+                .ToList();
 
             if (!enrichedMatches.Any())
             {
@@ -218,18 +231,8 @@ public static class SportMatchRoutes
                 HasPrevious = paginationInfo.HasPrevious
             };
 
-            // Clean serialization options that remove reference markers but still handle circular references
-            var serializerOptions = new JsonSerializerOptions
-            {
-                // Use IgnoreCycles instead of ReferenceHandler.Preserve to avoid $id reference markers
-                ReferenceHandler = ReferenceHandler.IgnoreCycles,
-                DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
-                WriteIndented = false,
-                // Add converter for handling problematic JsonElement values
-                Converters = { new JsonElementInvalidHandlingConverter() }
-            };
-
-            return Results.Json(predictionData, serializerOptions);
+            // Use the clean serialization options
+            return Results.Json(predictionData, GetCleanSerializerOptions());
         }
         catch (Exception ex)
         {
