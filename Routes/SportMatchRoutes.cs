@@ -393,17 +393,20 @@ public static class SportMatchRoutes
 
     public static RouteGroupBuilder MapSportMatchRoutes(this RouteGroupBuilder group)
     {
-        group.MapGet("/sportmatches", GetEnrichedMatches)
+        group.MapGet("/sportmatches", (MongoDbService mongoDbService, [AsParameters] PaginationParameters pagination) =>
+            GetEnrichedMatches(mongoDbService, pagination))
             .WithName("GetEnrichedMatches")
             .WithDescription("Get all enriched sport matches with additional stats")
             .WithOpenApi();
 
-        group.MapGet("/sportmatches/{matchId}", GetEnrichedMatchById)
+        group.MapGet("/sportmatches/{matchId}", (string matchId, MongoDbService mongoDbService, [AsParameters] PaginationParameters pagination) =>
+            GetEnrichedMatchById(matchId, mongoDbService, pagination))
             .WithName("GetEnrichedMatchById")
             .WithDescription("Get an enriched sport match by its ID")
             .WithOpenApi();
 
-        group.MapGet("/prediction-data", GetPredictionData)
+        group.MapGet("/prediction-data", (MongoDbService mongoDbService, [AsParameters] PaginationParameters pagination) =>
+            GetPredictionData(mongoDbService, pagination))
             .WithName("GetPredictionData")
             .WithDescription("Get enriched sports match data transformed for prediction UI")
             .WithOpenApi();
@@ -411,28 +414,67 @@ public static class SportMatchRoutes
         return group;
     }
 
-    private static async Task<IResult> GetEnrichedMatches(MongoDbService mongoDbService)
+    private static async Task<IResult> GetEnrichedMatches(MongoDbService mongoDbService, [AsParameters] PaginationParameters pagination)
     {
-        var cacheKey = "enriched_matches";
+        // Validate pagination parameters
+        if (pagination.Page < 1)
+        {
+            return Results.BadRequest(new { error = "Page number must be greater than 0" });
+        }
+
+        if (pagination.PageSize < 1 || pagination.PageSize > 100)
+        {
+            return Results.BadRequest(new { error = "Page size must be between 1 and 100" });
+        }
+
+        var cacheKey = $"enriched_matches_page_{pagination.Page}_size_{pagination.PageSize}";
 
         try
         {
-            if (_cache.TryGetValue(cacheKey, out List<EnrichedSportMatch> cachedMatches))
+            if (_cache.TryGetValue(cacheKey, out PaginatedResponse<List<EnrichedSportMatch>> cachedResponse))
             {
-                return Results.Ok(cachedMatches);
+                return Results.Ok(cachedResponse);
             }
 
             var collection = mongoDbService.GetCollection<EnrichedSportMatch>("EnrichedSportMatches");
+
+            // Get total count
+            var totalItems = await collection.CountDocumentsAsync(FilterDefinition<EnrichedSportMatch>.Empty);
+            var totalPages = (int)Math.Ceiling(totalItems / (double)pagination.PageSize);
+
+            // Validate page number against total pages
+            if (pagination.Page > totalPages && totalPages > 0)
+            {
+                return Results.BadRequest(new { error = $"Page number {pagination.Page} is greater than total pages {totalPages}" });
+            }
+
+            // Get paginated results with proper sorting
             var matches = await collection
                 .FindWithDiskUse(FilterDefinition<EnrichedSportMatch>.Empty)
-                .SortByDescending(static m => m.MatchTime)
+                .SortByDescending(m => m.MatchTime)
+                .Skip((pagination.Page - 1) * pagination.PageSize)
+                .Limit(pagination.PageSize)
                 .ToListAsync();
+
+            var response = new PaginatedResponse<List<EnrichedSportMatch>>
+            {
+                Data = matches,
+                Pagination = new PaginationInfo
+                {
+                    CurrentPage = pagination.Page,
+                    TotalPages = totalPages,
+                    PageSize = pagination.PageSize,
+                    TotalItems = totalItems,
+                    HasNext = pagination.Page < totalPages,
+                    HasPrevious = pagination.Page > 1
+                }
+            };
 
             var cacheOptions = new MemoryCacheEntryOptions()
                 .SetAbsoluteExpiration(_defaultCacheDuration);
-            _cache.Set(cacheKey, matches, cacheOptions);
+            _cache.Set(cacheKey, response, cacheOptions);
 
-            return Results.Ok(matches);
+            return Results.Ok(response);
         }
         catch (Exception ex)
         {
@@ -443,15 +485,15 @@ public static class SportMatchRoutes
         }
     }
 
-    private static async Task<IResult> GetEnrichedMatchById(string matchId, MongoDbService mongoDbService)
+    private static async Task<IResult> GetEnrichedMatchById(string matchId, MongoDbService mongoDbService, [AsParameters] PaginationParameters pagination)
     {
-        var cacheKey = $"match_{matchId}";
+        var cacheKey = $"match_{matchId}_page_{pagination.Page}_size_{pagination.PageSize}";
 
         try
         {
-            if (_cache.TryGetValue(cacheKey, out EnrichedSportMatch cachedMatch))
+            if (_cache.TryGetValue(cacheKey, out PaginatedResponse<EnrichedSportMatch> cachedResponse))
             {
-                return Results.Ok(cachedMatch);
+                return Results.Ok(cachedResponse);
             }
 
             var collection = mongoDbService.GetCollection<EnrichedSportMatch>("EnrichedSportMatches");
@@ -463,11 +505,23 @@ public static class SportMatchRoutes
                 return Results.NotFound($"Enriched sport match with ID {matchId} not found");
             }
 
+            var response = new PaginatedResponse<EnrichedSportMatch>
+            {
+                Data = match,
+                Pagination = new PaginationInfo
+                {
+                    CurrentPage = pagination.Page,
+                    TotalPages = 1,
+                    PageSize = pagination.PageSize,
+                    TotalItems = 1
+                }
+            };
+
             var cacheOptions = new MemoryCacheEntryOptions()
                 .SetAbsoluteExpiration(_defaultCacheDuration);
-            _cache.Set(cacheKey, match, cacheOptions);
+            _cache.Set(cacheKey, response, cacheOptions);
 
-            return Results.Ok(match);
+            return Results.Ok(response);
         }
         catch (Exception ex)
         {
@@ -478,15 +532,15 @@ public static class SportMatchRoutes
         }
     }
 
-    private static async Task<IResult> GetPredictionData(MongoDbService mongoDbService)
+    private static async Task<IResult> GetPredictionData(MongoDbService mongoDbService, [AsParameters] PaginationParameters pagination)
     {
-        var cacheKey = $"prediction_data_{DateTime.UtcNow:yyyy-MM-dd}";
+        var cacheKey = $"prediction_data_{DateTime.UtcNow:yyyy-MM-dd}_page_{pagination.Page}_size_{pagination.PageSize}";
         var sw = System.Diagnostics.Stopwatch.StartNew();
 
         try
         {
             // Try to get from cache first
-            if (_cache.TryGetValue(cacheKey, out PredictiveResponse cachedResponse))
+            if (_cache.TryGetValue(cacheKey, out PaginatedResponse<PredictiveResponse> cachedResponse))
             {
                 return Results.Ok(cachedResponse);
             }
@@ -499,116 +553,118 @@ public static class SportMatchRoutes
             var filter = Builders<EnrichedSportMatch>.Filter.Gte(m => m.MatchTime, today);
 
             // Get total count of upcoming matches
-            var upcomingCount = await collection.CountDocumentsAsync(filter);
-            Console.WriteLine($"Total upcoming matches: {upcomingCount}");
+            var totalItems = await collection.CountDocumentsAsync(filter);
+            var totalPages = (int)Math.Ceiling(totalItems / (double)pagination.PageSize);
+            Console.WriteLine($"Total upcoming matches: {totalItems}");
 
             // Process matches in batches
             const int batchSize = 100;
             var transformedMatches = new List<PredictiveMatchData>();
             var leagueMetadata = new Dictionary<string, LeagueData>();
 
-            for (int skip = 0; skip < upcomingCount; skip += batchSize)
+            // Calculate the skip and limit for pagination
+            var skip = (pagination.Page - 1) * pagination.PageSize;
+            var limit = pagination.PageSize;
+
+            var batch = await collection
+                .FindWithDiskUse(filter)
+                .SortByDescending(m => m.MatchTime)
+                .Skip(skip)
+                .Limit(limit)
+                .ToListAsync();
+
+            Console.WriteLine($"Processing batch {pagination.Page} of {totalPages}");
+
+            // Process each match in the batch
+            foreach (var match in batch)
             {
-                var batch = await collection
-                    .FindWithDiskUse(filter)
-                    .SortByDescending(m => m.MatchTime)
-                    .Skip(skip)
-                    .Limit(batchSize)
-                    .ToListAsync();
-
-                Console.WriteLine($"Processing batch {skip / batchSize + 1} of {(int)Math.Ceiling(upcomingCount / (double)batchSize)}");
-
-                // Process each match in the batch
-                foreach (var match in batch)
+                try
                 {
-                    try
+                    if (match?.OriginalMatch?.Teams?.Home == null || match?.OriginalMatch?.Teams?.Away == null)
+                        continue;
+
+                    var homeTeamName = match.OriginalMatch.Teams.Home.Name ?? "Home Team";
+                    var awayTeamName = match.OriginalMatch.Teams.Away.Name ?? "Away Team";
+
+                    var predictiveData = new PredictiveMatchData
                     {
-                        if (match?.OriginalMatch?.Teams?.Home == null || match?.OriginalMatch?.Teams?.Away == null)
-                            continue;
+                        Id = int.TryParse(match.MatchId, out int id) ? id : 0,
+                        Date = match.MatchTime.ToString("yyyy-MM-dd"),
+                        Time = match.MatchTime.ToString("HH:mm"),
+                        Venue = match.OriginalMatch?.TournamentName ?? "",
+                        HomeTeam = ExtractTeamData(
+                            match.OriginalMatch?.Teams?.Home?.Id,
+                            homeTeamName,
+                            match.Team1LastX,
+                            match.LastXStatsTeam1,
+                            true,
+                            GetOddsValue(match.Markets?.FirstOrDefault(m => m.Name == "1X2")?.Outcomes?.FirstOrDefault(o => o.Desc == "Home")?.Odds),
+                            CalculateAverageGoals(match),
+                            GetTeamPositionFromTable(match.TeamTableSlice, match.OriginalMatch?.Teams?.Home?.Id),
+                            awayTeamName,
+                            0,
+                            match.OriginalMatch
+                        ),
+                        AwayTeam = ExtractTeamData(
+                            match.OriginalMatch?.Teams?.Away?.Id,
+                            awayTeamName,
+                            match.Team2LastX,
+                            match.LastXStatsTeam2,
+                            false,
+                            GetOddsValue(match.Markets?.FirstOrDefault(m => m.Name == "1X2")?.Outcomes?.FirstOrDefault(o => o.Desc == "Away")?.Odds),
+                            CalculateAverageGoals(match),
+                            GetTeamPositionFromTable(match.TeamTableSlice, match.OriginalMatch?.Teams?.Away?.Id),
+                            homeTeamName,
+                            0,
+                            match.OriginalMatch
+                        ),
+                        PositionGap = CalculatePositionGap(match.TeamTableSlice, match.OriginalMatch?.Teams?.Home?.Id, match.OriginalMatch?.Teams?.Away?.Id),
+                        Favorite = DetermineFavorite(match.Markets),
+                        ConfidenceScore = CalculateConfidenceScore(match),
+                        AverageGoals = CalculateAverageGoals(match),
+                        ExpectedGoals = CalculateExpectedGoals(match),
+                        DefensiveStrength = CalculateDefensiveStrength(match),
+                        Odds = ExtractOdds(match.Markets),
+                        HeadToHead = ExtractHeadToHead(match.TeamVersusRecent, match.OriginalMatch?.Teams?.Home, match.OriginalMatch?.Teams?.Away),
+                        CornerStats = ExtractCornerStats(match.Team1LastX, match.Team2LastX),
+                        ScoringPatterns = ExtractScoringPatterns(match.Team1LastX, match.Team2LastX),
+                        ReasonsForPrediction = GeneratePredictionReasons(match)
+                    };
 
-                        var homeTeamName = match.OriginalMatch.Teams.Home.Name ?? "Home Team";
-                        var awayTeamName = match.OriginalMatch.Teams.Away.Name ?? "Away Team";
+                    if (predictiveData.HomeTeam != null && predictiveData.AwayTeam != null)
+                    {
+                        transformedMatches.Add(predictiveData);
 
-                        var predictiveData = new PredictiveMatchData
+                        // Update league metadata
+                        var venue = predictiveData.Venue ?? "Unknown";
+                        if (!leagueMetadata.ContainsKey(venue))
                         {
-                            Id = int.TryParse(match.MatchId, out int id) ? id : 0,
-                            Date = match.MatchTime.ToString("yyyy-MM-dd"),
-                            Time = match.MatchTime.ToString("HH:mm"),
-                            Venue = match.OriginalMatch?.TournamentName ?? "",
-                            HomeTeam = ExtractTeamData(
-                                match.OriginalMatch?.Teams?.Home?.Id,
-                                homeTeamName,
-                                match.Team1LastX,
-                                match.LastXStatsTeam1,
-                                true,
-                                GetOddsValue(match.Markets?.FirstOrDefault(m => m.Name == "1X2")?.Outcomes?.FirstOrDefault(o => o.Desc == "Home")?.Odds),
-                                CalculateAverageGoals(match),
-                                GetTeamPositionFromTable(match.TeamTableSlice, match.OriginalMatch?.Teams?.Home?.Id),
-                                awayTeamName,
-                                0,
-                                match.OriginalMatch
-                            ),
-                            AwayTeam = ExtractTeamData(
-                                match.OriginalMatch?.Teams?.Away?.Id,
-                                awayTeamName,
-                                match.Team2LastX,
-                                match.LastXStatsTeam2,
-                                false,
-                                GetOddsValue(match.Markets?.FirstOrDefault(m => m.Name == "1X2")?.Outcomes?.FirstOrDefault(o => o.Desc == "Away")?.Odds),
-                                CalculateAverageGoals(match),
-                                GetTeamPositionFromTable(match.TeamTableSlice, match.OriginalMatch?.Teams?.Away?.Id),
-                                homeTeamName,
-                                0,
-                                match.OriginalMatch
-                            ),
-                            PositionGap = CalculatePositionGap(match.TeamTableSlice, match.OriginalMatch?.Teams?.Home?.Id, match.OriginalMatch?.Teams?.Away?.Id),
-                            Favorite = DetermineFavorite(match.Markets),
-                            ConfidenceScore = CalculateConfidenceScore(match),
-                            AverageGoals = CalculateAverageGoals(match),
-                            ExpectedGoals = CalculateExpectedGoals(match),
-                            DefensiveStrength = CalculateDefensiveStrength(match),
-                            Odds = ExtractOdds(match.Markets),
-                            HeadToHead = ExtractHeadToHead(match.TeamVersusRecent, match.OriginalMatch?.Teams?.Home, match.OriginalMatch?.Teams?.Away),
-                            CornerStats = ExtractCornerStats(match.Team1LastX, match.Team2LastX),
-                            ScoringPatterns = ExtractScoringPatterns(match.Team1LastX, match.Team2LastX),
-                            ReasonsForPrediction = GeneratePredictionReasons(match)
-                        };
-
-                        if (predictiveData.HomeTeam != null && predictiveData.AwayTeam != null)
-                        {
-                            transformedMatches.Add(predictiveData);
-
-                            // Update league metadata
-                            var venue = predictiveData.Venue ?? "Unknown";
-                            if (!leagueMetadata.ContainsKey(venue))
+                            leagueMetadata[venue] = new LeagueData
                             {
-                                leagueMetadata[venue] = new LeagueData
-                                {
-                                    Matches = 0,
-                                    TotalGoals = 0,
-                                    HomeWinRate = 0,
-                                    DrawRate = 0,
-                                    AwayWinRate = 0,
-                                    BttsRate = 0
-                                };
-                            }
-
-                            // Update league stats
-                            leagueMetadata[venue].Matches++;
-                            leagueMetadata[venue].TotalGoals += predictiveData.AverageGoals ?? 0;
-
-                            if (predictiveData.Favorite == "home")
-                                leagueMetadata[venue].HomeWinRate++;
-                            else if (predictiveData.Favorite == "draw")
-                                leagueMetadata[venue].DrawRate++;
-                            else if (predictiveData.Favorite == "away")
-                                leagueMetadata[venue].AwayWinRate++;
+                                Matches = 0,
+                                TotalGoals = 0,
+                                HomeWinRate = 0,
+                                DrawRate = 0,
+                                AwayWinRate = 0,
+                                BttsRate = 0
+                            };
                         }
+
+                        // Update league stats
+                        leagueMetadata[venue].Matches++;
+                        leagueMetadata[venue].TotalGoals += predictiveData.AverageGoals ?? 0;
+
+                        if (predictiveData.Favorite == "home")
+                            leagueMetadata[venue].HomeWinRate++;
+                        else if (predictiveData.Favorite == "draw")
+                            leagueMetadata[venue].DrawRate++;
+                        else if (predictiveData.Favorite == "away")
+                            leagueMetadata[venue].AwayWinRate++;
                     }
-                    catch (Exception ex)
-                    {
-                        Console.WriteLine($"Error processing match {match?.MatchId}: {ex.Message}");
-                    }
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"Error processing match {match?.MatchId}: {ex.Message}");
                 }
             }
 
@@ -635,6 +691,18 @@ public static class SportMatchRoutes
                 }
             };
 
+            var paginatedResponse = new PaginatedResponse<PredictiveResponse>
+            {
+                Data = response,
+                Pagination = new PaginationInfo
+                {
+                    CurrentPage = pagination.Page,
+                    TotalPages = totalPages,
+                    PageSize = pagination.PageSize,
+                    TotalItems = totalItems
+                }
+            };
+
             // Cache for one hour
             sw.Stop();
             Console.WriteLine($"Total processing time: {sw.ElapsedMilliseconds}ms");
@@ -642,22 +710,32 @@ public static class SportMatchRoutes
             // Store in cache
             var cacheEntryOptions = new MemoryCacheEntryOptions()
                 .SetAbsoluteExpiration(TimeSpan.FromHours(1));
-            _cache.Set(cacheKey, response, cacheEntryOptions);
+            _cache.Set(cacheKey, paginatedResponse, cacheEntryOptions);
 
-            return Results.Ok(response);
+            return Results.Ok(paginatedResponse);
         }
         catch (Exception ex)
         {
             Console.WriteLine($"Error in GetPredictionData: {ex.Message}");
             // Return an empty response instead of an error
-            return Results.Ok(new PredictiveResponse
+            return Results.Ok(new PaginatedResponse<PredictiveResponse>
             {
-                UpcomingMatches = new List<PredictiveMatchData>(),
-                Metadata = new MetadataInfo
+                Data = new PredictiveResponse
                 {
-                    Total = 0,
-                    Date = DateTime.UtcNow.ToString("yyyy-MM-dd"),
-                    LeagueData = new Dictionary<string, LeagueData>()
+                    UpcomingMatches = new List<PredictiveMatchData>(),
+                    Metadata = new MetadataInfo
+                    {
+                        Total = 0,
+                        Date = DateTime.UtcNow.ToString("yyyy-MM-dd"),
+                        LeagueData = new Dictionary<string, LeagueData>()
+                    }
+                },
+                Pagination = new PaginationInfo
+                {
+                    CurrentPage = pagination.Page,
+                    TotalPages = 1,
+                    PageSize = pagination.PageSize,
+                    TotalItems = 0
                 }
             });
         }
@@ -2433,4 +2511,51 @@ public class StadiumInfo
 
     [System.Text.Json.Serialization.JsonPropertyName("pitchsize")]
     public string PitchSize { get; set; }
+}
+
+// Add pagination models at the top of the file, after the existing models
+public class PaginationParameters
+{
+    private const int MaxPageSize = 100;
+    private int _pageSize = 10;
+
+    [JsonPropertyName("page")]
+    public int Page { get; set; } = 1;
+
+    [JsonPropertyName("pageSize")]
+    public int PageSize
+    {
+        get => _pageSize;
+        set => _pageSize = value > MaxPageSize ? MaxPageSize : value;
+    }
+}
+
+public class PaginatedResponse<T>
+{
+    [JsonPropertyName("data")]
+    public T Data { get; set; }
+
+    [JsonPropertyName("pagination")]
+    public PaginationInfo Pagination { get; set; }
+}
+
+public class PaginationInfo
+{
+    [JsonPropertyName("currentPage")]
+    public int CurrentPage { get; set; }
+
+    [JsonPropertyName("totalPages")]
+    public int TotalPages { get; set; }
+
+    [JsonPropertyName("pageSize")]
+    public int PageSize { get; set; }
+
+    [JsonPropertyName("totalItems")]
+    public long TotalItems { get; set; }
+
+    [JsonPropertyName("hasNext")]
+    public bool HasNext { get; set; }
+
+    [JsonPropertyName("hasPrevious")]
+    public bool HasPrevious { get; set; }
 }

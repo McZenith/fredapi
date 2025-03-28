@@ -1066,7 +1066,11 @@ public class EnrichedSportMatch
 
     // Replace direct Markets property with a property that redirects to OriginalMatch.Markets
     [System.Text.Json.Serialization.JsonIgnore]
-    public List<MarketData> Markets => OriginalMatch?.Markets;
+    public List<MarketData> Markets
+    {
+        get => OriginalMatch?.Markets;
+        set => OriginalMatch.Markets = value;
+    }
 
     public DateTime CreatedAt { get; set; }
     public DateTime MatchTime { get; set; }
