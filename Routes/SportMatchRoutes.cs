@@ -351,6 +351,15 @@ public class PredictiveResponse
     public MetadataInfo Metadata { get; set; } = new();
 }
 
+public class TimeRange
+{
+    [JsonPropertyName("start")]
+    public string Start { get; set; }
+
+    [JsonPropertyName("end")]
+    public string End { get; set; }
+}
+
 public class MetadataInfo
 {
     [JsonPropertyName("total")]
@@ -358,6 +367,9 @@ public class MetadataInfo
 
     [JsonPropertyName("date")]
     public string Date { get; set; }
+
+    [JsonPropertyName("timeRange")]
+    public object TimeRange { get; set; }
 
     [JsonPropertyName("leagueData")]
     public Dictionary<string, LeagueData> LeagueData { get; set; } = new();
@@ -403,7 +415,8 @@ public static class SportMatchRoutes
             .WithDescription("Get an enriched sport match by its ID")
             .WithOpenApi();
 
-        group.MapGet("/prediction-data", GetPredictionData)
+        group.MapGet("/prediction-data", (MongoDbService mongoDbService, int days = 30, int limit = 500) =>
+                GetPredictionData(mongoDbService, days, limit))
             .WithName("GetPredictionData")
             .WithDescription("Get enriched sports match data transformed for prediction UI")
             .WithOpenApi();
@@ -421,13 +434,21 @@ public static class SportMatchRoutes
 
             var collection = mongoDbService.GetCollection<EnrichedSportMatch>("EnrichedSportMatches");
 
+            // Only include matches in the next 3 hours, filter out past matches
+            var now = DateTime.UtcNow;
+            var threeHoursLater = now.AddHours(3);
+            var filter = Builders<EnrichedSportMatch>.Filter.And(
+                Builders<EnrichedSportMatch>.Filter.Gte(m => m.MatchTime, now),
+                Builders<EnrichedSportMatch>.Filter.Lte(m => m.MatchTime, threeHoursLater)
+            );
+
             // Get total count for pagination metadata
-            var totalCount = await collection.CountDocumentsAsync(FilterDefinition<EnrichedSportMatch>.Empty);
+            var totalCount = await collection.CountDocumentsAsync(filter);
 
             // Configure the query with pagination and allowDiskUse
             var findOptions = new FindOptions { AllowDiskUse = true };
-            var matches = await collection.Find(FilterDefinition<EnrichedSportMatch>.Empty, findOptions)
-                .SortByDescending(m => m.MatchTime)
+            var matches = await collection.Find(filter, findOptions)
+                .SortBy(m => m.MatchTime) // Sort by upcoming matches first
                 .Skip((page - 1) * pageSize)
                 .Limit(pageSize)
                 .ToListAsync();
@@ -439,6 +460,11 @@ public static class SportMatchRoutes
                 totalPages = (int)Math.Ceiling((double)totalCount / pageSize),
                 currentPage = page,
                 pageSize,
+                timeRange = new TimeRange
+                {
+                    Start = now.ToString("yyyy-MM-dd'T'HH:mm:ss'Z'"),
+                    End = threeHoursLater.ToString("yyyy-MM-dd'T'HH:mm:ss'Z'")
+                },
                 data = matches
             });
         }
@@ -475,13 +501,22 @@ public static class SportMatchRoutes
         }
     }
 
-    private static async Task<IResult> GetPredictionData(MongoDbService mongoDbService)
+    private static async Task<IResult> GetPredictionData(MongoDbService mongoDbService, int days, int limit)
     {
-        var cacheKey = $"prediction_data_{DateTime.UtcNow:yyyy-MM-dd}";
+        // Get current time and 3-hour window
+        var now = DateTime.UtcNow;
+        var threeHoursLater = now.AddHours(3);
+
+        // Include timestamp in cache key to ensure cache is time-sensitive
+        var cacheKey = $"prediction_data_{now:yyyy-MM-dd_HH}_{days}_{limit}";
         var sw = System.Diagnostics.Stopwatch.StartNew();
 
         try
         {
+            // Ensure valid parameters
+            days = Math.Max(1, Math.Min(days, 365)); // Between 1 and 365 days
+            limit = Math.Max(10, Math.Min(limit, 1000)); // Between 10 and 1000 matches
+
             // Check cache first
             if (_cache.TryGetValue(cacheKey, out PredictiveResponse cachedResponse))
             {
@@ -489,23 +524,25 @@ public static class SportMatchRoutes
                 return Results.Ok(cachedResponse);
             }
 
-            Console.WriteLine("Fetching fresh prediction data");
+            Console.WriteLine($"Fetching fresh prediction data for next 3 hours, limit {limit} matches");
 
             var collection = mongoDbService.GetCollection<EnrichedSportMatch>("EnrichedSportMatches");
 
-            // Get a count of all matches
-            var totalCount = await collection.CountDocumentsAsync(FilterDefinition<EnrichedSportMatch>.Empty);
-            Console.WriteLine($"Total matches in database: {totalCount}");
+            // Create filter for matches in the next 3 hours
+            var filter = Builders<EnrichedSportMatch>.Filter.And(
+                Builders<EnrichedSportMatch>.Filter.Gte(m => m.MatchTime, now),
+                Builders<EnrichedSportMatch>.Filter.Lte(m => m.MatchTime, threeHoursLater)
+            );
 
-            // Limit to most recent matches (last 30 days) to avoid memory issues
-            var thirtyDaysAgo = DateTime.UtcNow.AddDays(-30);
-            var filter = Builders<EnrichedSportMatch>.Filter.Gte(m => m.MatchTime, thirtyDaysAgo);
+            // Get a count of upcoming matches
+            var totalCount = await collection.CountDocumentsAsync(filter);
+            Console.WriteLine($"Total upcoming matches in the next 3 hours: {totalCount}");
 
             // Use minimal filtering with allowDiskUse option
             var findOptions = new FindOptions { AllowDiskUse = true };
             var matches = await collection.Find(filter, findOptions)
-                .SortByDescending(m => m.MatchTime)
-                .Limit(500) // Reasonable limit to prevent memory issues
+                .SortBy(m => m.MatchTime) // Sort by match time ascending
+                .Limit(limit)
                 .ToListAsync();
 
             Console.WriteLine($"Found {matches.Count} total matches");
@@ -601,6 +638,7 @@ public static class SportMatchRoutes
                     }
                 );
 
+            // In the response, add the time range info
             var response = new PredictiveResponse
             {
                 UpcomingMatches = transformedMatches,
@@ -608,12 +646,17 @@ public static class SportMatchRoutes
                 {
                     Total = transformedMatches.Count,
                     Date = DateTime.UtcNow.ToString("yyyy-MM-dd"),
+                    TimeRange = new TimeRange
+                    {
+                        Start = now.ToString("yyyy-MM-dd'T'HH:mm:ss'Z'"),
+                        End = threeHoursLater.ToString("yyyy-MM-dd'T'HH:mm:ss'Z'")
+                    },
                     LeagueData = leagueMetadata
                 }
             };
 
-            // Cache the response
-            _cache.Set(cacheKey, response, TimeSpan.FromHours(1));
+            // Cache the response, but with a shorter expiration time since it's time-sensitive
+            _cache.Set(cacheKey, response, TimeSpan.FromMinutes(15));
 
             sw.Stop();
             Console.WriteLine($"Prediction data processed in {sw.ElapsedMilliseconds}ms total");
@@ -758,8 +801,16 @@ public static class SportMatchRoutes
     private static int CalculateConfidenceScore(EnrichedSportMatch match)
     {
         // If we're missing critical data, return 0
-        if (match == null)
+        if (match == null || string.IsNullOrEmpty(match.MatchId))
             return 0;
+
+        // Check if we have a cached result
+        if (_calculationCache.TryGetValue(match.MatchId, out var cachedValues) &&
+            cachedValues.ConfidenceScore.HasValue)
+        {
+            Console.WriteLine($"Using cached confidence score for match {match.MatchId}");
+            return cachedValues.ConfidenceScore.Value;
+        }
 
         int totalWeight = 0;
         int totalScore = 0;
@@ -930,7 +981,15 @@ public static class SportMatchRoutes
 
             var totalConfidence = totalScore / totalWeight;
             Console.WriteLine($"Final confidence score: {totalConfidence}% (total: {totalScore}, weight: {totalWeight})");
-            return Math.Max(0, Math.Min(100, totalConfidence)); // Ensure value is between 0-100
+
+            // Cache the result before returning
+            var confidenceScore = Math.Max(0, Math.Min(100, totalConfidence));
+            var cachedExpectedGoals = _calculationCache.TryGetValue(match.MatchId, out var existingValues) ?
+                existingValues.ExpectedGoals : null;
+
+            _calculationCache[match.MatchId] = (cachedExpectedGoals, confidenceScore);
+
+            return confidenceScore; // Ensure value is between 0-100
         }
         catch (Exception ex)
         {
@@ -2134,8 +2193,16 @@ public static class SportMatchRoutes
 
     private static double CalculateExpectedGoals(EnrichedSportMatch match)
     {
-        if (match == null)
+        if (match == null || string.IsNullOrEmpty(match.MatchId))
             return 0;
+
+        // Check if we have a cached result
+        if (_calculationCache.TryGetValue(match.MatchId, out var cachedValues) &&
+            cachedValues.ExpectedGoals.HasValue)
+        {
+            Console.WriteLine($"Using cached expected goals for match {match.MatchId}");
+            return cachedValues.ExpectedGoals.Value;
+        }
 
         double expectedGoals = 0;
         double weight = 0;
@@ -2315,12 +2382,19 @@ public static class SportMatchRoutes
             // Calculate final expected goals as weighted average
             var finalExpectedGoals = Math.Round(expectedGoals / weight, 2);
             Console.WriteLine($"Final expected goals: {finalExpectedGoals} (total: {expectedGoals}, weight: {weight})");
+
+            // Cache the result before returning
+            var confidenceScore = _calculationCache.TryGetValue(match.MatchId, out var existingValues) ?
+                existingValues.ConfidenceScore : null;
+
+            _calculationCache[match.MatchId] = (finalExpectedGoals, confidenceScore);
+
             return finalExpectedGoals;
         }
         catch (Exception ex)
         {
             Console.WriteLine($"Error calculating expected goals: {ex.Message}");
-            return 2.5; // Reasonable default
+            return 2.5; // Default to 2.5 expected goals on error
         }
     }
 }
