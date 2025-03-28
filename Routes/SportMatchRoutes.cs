@@ -468,13 +468,11 @@ public static class SportMatchRoutes
         {
             // Clear cache to force fresh data
             _cache.Remove(cacheKey);
-            Console.WriteLine("Fetching fresh prediction data");
 
             var collection = mongoDbService.GetCollection<EnrichedSportMatch>("EnrichedSportMatches");
 
             // Get a count of all matches
             var totalCount = await collection.CountDocumentsAsync(FilterDefinition<EnrichedSportMatch>.Empty);
-            Console.WriteLine($"Total matches in database: {totalCount}");
 
             // Use our extension method to ensure AllowDiskUse is enabled
             var matches = await collection
@@ -482,23 +480,29 @@ public static class SportMatchRoutes
                 .SortByDescending(m => m.MatchTime)
                 .ToListAsync();
 
-            Console.WriteLine($"Found {matches.Count} total matches");
-
-            // Filter matches with basic required data
+            // Add more detailed filtering to ensure we have all the data we need
             var validMatches = matches.Where(m =>
+                m != null &&
                 m.OriginalMatch != null &&
                 m.OriginalMatch.Teams != null &&
                 m.OriginalMatch.Teams.Home != null &&
-                m.OriginalMatch.Teams.Away != null
+                m.OriginalMatch.Teams.Away != null &&
+                !string.IsNullOrEmpty(m.OriginalMatch.Teams.Home.Id) &&
+                !string.IsNullOrEmpty(m.OriginalMatch.Teams.Away.Id) &&
+                !string.IsNullOrEmpty(m.OriginalMatch.Teams.Home.Name) &&
+                !string.IsNullOrEmpty(m.OriginalMatch.Teams.Away.Name)
             ).ToList();
 
-            Console.WriteLine($"Found {validMatches.Count} matches with basic team data");
+            // Further filter to include only matches that have the minimum data required for analysis
+            var predictableMatches = validMatches.Where(m =>
+                (m.Team1LastX != null || m.Team2LastX != null) && // At least one team has historical data
+                m.MatchTime > DateTime.UtcNow // Only upcoming matches
+            ).ToList();
 
             // Transform matches
-            Console.WriteLine("Starting transformation...");
             var transformedMatches = new List<PredictiveMatchData>();
 
-            foreach (var match in validMatches)
+            foreach (var match in predictableMatches)
             {
                 try
                 {
@@ -549,31 +553,79 @@ public static class SportMatchRoutes
                         ScoringPatterns = ExtractScoringPatterns(match.Team1LastX, match.Team2LastX),
                         ReasonsForPrediction = GeneratePredictionReasons(match)
                     };
-                    transformedMatches.Add(predictiveData);
+
+                    // Verify data quality before adding to results
+                    if (predictiveData.HomeTeam != null && predictiveData.AwayTeam != null)
+                    {
+                        transformedMatches.Add(predictiveData);
+                    }
                 }
-                catch (Exception ex)
+                catch (Exception)
                 {
-                    Console.WriteLine($"Error transforming match {match.MatchId}: {ex.Message}");
+                    // Silently ignore errors for individual matches
                 }
             }
 
-            Console.WriteLine($"Successfully transformed {transformedMatches.Count} matches");
+            // Only include tournaments with data
+            var leagueMetadata = new Dictionary<string, LeagueData>();
 
-            // Create metadata
-            var leagueMetadata = validMatches
-                .GroupBy(m => m.OriginalMatch?.TournamentName ?? "Unknown")
-                .ToDictionary(
-                    g => g.Key,
-                    g => new LeagueData
+            if (transformedMatches.Count > 0)
+            {
+                try
+                {
+                    var groupedMatches = transformedMatches
+                        .GroupBy(m => m.Venue ?? "Unknown")
+                        .ToList();
+
+                    foreach (var group in groupedMatches)
                     {
-                        Matches = g.Count(),
-                        TotalGoals = CalculateAverageGoalsForLeague(g.ToList()),
-                        HomeWinRate = CalculateHomeWinRateForLeague(g.ToList()),
-                        DrawRate = CalculateDrawRateForLeague(g.ToList()),
-                        AwayWinRate = CalculateAwayWinRateForLeague(g.ToList()),
-                        BttsRate = CalculateBttsRateForLeague(g.ToList())
+                        try
+                        {
+                            double totalGoals = 0;
+                            int homeWins = 0, draws = 0, awayWins = 0;
+
+                            foreach (var match in group)
+                            {
+                                // Safely calculate total goals
+                                totalGoals += match.AverageGoals ?? 0;
+
+                                // Count win types
+                                if (match.Favorite == "home") homeWins++;
+                                else if (match.Favorite == "draw") draws++;
+                                else if (match.Favorite == "away") awayWins++;
+                            }
+
+                            // Add to league metadata with safe calculations
+                            leagueMetadata[group.Key] = new LeagueData
+                            {
+                                Matches = group.Count(),
+                                TotalGoals = group.Count() > 0 ? totalGoals / group.Count() : 0,
+                                HomeWinRate = group.Count() > 0 ? (int)(homeWins * 100.0 / group.Count()) : 0,
+                                DrawRate = group.Count() > 0 ? (int)(draws * 100.0 / group.Count()) : 0,
+                                AwayWinRate = group.Count() > 0 ? (int)(awayWins * 100.0 / group.Count()) : 0,
+                                BttsRate = 0 // We'll need real data for this
+                            };
+                        }
+                        catch
+                        {
+                            // Create a default entry for this league
+                            leagueMetadata[group.Key] = new LeagueData
+                            {
+                                Matches = group.Count(),
+                                TotalGoals = 0,
+                                HomeWinRate = 0,
+                                DrawRate = 0,
+                                AwayWinRate = 0,
+                                BttsRate = 0
+                            };
+                        }
                     }
-                );
+                }
+                catch
+                {
+                    // Leave leagueMetadata as empty dictionary
+                }
+            }
 
             var response = new PredictiveResponse
             {
@@ -586,22 +638,29 @@ public static class SportMatchRoutes
                 }
             };
 
-            // Cache the response
-            _cache.Set(cacheKey, response, TimeSpan.FromHours(1));
-
+            // Cache for one hour
             sw.Stop();
-            Console.WriteLine($"Prediction data processed in {sw.ElapsedMilliseconds}ms total");
+
+            // Store in cache
+            var cacheEntryOptions = new MemoryCacheEntryOptions()
+                .SetAbsoluteExpiration(TimeSpan.FromHours(1));
+            _cache.Set(cacheKey, response, cacheEntryOptions);
 
             return Results.Ok(response);
         }
-        catch (Exception ex)
+        catch (Exception)
         {
-            sw.Stop();
-            Console.WriteLine($"Error fetching prediction data: {ex.Message}");
-            return Results.Problem(
-                detail: ex.Message,
-                title: "Error fetching prediction data",
-                statusCode: 500);
+            // Return an empty response instead of an error
+            return Results.Ok(new PredictiveResponse
+            {
+                UpcomingMatches = new List<PredictiveMatchData>(),
+                Metadata = new MetadataInfo
+                {
+                    Total = 0,
+                    Date = DateTime.UtcNow.ToString("yyyy-MM-dd"),
+                    LeagueData = new Dictionary<string, LeagueData>()
+                }
+            });
         }
     }
 
@@ -997,8 +1056,16 @@ public static class SportMatchRoutes
 
     private static double GetOddsValue(string oddsString)
     {
-        if (string.IsNullOrEmpty(oddsString) || !double.TryParse(oddsString, out double odds))
-            return 2.0; // Default to even odds when missing or invalid
+        if (string.IsNullOrEmpty(oddsString))
+        {
+            return 0; // Return 0 to indicate missing data instead of default value
+        }
+
+        if (!double.TryParse(oddsString, out double odds))
+        {
+            return 0; // Return 0 to indicate invalid data
+        }
+
         return odds;
     }
 
@@ -1489,7 +1556,7 @@ public static class SportMatchRoutes
     {
         try
         {
-            // Create a TeamData object with basic information that should always be available
+            // Create a TeamData object with basic information
             var team = new TeamData
             {
                 Name = teamName ?? "Unknown Team",
@@ -1497,15 +1564,12 @@ public static class SportMatchRoutes
                 Logo = "", // We can set a default logo or leave it empty
                 IsHomeTeam = isHomeTeam,
                 OpponentName = opponentName ?? "Unknown Opponent",
-                AvgOdds = avgOdds > 0 ? avgOdds : 2.5, // Default to a reasonable value if odds unavailable
+                AvgOdds = avgOdds > 0 ? avgOdds : 0, // No default values
                 LeagueAvgGoals = leagueAvgGoals,
                 Possession = possession
             };
 
-            // Safe access to team.Position to avoid negative positions
-            if (team.Position < 0) team.Position = 0;
-
-            // If we have team statistics, extract additional data safely
+            // Only process data if we have valid team statistics
             if (teamLastX != null && teamLastX.Matches != null && teamLastX.Matches.Any())
             {
                 // Calculate win percentages
@@ -1535,11 +1599,11 @@ public static class SportMatchRoutes
                     (m.Teams?.Home?.Id != null && m.Teams.Home.Id.ToString() == teamId && (m.Result?.Away ?? 1) == 0) ||
                     (m.Teams?.Away?.Id != null && m.Teams.Away.Id.ToString() == teamId && (m.Result?.Home ?? 1) == 0));
 
-                // Safely set values
-                team.WinPercentage = totalMatches > 0 ? (double)wins / totalMatches * 100 : 50;
-                team.HomeWinPercentage = homeMatches > 0 ? (double)homeWins / homeMatches * 100 : 50;
-                team.AwayWinPercentage = awayMatches > 0 ? (double)awayWins / awayMatches * 100 : 50;
-                team.CleanSheetPercentage = totalMatches > 0 ? (double)cleanSheets / totalMatches * 100 : 30;
+                // Set values without fallbacks
+                team.WinPercentage = totalMatches > 0 ? (double)wins / totalMatches * 100 : 0;
+                team.HomeWinPercentage = homeMatches > 0 ? (double)homeWins / homeMatches * 100 : 0;
+                team.AwayWinPercentage = awayMatches > 0 ? (double)awayWins / awayMatches * 100 : 0;
+                team.CleanSheetPercentage = totalMatches > 0 ? (double)cleanSheets / totalMatches * 100 : 0;
 
                 // Track totals
                 team.TotalHomeMatches = homeMatches;
@@ -1576,13 +1640,13 @@ public static class SportMatchRoutes
                     }
                 }
 
-                // Calculate averages
-                team.AverageGoalsScored = totalMatches > 0 ? goalsScored / totalMatches : 1.2;
-                team.AverageGoalsConceded = totalMatches > 0 ? goalsConceded / totalMatches : 1.0;
-                team.HomeAverageGoalsScored = homeMatches > 0 ? homeGoalsScored / homeMatches : 1.3;
-                team.HomeAverageGoalsConceded = homeMatches > 0 ? homeGoalsConceded / homeMatches : 0.9;
-                team.AwayAverageGoalsScored = awayMatches > 0 ? awayGoalsScored / awayMatches : 1.1;
-                team.AwayAverageGoalsConceded = awayMatches > 0 ? awayGoalsConceded / awayMatches : 1.2;
+                // Calculate averages without fallbacks
+                team.AverageGoalsScored = totalMatches > 0 ? goalsScored / totalMatches : 0;
+                team.AverageGoalsConceded = totalMatches > 0 ? goalsConceded / totalMatches : 0;
+                team.HomeAverageGoalsScored = homeMatches > 0 ? homeGoalsScored / homeMatches : 0;
+                team.HomeAverageGoalsConceded = homeMatches > 0 ? homeGoalsConceded / homeMatches : 0;
+                team.AwayAverageGoalsScored = awayMatches > 0 ? awayGoalsScored / awayMatches : 0;
+                team.AwayAverageGoalsConceded = awayMatches > 0 ? awayGoalsConceded / awayMatches : 0;
 
                 // Set values for UI display
                 team.AvgHomeGoals = team.HomeAverageGoalsScored;
@@ -1600,7 +1664,7 @@ public static class SportMatchRoutes
             }
             else
             {
-                // We don't set any defaults - these will be null if no data is available
+                // Set everything to zero or empty - no defaults
                 team.WinPercentage = 0;
                 team.HomeWinPercentage = 0;
                 team.AwayWinPercentage = 0;
@@ -1611,6 +1675,9 @@ public static class SportMatchRoutes
                 team.HomeAverageGoalsConceded = 0;
                 team.AwayAverageGoalsScored = 0;
                 team.AwayAverageGoalsConceded = 0;
+                team.AvgHomeGoals = 0;
+                team.AvgAwayGoals = 0;
+                team.AvgTotalGoals = 0;
                 team.FormStrength = 0;
                 team.FormRating = 0;
                 team.Form = "";
@@ -1620,11 +1687,9 @@ public static class SportMatchRoutes
 
             return team;
         }
-        catch (Exception ex)
+        catch (Exception)
         {
-            Console.WriteLine($"Error extracting team data for {teamName}: {ex.Message}");
-
-            // Return minimal team data to prevent errors
+            // Return minimal team data to prevent errors, with no default values
             return new TeamData
             {
                 Name = teamName,
@@ -1635,6 +1700,13 @@ public static class SportMatchRoutes
                 AwayWinPercentage = 0,
                 AverageGoalsScored = 0,
                 AverageGoalsConceded = 0,
+                HomeAverageGoalsScored = 0,
+                HomeAverageGoalsConceded = 0,
+                AwayAverageGoalsScored = 0,
+                AwayAverageGoalsConceded = 0,
+                AvgHomeGoals = 0,
+                AvgAwayGoals = 0,
+                AvgTotalGoals = 0,
                 Form = "",
                 IsHomeTeam = isHomeTeam,
                 OpponentName = opponentName
