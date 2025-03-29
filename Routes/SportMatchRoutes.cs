@@ -187,13 +187,29 @@ public static class SportMatchRoutes
             // Get SportMatchesPredictionTransformer from DI
             var transformer = serviceProvider.GetRequiredService<SportMatchesPredictionTransformer>();
 
-            // Get matches from DB with pagination - Will use our updated filter (3 hours ago to 24 hours ahead)
-            var mongoMatches = await mongoDbService.GetMongoEnrichedMatchesAsync(
-                pagination.Page,
-                pagination.PageSize,
-                true);
+            // Set maximum page size to 100
+            pagination.PageSize = pagination.PageSize > 100 ? 100 : pagination.PageSize;
 
-            var totalMatchCount = await mongoDbService.GetTotalMongoMatchesCountAsync(true);
+            // Calculate time range (90 mins ago to 24 hours from now)
+            var startTime = DateTime.UtcNow.AddMinutes(-90);
+            var endTime = DateTime.UtcNow.AddHours(24);
+
+            // Get matches from DB with time filter
+            var filter = Builders<MongoEnrichedMatch>.Filter.And(
+                Builders<MongoEnrichedMatch>.Filter.Gte(m => m.MatchTime, startTime),
+                Builders<MongoEnrichedMatch>.Filter.Lte(m => m.MatchTime, endTime)
+            );
+
+            // Get matches with pagination
+            var collection = mongoDbService.GetCollection<MongoEnrichedMatch>("EnrichedSportMatches");
+            var totalMatchCount = await collection.CountDocumentsAsync(filter);
+
+            var mongoMatches = await collection
+                .Find(filter)
+                .SortBy(m => m.MatchTime)
+                .Skip((pagination.Page - 1) * pagination.PageSize)
+                .Limit(pagination.PageSize)
+                .ToListAsync();
 
             // Transform matches to enriched format
             var enrichedMatches = mongoMatches
@@ -203,7 +219,7 @@ public static class SportMatchRoutes
 
             if (!enrichedMatches.Any())
             {
-                return Results.NotFound("No matches found");
+                return Results.NotFound("No matches found in the specified time range");
             }
 
             // Use the transformer to convert the data
@@ -231,7 +247,7 @@ public static class SportMatchRoutes
                 HasPrevious = paginationInfo.HasPrevious
             };
 
-            // Use the clean serialization options
+            // Return result without caching
             return Results.Json(predictionData, GetCleanSerializerOptions());
         }
         catch (Exception ex)
