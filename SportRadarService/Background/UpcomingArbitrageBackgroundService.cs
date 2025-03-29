@@ -350,32 +350,57 @@ public partial class UpcomingArbitrageBackgroundService : BackgroundService
         return Math.Round(margin, 2);
     }
 
-private ArbitrageMatch CreateArbitrageMatch(MatchData match, List<Market> arbitrageMarkets)
+    private ArbitrageMatch CreateArbitrageMatch(MatchData match, List<Market> arbitrageMarkets)
     {
         return new ArbitrageMatch
         {
             Id = ObjectId.GenerateNewId(),
-            MatchId = match.EventId,
+            MatchId = match.EventId.Split(':')[2],
             Teams = new Teams
             {
                 Home = new Team
                 {
-                    Id = match.HomeTeamId,
+                    Id = match.HomeTeamId.Split(':')[2],
                     Name = match.HomeTeamName
                 },
                 Away = new Team
                 {
-                    Id = match.AwayTeamId,
+                    Id = match.AwayTeamId.Split(':')[2],
                     Name = match.AwayTeamName
                 }
             },
-            TournamentName = match.Tournament?.Name ?? "Unknown Tournament",
+            TournamentName = match.Sport.Category.Tournament.Name ?? "Unknown Tournament",
             Markets = arbitrageMarkets,
             CreatedAt = DateTime.UtcNow,
-            MatchTime = DateTime.TryParse(match.StartTime.ToString(), out DateTime matchTime) 
-                ? matchTime 
-                : DateTime.UtcNow
+            MatchTime = GetUtcDateTime(match.StartTime)
         };
+    }
+
+    private DateTime GetUtcDateTime(dynamic startTime)
+    {
+        if (startTime == null)
+            return DateTime.UtcNow;
+
+        // Handle Unix timestamp (in milliseconds)
+        if (startTime is long longTime)
+        {
+            // Convert to seconds if in milliseconds
+            if (longTime > 10000000000) // Typical millisecond timestamp is 13 digits
+                longTime /= 1000;
+
+            return DateTimeOffset.FromUnixTimeSeconds(longTime).UtcDateTime;
+        }
+
+        // Try to parse as string
+        if (DateTime.TryParse(startTime.ToString(), out DateTime parsedTime))
+        {
+            // Ensure we're working with UTC time
+            if (parsedTime.Kind != DateTimeKind.Utc)
+                return DateTime.SpecifyKind(parsedTime, DateTimeKind.Utc);
+            return parsedTime;
+        }
+
+        return DateTime.UtcNow;
     }
 
     private async Task StoreArbitrageMatchesAsync(

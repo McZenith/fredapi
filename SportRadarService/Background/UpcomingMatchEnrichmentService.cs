@@ -335,10 +335,137 @@ public class UpcomingMatchEnrichmentService : BackgroundService
             TournamentName = match.Sport.Category.Tournament.Name ?? "Unknown Tournament",
             CreatedAt = DateTime.UtcNow,
             Markets = match.Markets,
-            MatchTime = DateTime.TryParse(match.StartTime.ToString(), out DateTime matchTime)
-                ? matchTime
-                : DateTime.UtcNow
+            MatchTime = GetUtcDateTime(match.StartTime)
         };
+    }
+
+    private DateTime GetUtcDateTime(dynamic startTime)
+    {
+        try
+        {
+            // Handle JsonElement type from System.Text.Json
+            if (startTime is System.Text.Json.JsonElement jsonElement)
+            {
+                // Handle null or undefined JSON values
+                if (jsonElement.ValueKind == System.Text.Json.JsonValueKind.Null ||
+                    jsonElement.ValueKind == System.Text.Json.JsonValueKind.Undefined)
+                {
+                    _logger.LogWarning("Match StartTime JsonElement is null or undefined, using fallback time");
+                    return DateTime.UtcNow.AddDays(1);
+                }
+
+                // Handle number values (timestamps)
+                if (jsonElement.ValueKind == System.Text.Json.JsonValueKind.Number)
+                {
+                    // Try to get as long first (for timestamps)
+                    if (jsonElement.TryGetInt64(out long longValue))
+                    {
+                        // Convert to seconds if in milliseconds
+                        if (longValue > 10000000000) // Typical millisecond timestamp is 13 digits
+                            longValue /= 1000;
+
+                        return DateTimeOffset.FromUnixTimeSeconds(longValue).UtcDateTime;
+                    }
+                }
+
+                // Handle string values
+                if (jsonElement.ValueKind == System.Text.Json.JsonValueKind.String)
+                {
+                    string stringValue = jsonElement.GetString();
+
+                    // Try to parse as numeric timestamp first
+                    if (!string.IsNullOrEmpty(stringValue) &&
+                        long.TryParse(stringValue, out long numericTime))
+                    {
+                        // Convert to seconds if in milliseconds
+                        if (numericTime > 10000000000) // Typical millisecond timestamp is 13 digits
+                            numericTime /= 1000;
+
+                        return DateTimeOffset.FromUnixTimeSeconds(numericTime).UtcDateTime;
+                    }
+
+                    // Try to parse as formatted date
+                    if (!string.IsNullOrEmpty(stringValue) &&
+                        DateTime.TryParse(stringValue, out DateTime parsedTime))
+                    {
+                        // Ensure we're working with UTC time
+                        if (parsedTime.Kind != DateTimeKind.Utc)
+                            return DateTime.SpecifyKind(parsedTime, DateTimeKind.Utc);
+                        return parsedTime;
+                    }
+                }
+
+                // If we couldn't handle the specific JsonElement type
+                _logger.LogWarning($"Unhandled JsonElement type: {jsonElement.ValueKind}, using fallback time");
+                return DateTime.UtcNow.AddDays(1);
+            }
+
+            // Handle null case (original logic)
+            if (startTime == null)
+            {
+                _logger.LogWarning("Match StartTime is null, using fallback time");
+                return DateTime.UtcNow.AddDays(1); // Use tomorrow as fallback
+            }
+
+            // Handle Unix timestamp (in milliseconds)
+            if (startTime is long longTime)
+            {
+                // Convert to seconds if in milliseconds
+                if (longTime > 10000000000) // Typical millisecond timestamp is 13 digits
+                    longTime /= 1000;
+
+                return DateTimeOffset.FromUnixTimeSeconds(longTime).UtcDateTime;
+            }
+
+            // Try to parse as string
+            if (startTime is string strTime)
+            {
+                // Try to parse as numeric timestamp first
+                if (long.TryParse(strTime, out long numericTime))
+                {
+                    // Convert to seconds if in milliseconds
+                    if (numericTime > 10000000000) // Typical millisecond timestamp is 13 digits
+                        numericTime /= 1000;
+
+                    return DateTimeOffset.FromUnixTimeSeconds(numericTime).UtcDateTime;
+                }
+
+                // Try to parse as formatted date
+                if (DateTime.TryParse(strTime, out DateTime parsedTime))
+                {
+                    // Ensure we're working with UTC time
+                    if (parsedTime.Kind != DateTimeKind.Utc)
+                        return DateTime.SpecifyKind(parsedTime, DateTimeKind.Utc);
+                    return parsedTime;
+                }
+            }
+
+            // Handle other types by converting to string first
+            try
+            {
+                string strValue = startTime.ToString();
+                if (!string.IsNullOrEmpty(strValue) &&
+                    DateTime.TryParse(strValue, out DateTime parsedTime))
+                {
+                    if (parsedTime.Kind != DateTimeKind.Utc)
+                        return DateTime.SpecifyKind(parsedTime, DateTimeKind.Utc);
+                    return parsedTime;
+                }
+            }
+            catch
+            {
+                // Ignore conversion errors
+            }
+
+            // If we got here, we couldn't parse the time
+            _logger.LogWarning($"Failed to parse match StartTime: {startTime}, using fallback time");
+            return DateTime.UtcNow.AddDays(1); // Use tomorrow as fallback
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, $"Error processing match StartTime: {startTime}");
+            return DateTime.UtcNow.AddDays(1); // Use tomorrow as fallback in case of error
+        }
     }
 
     private async Task<List<MatchData>> FilterOutAlreadyEnrichedMatches(

@@ -461,6 +461,12 @@ namespace fredapi.SportRadarService.Transformers
                     _logger.LogWarning($"Match {sportMatch.MatchId} has invalid date, using default: {matchTime}");
                 }
 
+                // Ensure we're using local time for display
+                if (matchTime.Kind != DateTimeKind.Local)
+                {
+                    matchTime = matchTime.ToLocalTime();
+                }
+
                 // Get venue (tournament name)
                 string venue = !string.IsNullOrEmpty(sportMatch.OriginalMatch.TournamentName)
                     ? sportMatch.OriginalMatch.TournamentName

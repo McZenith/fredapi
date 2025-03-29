@@ -49,7 +49,11 @@ public static class SportMatchRoutes
             .WithOpenApi();
 
         // Prediction data endpoint
-        group.MapGet("/prediction-data", async (MongoDbService mongoDbService, [AsParameters] PaginationParameters pagination, IServiceProvider serviceProvider) => await GetPredictionData(mongoDbService, pagination, serviceProvider))
+        group.MapGet("/prediction-data", async (
+            MongoDbService mongoDbService,
+            [AsParameters] PaginationParameters pagination,
+            IServiceProvider serviceProvider,
+            HttpContext context) => await GetPredictionData(mongoDbService, pagination, serviceProvider, context))
             .WithName("GetPredictionData")
             .WithOpenApi();
 
@@ -180,7 +184,8 @@ public static class SportMatchRoutes
     private static async Task<IResult> GetPredictionData(
         MongoDbService mongoDbService,
         [AsParameters] PaginationParameters pagination,
-        IServiceProvider serviceProvider)
+        IServiceProvider serviceProvider,
+        HttpContext context)
     {
         try
         {
@@ -190,9 +195,17 @@ public static class SportMatchRoutes
             // Set maximum page size to 100
             pagination.PageSize = pagination.PageSize > 100 ? 100 : pagination.PageSize;
 
-            // Calculate time range (90 mins ago to 24 hours from now)
-            var startTime = DateTime.UtcNow.AddMinutes(-90);
-            var endTime = DateTime.UtcNow.AddHours(24);
+            // Default time range: 90 mins ago to 24 hours ahead
+            // But allow configuring via query parameters if present
+            var startTime = context.Request.Query.TryGetValue("startTime", out var startTimeStr) &&
+                            DateTime.TryParse(startTimeStr, out var parsedStartTime)
+                ? parsedStartTime.ToUniversalTime()
+                : DateTime.UtcNow.AddMinutes(-90);
+
+            var endTime = context.Request.Query.TryGetValue("endTime", out var endTimeStr) &&
+                          DateTime.TryParse(endTimeStr, out var parsedEndTime)
+                ? parsedEndTime.ToUniversalTime()
+                : DateTime.UtcNow.AddHours(24);
 
             // Get matches from DB with time filter
             var filter = Builders<MongoEnrichedMatch>.Filter.And(
@@ -213,7 +226,7 @@ public static class SportMatchRoutes
 
             // Transform matches to enriched format and filter out SRL teams
             var enrichedMatches = mongoMatches
-                .Select(m => m.ToEnrichedSportMatch())
+                .Select(m => m.ToEnrichedSportMatch()) // This already calls ToLocalTime()
                 .Where(m => m != null)
                 .Where(m =>
                     !(m.OriginalMatch?.Teams?.Home?.Name?.Contains("SRL", StringComparison.OrdinalIgnoreCase) == true ||
