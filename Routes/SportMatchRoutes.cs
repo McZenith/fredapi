@@ -211,10 +211,13 @@ public static class SportMatchRoutes
                 .Limit(pagination.PageSize)
                 .ToListAsync();
 
-            // Transform matches to enriched format
+            // Transform matches to enriched format and filter out SRL teams
             var enrichedMatches = mongoMatches
                 .Select(m => m.ToEnrichedSportMatch())
                 .Where(m => m != null)
+                .Where(m =>
+                    !(m.OriginalMatch?.Teams?.Home?.Name?.Contains("SRL", StringComparison.OrdinalIgnoreCase) == true ||
+                      m.OriginalMatch?.Teams?.Away?.Name?.Contains("SRL", StringComparison.OrdinalIgnoreCase) == true))
                 .ToList();
 
             if (!enrichedMatches.Any())
