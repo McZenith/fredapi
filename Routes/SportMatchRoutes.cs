@@ -187,13 +187,13 @@ public static class SportMatchRoutes
             // Get SportMatchesPredictionTransformer from DI
             var transformer = serviceProvider.GetRequiredService<SportMatchesPredictionTransformer>();
 
-            // Get matches from DB with pagination
+            // Get matches from DB with pagination - Will use our updated filter (3 hours ago to 24 hours ahead)
             var mongoMatches = await mongoDbService.GetMongoEnrichedMatchesAsync(
                 pagination.Page,
                 pagination.PageSize,
                 true);
 
-            var totalMatchCount = await mongoDbService.GetTotalMongoMatchesCountAsync();
+            var totalMatchCount = await mongoDbService.GetTotalMongoMatchesCountAsync(true);
 
             // Transform matches to enriched format
             var enrichedMatches = mongoMatches
@@ -325,7 +325,10 @@ public static class MongoDbServiceExtensions
     {
         var collection = mongoDbService.GetCollection<MongoEnrichedMatch>("EnrichedSportMatches");
         var filter = upcomingOnly
-            ? Builders<MongoEnrichedMatch>.Filter.Gte(m => m.MatchTime, DateTime.UtcNow.Date)
+            ? Builders<MongoEnrichedMatch>.Filter.And(
+                Builders<MongoEnrichedMatch>.Filter.Gte(m => m.MatchTime, DateTime.UtcNow.AddHours(-3)),
+                Builders<MongoEnrichedMatch>.Filter.Lte(m => m.MatchTime, DateTime.UtcNow.AddHours(24))
+              )
             : Builders<MongoEnrichedMatch>.Filter.Empty;
 
         return await collection
@@ -342,7 +345,10 @@ public static class MongoDbServiceExtensions
     {
         var collection = mongoDbService.GetCollection<MongoEnrichedMatch>("EnrichedSportMatches");
         var filter = upcomingOnly
-            ? Builders<MongoEnrichedMatch>.Filter.Gte(m => m.MatchTime, DateTime.UtcNow.Date)
+            ? Builders<MongoEnrichedMatch>.Filter.And(
+                Builders<MongoEnrichedMatch>.Filter.Gte(m => m.MatchTime, DateTime.UtcNow.AddHours(-3)),
+                Builders<MongoEnrichedMatch>.Filter.Lte(m => m.MatchTime, DateTime.UtcNow.AddHours(24))
+              )
             : Builders<MongoEnrichedMatch>.Filter.Empty;
 
         return await collection.CountDocumentsAsync(filter);
@@ -404,7 +410,7 @@ public class MongoEnrichedMatch
             MatchId = this.MatchId,
             SeasonId = this.SeasonId,
             OriginalMatch = this.OriginalMatch,
-            MatchTime = this.MatchTime,
+            MatchTime = this.MatchTime.ToLocalTime(),
             Markets = this.Markets,
             Team1LastX = this.Team1LastX,
             Team2LastX = this.Team2LastX,
