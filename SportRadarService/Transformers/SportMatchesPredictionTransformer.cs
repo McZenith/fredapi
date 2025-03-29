@@ -391,20 +391,8 @@ namespace fredapi.SportRadarService.Transformers
                 return false;
             }
 
-            // Check if any model is available with data for analytics
-            bool hasAnyUsableData =
-                sportMatch.Team1LastX?.Matches?.Any() == true ||
-                sportMatch.Team2LastX?.Matches?.Any() == true ||
-                sportMatch.TeamVersusRecent?.Matches?.Any() == true ||
-                sportMatch.TeamTableSlice?.TableRows?.Any() == true ||
-                sportMatch.Team1ScoringConceding?.Stats != null ||
-                sportMatch.Team2ScoringConceding?.Stats != null;
-
-            if (!hasAnyUsableData)
-            {
-                _logger.LogWarning($"Match {sportMatch.MatchId} has no usable data models for transformation");
-                return false;
-            }
+            // We've removed the strict data requirement check
+            // Even without enriched data, we can show basic match info with default values
 
             return true;
         }
@@ -485,7 +473,12 @@ namespace fredapi.SportRadarService.Transformers
                 // Calculate position gap between teams
                 int homePos = GetTeamPosition(sportMatch, homeTeam.Name);
                 int awayPos = GetTeamPosition(sportMatch, awayTeam.Name);
-                int positionGap = Math.Abs(homePos - awayPos);
+
+                // If we couldn't determine positions, use a default zero gap
+                // to avoid this being a reason to reject matches
+                int positionGap = (homePos > 0 && awayPos > 0)
+                    ? Math.Abs(homePos - awayPos)
+                    : 0;
 
                 // Determine favorite team based on odds
                 string favorite = DetermineFavorite(oddsInfo);
