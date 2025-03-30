@@ -12,7 +12,10 @@ public partial class ArbitrageLiveMatchBackgroundService : BackgroundService
     private readonly IHubContext<LiveMatchHub> _hubContext;
     private readonly HttpClient _httpClient;
     private readonly MarketValidator _marketValidator;
-    
+
+    // Static property to store the last message sent to clients
+    private static List<ClientMatch> _lastSentMatches = new List<ClientMatch>();
+
     private const int DelayMinutes = 1;
     private const decimal MaxAcceptableMargin = 10.0m;
 
@@ -137,7 +140,6 @@ public partial class ArbitrageLiveMatchBackgroundService : BackgroundService
         return market.Status != 2 && market.Status != 3; // Exclude suspended and settled markets
     }
 
-// Continuation of ArbitrageLiveMatchBackgroundService
     private (Market market, bool hasArbitrage) ProcessMarket(MarketData marketData, string matchId)
     {
         try
@@ -329,6 +331,9 @@ public partial class ArbitrageLiveMatchBackgroundService : BackgroundService
                 LastUpdated = DateTime.UtcNow
             }).ToList();
 
+            // Store the last sent matches for new clients
+            _lastSentMatches = clientMatches;
+
             await _hubContext.Clients.All.SendAsync("ReceiveArbitrageLiveMatches", clientMatches);
             
             _logger.LogInformation(
@@ -340,8 +345,11 @@ public partial class ArbitrageLiveMatchBackgroundService : BackgroundService
         {
             _logger.LogError(ex, "Error streaming matches to clients");
         }
-    }}
+    }
 
+    // Method to get the last sent matches (can be called by a hub method)
+    public static List<ClientMatch> GetLastSentMatches() => _lastSentMatches;
+}
 
 public class ApiResponse
 {
@@ -510,7 +518,6 @@ public class OutcomeData
     [JsonPropertyName("isActive")]
     public int IsActive { get; set; }
 }
-
 
 public class Match
 {
