@@ -2327,11 +2327,68 @@ public class RefereeInfo
 
 public class NextMatchInfo : MatchStat
 {
-    [System.Text.Json.Serialization.JsonPropertyName("stadium")]
-    public StadiumInfo Stadium { get; set; }
+    [JsonPropertyName("stadium")]
+    public StadiumInfo? Stadium { get; set; }
 
-    [System.Text.Json.Serialization.JsonPropertyName("matchdifficultyrating")]
-    public Dictionary<string, int> MatchDifficultyRating { get; set; } = new();
+    [JsonPropertyName("matchdifficultyrating")]
+    [JsonConverter(typeof(MatchDifficultyRatingConverter))]
+    public Dictionary<string, int>? MatchDifficultyRating { get; set; }
+}
+
+public class MatchDifficultyRatingConverter : JsonConverter<Dictionary<string, int>?>
+{
+    public override Dictionary<string, int>? Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
+    {
+        if (reader.TokenType == JsonTokenType.Null)
+            return null;
+
+        if (reader.TokenType != JsonTokenType.StartObject)
+            return null;
+
+        var result = new Dictionary<string, int>();
+        while (reader.Read())
+        {
+            if (reader.TokenType == JsonTokenType.EndObject)
+                break;
+
+            if (reader.TokenType != JsonTokenType.PropertyName)
+                continue;
+
+            var key = reader.GetString();
+            reader.Read();
+
+            if (reader.TokenType == JsonTokenType.Number)
+            {
+                result[key] = reader.GetInt32();
+            }
+            else if (reader.TokenType == JsonTokenType.String)
+            {
+                if (int.TryParse(reader.GetString(), out int value))
+                {
+                    result[key] = value;
+                }
+            }
+        }
+
+        return result;
+    }
+
+    public override void Write(Utf8JsonWriter writer, Dictionary<string, int>? value, JsonSerializerOptions options)
+    {
+        if (value == null)
+        {
+            writer.WriteNullValue();
+            return;
+        }
+
+        writer.WriteStartObject();
+        foreach (var kvp in value)
+        {
+            writer.WritePropertyName(kvp.Key);
+            writer.WriteNumberValue(kvp.Value);
+        }
+        writer.WriteEndObject();
+    }
 }
 
 public class StadiumInfo

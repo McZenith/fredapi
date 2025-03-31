@@ -2,6 +2,10 @@ using System.Text.Json;
 using System.Text.Json.Serialization;
 using fredapi.SignalR;
 using fredapi.Utils;
+using fredapi.Model;
+using fredapi.Model.MatchSituationStats;
+using fredapi.Model.Live;
+using Microsoft.AspNetCore.Http.HttpResults;
 using Microsoft.AspNetCore.SignalR;
 
 namespace fredapi.SportRadarService.Background.ArbitrageLiveMatchBackgroundService;
@@ -12,6 +16,7 @@ public partial class ArbitrageLiveMatchBackgroundService : BackgroundService
     private readonly IHubContext<LiveMatchHub> _hubContext;
     private readonly HttpClient _httpClient;
     private readonly MarketValidator _marketValidator;
+    private readonly IServiceProvider _serviceProvider;
 
     // Static properties to store the last messages sent to clients
     private static List<ClientMatch> _lastSentArbitrageMatches = new List<ClientMatch>();
@@ -22,11 +27,13 @@ public partial class ArbitrageLiveMatchBackgroundService : BackgroundService
 
     public ArbitrageLiveMatchBackgroundService(
         ILogger<ArbitrageLiveMatchBackgroundService> logger,
-        IHubContext<LiveMatchHub> hubContext)
+        IHubContext<LiveMatchHub> hubContext,
+        IServiceProvider serviceProvider)
     {
         _logger = logger;
         _hubContext = hubContext;
         _marketValidator = new MarketValidator(logger);
+        _serviceProvider = serviceProvider;
         _httpClient = new HttpClient
         {
             Timeout = TimeSpan.FromSeconds(15)
@@ -71,7 +78,7 @@ public partial class ArbitrageLiveMatchBackgroundService : BackgroundService
             }
 
             var flattenedEvents = FlattenEvents(apiResponse);
-            _logger.LogInformation($"Total matches received from API: {flattenedEvents.Count}");
+            _logger.LogInformation($"Processing {flattenedEvents.Count} matches");
 
             var matchEvents = ProcessEvents(flattenedEvents);
             LogMatchStatistics(matchEvents, flattenedEvents.Count);
@@ -327,19 +334,63 @@ public partial class ArbitrageLiveMatchBackgroundService : BackgroundService
 
         try
         {
-            // Process arbitrage matches
-            var clientArbitrageMatches = arbitrageMatches.Select(match => CreateClientMatch(match)).ToList();
-            _lastSentArbitrageMatches = clientArbitrageMatches;
-            await _hubContext.Clients.All.SendAsync("ReceiveArbitrageLiveMatches", clientArbitrageMatches);
-
-            // Process all matches
+            // Process all matches first to get enriched data
             var allMatches = ProcessAllEvents(allEvents);
-            var clientAllMatches = allMatches.Select(match => CreateClientMatch(match)).ToList();
+            _logger.LogInformation($"Processing {allMatches.Count} matches for enrichment");
+
+            // Process matches in smaller batches to avoid overwhelming the API
+            foreach (var matchBatch in allMatches.Chunk(5))
+            {
+                // Add a random delay before processing each batch (1-2 seconds)
+                await AddHumanLikeDelay(1000, 2000);
+
+                foreach (var match in matchBatch)
+                {
+                    try
+                    {
+                        // Fetch match situation and details data
+                        await FetchMatchSituationAndDetails(match);
+                        _logger.LogDebug($"Enriched match {match.Id} with situation and details");
+                        // Add a random delay between matches (800ms-1.2s)
+                        await AddHumanLikeDelay(800, 1200);
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning(ex, "Error fetching match data for match {MatchId}", match.Id);
+                        // Add a longer delay after an error (2-3 seconds)
+                        await AddHumanLikeDelay(2000, 3000);
+                    }
+                }
+                // Add delay between batches (2-3 seconds)
+                await AddHumanLikeDelay(2000, 3000);
+            }
+
+            // Create client matches with enriched data for all matches
+            var clientAllMatches = allMatches.Select(match =>
+            {
+                var clientMatch = CreateClientMatch(match);
+                _logger.LogDebug($"Created client match {match.Id} with situation: {match.MatchSituation != null}, details: {match.MatchDetails != null}");
+                return clientMatch;
+            }).ToList();
             _lastSentAllMatches = clientAllMatches;
+
+            // Create client matches with enriched data for arbitrage matches
+            var clientArbitrageMatches = arbitrageMatches.Select(match =>
+            {
+                // Find the enriched version of this match from allMatches
+                var enrichedMatch = allMatches.FirstOrDefault(m => m.Id == match.Id);
+                var clientMatch = CreateClientMatch(enrichedMatch ?? match);
+                _logger.LogDebug($"Created arbitrage client match {match.Id} with situation: {enrichedMatch?.MatchSituation != null}, details: {enrichedMatch?.MatchDetails != null}");
+                return clientMatch;
+            }).ToList();
+            _lastSentArbitrageMatches = clientArbitrageMatches;
+
+            // Send both messages with enriched data
+            await _hubContext.Clients.All.SendAsync("ReceiveArbitrageLiveMatches", clientArbitrageMatches);
             await _hubContext.Clients.All.SendAsync("ReceiveAllLiveMatches", clientAllMatches);
 
             _logger.LogInformation(
-                "Streamed {ArbitrageMatchCount} arbitrage matches and {AllMatchCount} total matches",
+                "Streamed {ArbitrageMatchCount} arbitrage matches and {AllMatchCount} total matches with enriched data",
                 clientArbitrageMatches.Count,
                 clientAllMatches.Count);
         }
@@ -347,6 +398,241 @@ public partial class ArbitrageLiveMatchBackgroundService : BackgroundService
         {
             _logger.LogError(ex, "Error streaming matches to clients");
         }
+    }
+
+    private async Task FetchMatchSituationAndDetails(Match match)
+    {
+        using var scope = _serviceProvider.CreateScope();
+        var matchService = scope.ServiceProvider.GetService<SportRadarService>();
+
+        var tasks = new Dictionary<string, Task<IResult>>
+        {
+            { "MatchSituation", matchService.GetMatchSituationAsync(match.Id.ToString()) },
+            { "MatchDetailsExtended", matchService.GetMatchDetailsExtendedAsync(match.Id.ToString()) }
+        };
+
+        foreach (var task in tasks.OrderBy(_ => Random.Shared.Next()))
+        {
+            try
+            {
+                await AddHumanLikeDelay(300, 500);
+                var result = await task.Value;
+                await AddHumanLikeDelay(300, 500);
+                if (result is Ok<JsonDocument> okResult && okResult.Value != null)
+                {
+                    var rawJson = okResult.Value.RootElement.GetRawText();
+
+                    if (rawJson.Contains("\"event\":\"exception\""))
+                    {
+                        _logger.LogWarning("Received exception response for match {MatchId} in {ResponseType}", match.Id, task.Key);
+                        continue;
+                    }
+
+                    var doc = okResult.Value.RootElement.GetProperty("doc");
+                    if (doc.GetArrayLength() == 0)
+                    {
+                        _logger.LogWarning("Empty doc array for match {MatchId} in {ResponseType}", match.Id, task.Key);
+                        continue;
+                    }
+
+                    var firstDoc = doc[0];
+                    if (!firstDoc.TryGetProperty("data", out var dataElement))
+                    {
+                        _logger.LogWarning("No data property found for match {MatchId} in {ResponseType}", match.Id, task.Key);
+                        continue;
+                    }
+
+                    if (task.Key == "MatchSituation")
+                    {
+                        try
+                        {
+                            var response = JsonSerializer.Deserialize<fredapi.Model.Live.StatsMatchSituationResponse>(rawJson);
+
+                            if (response?.Doc?.FirstOrDefault()?.Data != null)
+                            {
+                                var data = response.Doc[0].Data;
+                                if (data.Data == null || !data.Data.Any())
+                                {
+                                    _logger.LogWarning("No match situation data found for match {MatchId}", data.MatchId);
+                                    return;
+                                }
+
+                                var validData = data.Data.Where(d => d != null && d.Home != null && d.Away != null).ToList();
+                                if (!validData.Any())
+                                {
+                                    _logger.LogWarning("No valid match situation data entries found for match {MatchId}", data.MatchId);
+                                    return;
+                                }
+
+                                var situationData = new MatchSituationStats
+                                {
+                                    MatchId = data.MatchId,
+                                    Data = validData.Select(d => new TimeSliceStats
+                                    {
+                                        Time = d.Time,
+                                        InjuryTime = d.InjuryTime,
+                                        Home = new fredapi.Model.MatchSituationStats.TeamStats
+                                        {
+                                            Attack = (int)Math.Round((decimal)d.Home.Attack, 0),
+                                            Dangerous = (int)Math.Round((decimal)d.Home.Dangerous, 0),
+                                            Safe = (int)Math.Round((decimal)d.Home.Safe, 0),
+                                            AttackCount = d.Home.AttackCount,
+                                            DangerousCount = d.Home.DangerousCount,
+                                            SafeCount = d.Home.SafeCount
+                                        },
+                                        Away = new fredapi.Model.MatchSituationStats.TeamStats
+                                        {
+                                            Attack = (int)Math.Round((decimal)d.Away.Attack, 0),
+                                            Dangerous = (int)Math.Round((decimal)d.Away.Dangerous, 0),
+                                            Safe = (int)Math.Round((decimal)d.Away.Safe, 0),
+                                            AttackCount = d.Away.AttackCount,
+                                            DangerousCount = d.Away.DangerousCount,
+                                            SafeCount = d.Away.SafeCount
+                                        }
+                                    }).ToList()
+                                };
+
+                                var analyzedStats = MatchSituationAnalyzer.AnalyzeMatchSituation(situationData);
+
+                                match.MatchSituation = new ClientMatchSituation
+                                {
+                                    TotalTime = analyzedStats.TotalTime,
+                                    DominantTeam = analyzedStats.DominantTeam,
+                                    MatchMomentum = analyzedStats.MatchMomentum,
+                                    Home = new ClientTeamSituation
+                                    {
+                                        TotalAttacks = analyzedStats.Home.TotalAttacks,
+                                        TotalDangerousAttacks = analyzedStats.Home.TotalDangerousAttacks,
+                                        TotalSafeAttacks = analyzedStats.Home.TotalSafeAttacks,
+                                        TotalAttackCount = analyzedStats.Home.TotalAttackCount,
+                                        TotalDangerousCount = analyzedStats.Home.TotalDangerousCount,
+                                        TotalSafeCount = analyzedStats.Home.TotalSafeCount,
+                                        AttackPercentage = Math.Round(analyzedStats.Home.AttackPercentage),
+                                        DangerousAttackPercentage = Math.Round(analyzedStats.Home.DangerousAttackPercentage),
+                                        SafeAttackPercentage = Math.Round(analyzedStats.Home.SafeAttackPercentage)
+                                    },
+                                    Away = new ClientTeamSituation
+                                    {
+                                        TotalAttacks = analyzedStats.Away.TotalAttacks,
+                                        TotalDangerousAttacks = analyzedStats.Away.TotalDangerousAttacks,
+                                        TotalSafeAttacks = analyzedStats.Away.TotalSafeAttacks,
+                                        TotalAttackCount = analyzedStats.Away.TotalAttackCount,
+                                        TotalDangerousCount = analyzedStats.Away.TotalDangerousCount,
+                                        TotalSafeCount = analyzedStats.Away.TotalSafeCount,
+                                        AttackPercentage = Math.Round(analyzedStats.Away.AttackPercentage),
+                                        DangerousAttackPercentage = Math.Round(analyzedStats.Away.DangerousAttackPercentage),
+                                        SafeAttackPercentage = Math.Round(analyzedStats.Away.SafeAttackPercentage)
+                                    }
+                                };
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            _logger.LogError(ex, "Error processing match situation for match {MatchId}", match.Id);
+                        }
+                    }
+                    else if (task.Key == "MatchDetailsExtended")
+                    {
+                        try
+                        {
+                            if (firstDoc.TryGetProperty("event", out var eventProperty))
+                            {
+                                var eventValue = eventProperty.GetString();
+                                if (eventValue == "exception")
+                                {
+                                    _logger.LogWarning("Received exception event for match {MatchId} in {ResponseType}", match.Id, task.Key);
+                                    continue;
+                                }
+                            }
+
+                            var options = new JsonSerializerOptions
+                            {
+                                PropertyNameCaseInsensitive = true,
+                                AllowTrailingCommas = true,
+                                ReadCommentHandling = JsonCommentHandling.Skip,
+                                DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
+                                Converters =
+                                {
+                                    new JsonDictionaryStringNumberConverter(),
+                                    new MatchDetailsDataConverter()
+                                }
+                            };
+
+                            var detailsData = JsonSerializer.Deserialize<MatchDetailsExtendedResponse>(rawJson, options);
+
+                            if (detailsData?.Doc?.FirstOrDefault()?.Data != null)
+                            {
+                                var data = detailsData.Doc[0].Data;
+                                match.MatchDetails = new ClientMatchDetailsExtended
+                                {
+                                    Types = data.Types,
+                                    Home = new ClientTeamStats
+                                    {
+                                        YellowCards = ExtractIntValue(data.Values, "40", "home"),
+                                        RedCards = ExtractIntValue(data.Values, "50", "home"),
+                                        FreeKicks = ExtractIntValue(data.Values, "120", "home"),
+                                        GoalKicks = ExtractIntValue(data.Values, "121", "home"),
+                                        ThrowIns = ExtractIntValue(data.Values, "122", "home"),
+                                        Offsides = ExtractIntValue(data.Values, "123", "home"),
+                                        CornerKicks = ExtractIntValue(data.Values, "124", "home"),
+                                        ShotsOnTarget = ExtractIntValue(data.Values, "125", "home"),
+                                        ShotsOffTarget = ExtractIntValue(data.Values, "126", "home"),
+                                        Saves = ExtractIntValue(data.Values, "127", "home"),
+                                        Fouls = ExtractIntValue(data.Values, "129", "home"),
+                                        Injuries = ExtractIntValue(data.Values, "158", "home"),
+                                        DangerousAttacks = ExtractIntValue(data.Values, "1029", "home"),
+                                        BallSafe = ExtractIntValue(data.Values, "1030", "home"),
+                                        TotalAttacks = ExtractIntValue(data.Values, "1126", "home"),
+                                        GoalAttempts = ExtractIntValue(data.Values, "goalattempts", "home"),
+                                        BallSafePercentage = ExtractDoubleValue(data.Values, "ballsafepercentage", "home"),
+                                        AttackPercentage = ExtractDoubleValue(data.Values, "attackpercentage", "home"),
+                                        DangerousAttackPercentage = ExtractDoubleValue(data.Values, "dangerousattackpercentage", "home")
+                                    },
+                                    Away = new ClientTeamStats
+                                    {
+                                        YellowCards = ExtractIntValue(data.Values, "40", "away"),
+                                        RedCards = ExtractIntValue(data.Values, "50", "away"),
+                                        FreeKicks = ExtractIntValue(data.Values, "120", "away"),
+                                        GoalKicks = ExtractIntValue(data.Values, "121", "away"),
+                                        ThrowIns = ExtractIntValue(data.Values, "122", "away"),
+                                        Offsides = ExtractIntValue(data.Values, "123", "away"),
+                                        CornerKicks = ExtractIntValue(data.Values, "124", "away"),
+                                        ShotsOnTarget = ExtractIntValue(data.Values, "125", "away"),
+                                        ShotsOffTarget = ExtractIntValue(data.Values, "126", "away"),
+                                        Saves = ExtractIntValue(data.Values, "127", "away"),
+                                        Fouls = ExtractIntValue(data.Values, "129", "away"),
+                                        Injuries = ExtractIntValue(data.Values, "158", "away"),
+                                        DangerousAttacks = ExtractIntValue(data.Values, "1029", "away"),
+                                        BallSafe = ExtractIntValue(data.Values, "1030", "away"),
+                                        TotalAttacks = ExtractIntValue(data.Values, "1126", "away"),
+                                        GoalAttempts = ExtractIntValue(data.Values, "goalattempts", "away"),
+                                        BallSafePercentage = ExtractDoubleValue(data.Values, "ballsafepercentage", "away"),
+                                        AttackPercentage = ExtractDoubleValue(data.Values, "attackpercentage", "away"),
+                                        DangerousAttackPercentage = ExtractDoubleValue(data.Values, "dangerousattackpercentage", "away")
+                                    }
+                                };
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            _logger.LogError(ex, "Error processing match details for match {MatchId}", match.Id);
+                        }
+                    }
+                }
+                await AddHumanLikeDelay(300, 500);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, $"Error fetching match data for match {match.Id}");
+                await AddHumanLikeDelay(1000, 2000);
+            }
+        }
+    }
+
+    private static async Task AddHumanLikeDelay(int minMs, int maxMs)
+    {
+        var delay = Random.Shared.Next(minMs, maxMs);
+        await Task.Delay(delay);
     }
 
     private ClientMatch CreateClientMatch(Match match)
@@ -381,13 +667,59 @@ public partial class ArbitrageLiveMatchBackgroundService : BackgroundService
                     StakePercentage = o.StakePercentage
                 }).ToList()
             }).ToList(),
-            LastUpdated = DateTime.UtcNow
+            LastUpdated = DateTime.UtcNow,
+            MatchSituation = match.MatchSituation,
+            MatchDetails = match.MatchDetails
         };
     }
 
     // Methods to get the last sent matches (can be called by hub methods)
     public static List<ClientMatch> GetLastSentArbitrageMatches() => _lastSentArbitrageMatches;
     public static List<ClientMatch> GetLastSentAllMatches() => _lastSentAllMatches;
+
+    private int ExtractIntValue(Dictionary<string, StatValue> values, string key, string team)
+    {
+        if (values == null || !values.TryGetValue(key, out var statValue) ||
+            statValue?.Value == null || !statValue.Value.TryGetValue(team, out var valueObj))
+        {
+            return 0;
+        }
+
+        if (valueObj == null)
+            return 0;
+
+        if (valueObj is string strValue)
+            return int.TryParse(strValue, out var value) ? value : 0;
+        if (valueObj is int intValue)
+            return intValue;
+        if (valueObj is long longValue)
+            return (int)longValue;
+        if (valueObj is double doubleValue)
+            return (int)doubleValue;
+        return 0;
+    }
+
+    private double ExtractDoubleValue(Dictionary<string, StatValue> values, string key, string team)
+    {
+        if (values == null || !values.TryGetValue(key, out var statValue) ||
+            statValue?.Value == null || !statValue.Value.TryGetValue(team, out var valueObj))
+        {
+            return 0;
+        }
+
+        if (valueObj == null)
+            return 0;
+
+        if (valueObj is string strValue)
+            return double.TryParse(strValue, out var value) ? value : 0;
+        if (valueObj is int intValue)
+            return intValue;
+        if (valueObj is long longValue)
+            return longValue;
+        if (valueObj is double doubleValue)
+            return doubleValue;
+        return 0;
+    }
 }
 
 public class ApiResponse
@@ -571,6 +903,8 @@ public class Match
     public string PlayedTime { get; set; }
     public List<Market> Markets { get; set; } = new();
     public DateTime LastUpdated { get; set; }
+    public ClientMatchSituation MatchSituation { get; set; }
+    public ClientMatchDetailsExtended MatchDetails { get; set; }
 }
 
 public class Teams
@@ -617,6 +951,8 @@ public class ClientMatch
     public string PlayedTime { get; set; }
     public List<ClientMarket> Markets { get; set; }
     public DateTime LastUpdated { get; set; }
+    public ClientMatchSituation MatchSituation { get; set; }
+    public ClientMatchDetailsExtended MatchDetails { get; set; }
 }
 
 public class ClientTeams
@@ -648,4 +984,486 @@ public class ClientOutcome
     public string Description { get; set; }
     public decimal Odds { get; set; }
     public decimal StakePercentage { get; set; }
+}
+
+public class ClientMatchSituation
+{
+    public int TotalTime { get; set; }
+    public string DominantTeam { get; set; }
+    public string MatchMomentum { get; set; }
+    public ClientTeamSituation Home { get; set; }
+    public ClientTeamSituation Away { get; set; }
+}
+
+public class ClientTeamSituation
+{
+    public int TotalAttacks { get; set; }
+    public int TotalDangerousAttacks { get; set; }
+    public int TotalSafeAttacks { get; set; }
+    public int TotalAttackCount { get; set; }
+    public int TotalDangerousCount { get; set; }
+    public int TotalSafeCount { get; set; }
+    public double AttackPercentage { get; set; }
+    public double DangerousAttackPercentage { get; set; }
+    public double SafeAttackPercentage { get; set; }
+}
+
+public class ClientMatchDetailsExtended
+{
+    public ClientTeamStats Home { get; set; }
+    public ClientTeamStats Away { get; set; }
+    public Dictionary<string, string> Types { get; set; }
+}
+
+public class ClientTeamStats
+{
+    public int YellowCards { get; set; }
+    public int RedCards { get; set; }
+    public int FreeKicks { get; set; }
+    public int GoalKicks { get; set; }
+    public int ThrowIns { get; set; }
+    public int Offsides { get; set; }
+    public int CornerKicks { get; set; }
+    public int ShotsOnTarget { get; set; }
+    public int ShotsOffTarget { get; set; }
+    public int Saves { get; set; }
+    public int Fouls { get; set; }
+    public int Injuries { get; set; }
+    public int DangerousAttacks { get; set; }
+    public int BallSafe { get; set; }
+    public int TotalAttacks { get; set; }
+    public int GoalAttempts { get; set; }
+    public double BallSafePercentage { get; set; }
+    public double AttackPercentage { get; set; }
+    public double DangerousAttackPercentage { get; set; }
+}
+
+public class MatchDetailsExtendedResponse
+{
+    [JsonPropertyName("queryUrl")]
+    public string QueryUrl { get; set; }
+
+    [JsonPropertyName("doc")]
+    public List<MatchDetailsDoc> Doc { get; set; }
+}
+
+public class MatchDetailsDoc
+{
+    [JsonPropertyName("event")]
+    public string Event { get; set; }
+
+    [JsonPropertyName("_dob")]
+    public long Dob { get; set; }
+
+    [JsonPropertyName("_maxage")]
+    public int MaxAge { get; set; }
+
+    [JsonPropertyName("data")]
+    public MatchDetailsData Data { get; set; }
+}
+
+public class MatchDetailsData
+{
+    [JsonPropertyName("_doc")]
+    public string Doc { get; set; }
+
+    [JsonPropertyName("_matchid")]
+    public long MatchId { get; set; }
+
+    [JsonPropertyName("teams")]
+    public Teams Teams { get; set; }
+
+    [JsonPropertyName("index")]
+    public List<object> Index { get; set; }
+
+    [JsonPropertyName("values")]
+    public Dictionary<string, StatValue> Values { get; set; }
+
+    [JsonPropertyName("types")]
+    public Dictionary<string, string> Types { get; set; }
+}
+
+public class TeamsConverter : JsonConverter<Teams>
+{
+    public override Teams Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
+    {
+        var teams = new Teams();
+
+        if (reader.TokenType == JsonTokenType.Null)
+        {
+            return teams;
+        }
+
+        if (reader.TokenType != JsonTokenType.StartObject)
+        {
+            reader.Skip();
+            return teams;
+        }
+
+        while (reader.Read())
+        {
+            if (reader.TokenType == JsonTokenType.EndObject)
+                return teams;
+
+            if (reader.TokenType != JsonTokenType.PropertyName)
+                continue;
+
+            var propertyName = reader.GetString()?.ToLower();
+            reader.Read();
+
+            try
+            {
+                switch (propertyName)
+                {
+                    case "home":
+                        if (reader.TokenType == JsonTokenType.StartObject)
+                        {
+                            teams.Home = JsonSerializer.Deserialize<Team>(ref reader, options);
+                        }
+                        else
+                        {
+                            reader.Skip();
+                        }
+                        break;
+                    case "away":
+                        if (reader.TokenType == JsonTokenType.StartObject)
+                        {
+                            teams.Away = JsonSerializer.Deserialize<Team>(ref reader, options);
+                        }
+                        else
+                        {
+                            reader.Skip();
+                        }
+                        break;
+                    default:
+                        reader.Skip();
+                        break;
+                }
+            }
+            catch (JsonException)
+            {
+                reader.Skip();
+            }
+        }
+
+        return teams;
+    }
+
+    public override void Write(Utf8JsonWriter writer, Teams value, JsonSerializerOptions options)
+    {
+        writer.WriteStartObject();
+        writer.WritePropertyName("home");
+        JsonSerializer.Serialize(writer, value.Home, options);
+        writer.WritePropertyName("away");
+        JsonSerializer.Serialize(writer, value.Away, options);
+        writer.WriteEndObject();
+    }
+}
+
+public class TeamConverter : JsonConverter<Team>
+{
+    public override Team Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
+    {
+        var team = new Team();
+
+        if (reader.TokenType == JsonTokenType.Null)
+        {
+            return team;
+        }
+
+        if (reader.TokenType != JsonTokenType.StartObject)
+        {
+            reader.Skip();
+            return team;
+        }
+
+        while (reader.Read())
+        {
+            if (reader.TokenType == JsonTokenType.EndObject)
+                return team;
+
+            if (reader.TokenType != JsonTokenType.PropertyName)
+                continue;
+
+            var propertyName = reader.GetString()?.ToLower();
+            reader.Read();
+
+            try
+            {
+                switch (propertyName)
+                {
+                    case "id":
+                        if (reader.TokenType == JsonTokenType.Number)
+                        {
+                            if (reader.TryGetInt32(out int intValue))
+                                team.Id = intValue;
+                            else if (reader.TryGetInt64(out long longValue))
+                                team.Id = (int)longValue;
+                            else if (reader.TryGetDouble(out double doubleValue))
+                                team.Id = (int)doubleValue;
+                        }
+                        else if (reader.TokenType == JsonTokenType.String)
+                        {
+                            var strValue = reader.GetString();
+                            if (int.TryParse(strValue, out int parsedValue))
+                                team.Id = parsedValue;
+                        }
+                        else
+                        {
+                            reader.Skip();
+                        }
+                        break;
+                    case "name":
+                        if (reader.TokenType == JsonTokenType.String)
+                        {
+                            team.Name = reader.GetString();
+                        }
+                        else
+                        {
+                            reader.Skip();
+                        }
+                        break;
+                    default:
+                        reader.Skip();
+                        break;
+                }
+            }
+            catch (JsonException)
+            {
+                reader.Skip();
+            }
+        }
+
+        return team;
+    }
+
+    public override void Write(Utf8JsonWriter writer, Team value, JsonSerializerOptions options)
+    {
+        writer.WriteStartObject();
+        writer.WriteNumber("id", value.Id);
+        writer.WriteString("name", value.Name);
+        writer.WriteEndObject();
+    }
+}
+
+public class MatchDetailsDataConverter : JsonConverter<MatchDetailsData>
+{
+    private readonly TeamsConverter _teamsConverter = new TeamsConverter();
+    private readonly TeamConverter _teamConverter = new TeamConverter();
+
+    public override MatchDetailsData Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
+    {
+        var data = new MatchDetailsData();
+
+        if (reader.TokenType == JsonTokenType.Null)
+        {
+            return data;
+        }
+
+        if (reader.TokenType != JsonTokenType.StartObject)
+        {
+            reader.Skip();
+            return data;
+        }
+
+        while (reader.Read())
+        {
+            if (reader.TokenType == JsonTokenType.EndObject)
+                return data;
+
+            if (reader.TokenType != JsonTokenType.PropertyName)
+                continue;
+
+            var propertyName = reader.GetString();
+            reader.Read();
+
+            try
+            {
+                switch (propertyName)
+                {
+                    case "_doc":
+                        if (reader.TokenType == JsonTokenType.String)
+                        {
+                            data.Doc = reader.GetString();
+                        }
+                        else
+                        {
+                            reader.Skip();
+                        }
+                        break;
+                    case "_matchid":
+                        if (reader.TokenType == JsonTokenType.Number)
+                        {
+                            if (reader.TryGetInt64(out long longValue))
+                                data.MatchId = longValue;
+                            else if (reader.TryGetInt32(out int intValue))
+                                data.MatchId = intValue;
+                            else if (reader.TryGetDouble(out double doubleValue))
+                                data.MatchId = (long)doubleValue;
+                        }
+                        else if (reader.TokenType == JsonTokenType.String)
+                        {
+                            var strValue = reader.GetString();
+                            if (long.TryParse(strValue, out long parsedValue))
+                                data.MatchId = parsedValue;
+                        }
+                        else
+                        {
+                            reader.Skip();
+                        }
+                        break;
+                    case "teams":
+                        data.Teams = _teamsConverter.Read(ref reader, typeof(Teams), options);
+                        break;
+                    case "index":
+                        if (reader.TokenType == JsonTokenType.StartArray)
+                        {
+                            data.Index = JsonSerializer.Deserialize<List<object>>(ref reader, options);
+                        }
+                        else
+                        {
+                            reader.Skip();
+                        }
+                        break;
+                    case "values":
+                        if (reader.TokenType == JsonTokenType.StartObject)
+                        {
+                            data.Values = JsonSerializer.Deserialize<Dictionary<string, StatValue>>(ref reader, options);
+                        }
+                        else
+                        {
+                            reader.Skip();
+                        }
+                        break;
+                    case "types":
+                        if (reader.TokenType == JsonTokenType.StartObject)
+                        {
+                            data.Types = JsonSerializer.Deserialize<Dictionary<string, string>>(ref reader, options);
+                        }
+                        else
+                        {
+                            reader.Skip();
+                        }
+                        break;
+                    default:
+                        reader.Skip();
+                        break;
+                }
+            }
+            catch (JsonException)
+            {
+                reader.Skip();
+            }
+        }
+
+        return data;
+    }
+
+    public override void Write(Utf8JsonWriter writer, MatchDetailsData value, JsonSerializerOptions options)
+    {
+        writer.WriteStartObject();
+        writer.WriteString("_doc", value.Doc);
+        writer.WriteNumber("_matchid", value.MatchId);
+        writer.WritePropertyName("teams");
+        _teamsConverter.Write(writer, value.Teams, options);
+        writer.WritePropertyName("index");
+        JsonSerializer.Serialize(writer, value.Index, options);
+        writer.WritePropertyName("values");
+        JsonSerializer.Serialize(writer, value.Values, options);
+        writer.WritePropertyName("types");
+        JsonSerializer.Serialize(writer, value.Types, options);
+        writer.WriteEndObject();
+    }
+}
+
+public class JsonDictionaryStringNumberConverter : JsonConverter<Dictionary<string, object>>
+{
+    public override Dictionary<string, object> Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
+    {
+        var result = new Dictionary<string, object>();
+
+        if (reader.TokenType != JsonTokenType.StartObject)
+            return result;
+
+        while (reader.Read())
+        {
+            if (reader.TokenType == JsonTokenType.EndObject)
+                return result;
+
+            if (reader.TokenType != JsonTokenType.PropertyName)
+                continue;
+
+            var key = reader.GetString();
+            reader.Read();
+
+            object value = null;
+            switch (reader.TokenType)
+            {
+                case JsonTokenType.String:
+                    value = reader.GetString();
+                    break;
+                case JsonTokenType.Number:
+                    if (reader.TryGetInt32(out int intValue))
+                        value = intValue;
+                    else if (reader.TryGetInt64(out long longValue))
+                        value = longValue;
+                    else if (reader.TryGetDouble(out double doubleValue))
+                        value = doubleValue;
+                    break;
+                case JsonTokenType.True:
+                    value = true;
+                    break;
+                case JsonTokenType.False:
+                    value = false;
+                    break;
+                case JsonTokenType.Null:
+                    value = null;
+                    break;
+                case JsonTokenType.StartObject:
+                    value = JsonSerializer.Deserialize<Dictionary<string, object>>(ref reader, options);
+                    break;
+                case JsonTokenType.StartArray:
+                    value = JsonSerializer.Deserialize<List<object>>(ref reader, options);
+                    break;
+            }
+
+            if (key != null)
+                result[key] = value;
+        }
+
+        return result;
+    }
+
+    public override void Write(Utf8JsonWriter writer, Dictionary<string, object> value, JsonSerializerOptions options)
+    {
+        writer.WriteStartObject();
+        foreach (var kvp in value)
+        {
+            writer.WritePropertyName(kvp.Key);
+            if (kvp.Value == null)
+                writer.WriteNullValue();
+            else if (kvp.Value is string strValue)
+                writer.WriteStringValue(strValue);
+            else if (kvp.Value is int intValue)
+                writer.WriteNumberValue(intValue);
+            else if (kvp.Value is long longValue)
+                writer.WriteNumberValue(longValue);
+            else if (kvp.Value is double doubleValue)
+                writer.WriteNumberValue(doubleValue);
+            else if (kvp.Value is bool boolValue)
+                writer.WriteBooleanValue(boolValue);
+            else
+                JsonSerializer.Serialize(writer, kvp.Value, options);
+        }
+        writer.WriteEndObject();
+    }
+}
+
+public class StatValue
+{
+    [JsonPropertyName("name")]
+    public string Name { get; set; }
+
+    [JsonPropertyName("value")]
+    public Dictionary<string, object> Value { get; set; }
 }

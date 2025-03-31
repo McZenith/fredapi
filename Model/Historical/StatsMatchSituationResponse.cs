@@ -2,7 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Text.Json.Serialization;
 
-namespace fredapi.Model.Live
+namespace fredapi.Model.Historical.StatsMatchSituationResponse
 {
     public class StatsMatchSituationResponse
     {

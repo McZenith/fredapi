@@ -5,7 +5,7 @@ GET {{fredapi_HostAddress}}/api/match/upcoming
 Accept: application/json
 ###
 
-GET {{fredapi_HostAddress}}/api/match/details_extended?matchId=51271799
+GET {{fredapi_HostAddress}}/api/match/details_extended?matchId=57308721
 Accept: application/json
 ###
 
@@ -41,7 +41,7 @@ GET {{fredapi_HostAddress}}/api/phrases/51389003
 Accept: application/json
 ###
 
-GET {{fredapi_HostAddress}}/api/situation/51271799
+GET {{fredapi_HostAddress}}/api/situation/57308721
 Accept: application/json
 ###
 
