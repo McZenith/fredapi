@@ -139,6 +139,7 @@ public partial class ArbitrageLiveMatchBackgroundService : BackgroundService
     {
         var markets = eventData.Markets
             .Where(m => IsValidMarketStatus(m))
+            .Where(m => m.Desc?.ToLower() == "match result" || m.Desc?.ToLower() == "1x2") // Only include 1X2 markets
             .Select(m => new Market
             {
                 Id = m.Id,
@@ -147,7 +148,7 @@ public partial class ArbitrageLiveMatchBackgroundService : BackgroundService
                 Outcomes = ProcessOutcomes(m.Outcomes),
                 Favourite = m.Favourite,
             })
-            .Where(m => m.Outcomes.Any())
+            .Where(m => m.Outcomes.Any() && m.Outcomes.Count == 3) // Ensure we have exactly 3 outcomes (1X2)
             .ToList();
 
         return CreateMatch(eventData, markets);
