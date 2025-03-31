@@ -13,8 +13,9 @@ public partial class ArbitrageLiveMatchBackgroundService : BackgroundService
     private readonly HttpClient _httpClient;
     private readonly MarketValidator _marketValidator;
 
-    // Static property to store the last message sent to clients
-    private static List<ClientMatch> _lastSentMatches = new List<ClientMatch>();
+    // Static properties to store the last messages sent to clients
+    private static List<ClientMatch> _lastSentArbitrageMatches = new List<ClientMatch>();
+    private static List<ClientMatch> _lastSentAllMatches = new List<ClientMatch>();
 
     private const int DelayMinutes = 1;
     private const decimal MaxAcceptableMargin = 10.0m;
@@ -75,7 +76,7 @@ public partial class ArbitrageLiveMatchBackgroundService : BackgroundService
             var matchEvents = ProcessEvents(flattenedEvents);
             LogMatchStatistics(matchEvents, flattenedEvents.Count);
 
-            await StreamMatchesToClientsAsync(matchEvents);
+            await StreamMatchesToClientsAsync(matchEvents, flattenedEvents);
         }
         catch (Exception ex)
         {
@@ -114,6 +115,15 @@ public partial class ArbitrageLiveMatchBackgroundService : BackgroundService
             .ToList();
     }
 
+    private List<Match> ProcessAllEvents(List<Event> events)
+    {
+        return events
+            .Select(CreateMatchFromEvent)
+            .Where(m => m.Markets.Any())
+            .Where(m => !m.Teams.Away.Name.ToUpper().Contains("SRL") || !m.Teams.Home.Name.ToUpper().Contains("SRL"))
+            .ToList();
+    }
+
     private Match ProcessSingleEvent(Event eventData)
     {
         var potentialMarkets = ProcessMarkets(eventData);
@@ -123,6 +133,24 @@ public partial class ArbitrageLiveMatchBackgroundService : BackgroundService
             .ToList();
 
         return CreateMatch(eventData, arbitrageMarkets);
+    }
+
+    private Match CreateMatchFromEvent(Event eventData)
+    {
+        var markets = eventData.Markets
+            .Where(m => IsValidMarketStatus(m))
+            .Select(m => new Market
+            {
+                Id = m.Id,
+                Description = m.Desc,
+                Specifier = m.Specifier,
+                Outcomes = ProcessOutcomes(m.Outcomes),
+                Favourite = m.Favourite,
+            })
+            .Where(m => m.Outcomes.Any())
+            .ToList();
+
+        return CreateMatch(eventData, markets);
     }
 
     private List<(Market market, bool hasArbitrage)> ProcessMarkets(Event eventData)
@@ -290,56 +318,29 @@ public partial class ArbitrageLiveMatchBackgroundService : BackgroundService
         _logger.LogInformation($"Total arbitrage opportunities: {totalArbitrageOpportunities}");
         _logger.LogInformation($"Arbitrage opportunity rate: {(decimal)matches.Count / totalEvents:P2}");
     }
-    
+
     // SignalR Streaming Methods
-    private async Task StreamMatchesToClientsAsync(List<Match> matches)
+    private async Task StreamMatchesToClientsAsync(List<Match> arbitrageMatches, List<Event> allEvents)
     {
-        if (!matches.Any()) return;
+        if (!arbitrageMatches.Any() && !allEvents.Any()) return;
 
         try
         {
-            var clientMatches = matches.Select(match => new ClientMatch
-            {
-                Id = match.Id,
-                SeasonId = match.SeasonId,
-                Teams = new ClientTeams
-                {
-                    Home = new ClientTeam { Id = match.Teams.Home.Id, Name = match.Teams.Home.Name },
-                    Away = new ClientTeam { Id = match.Teams.Away.Id, Name = match.Teams.Away.Name }
-                },
-                TournamentName = match.TournamentName,
-                Score = match.Score,
-                Period = match.Period,
-                MatchStatus = match.MatchStatus,
-                PlayedTime = match.PlayedTime,
-                Markets = match.Markets.Select(m => new ClientMarket
-                {
-                    Id = m.Id,
-                    Description = m.Description,
-                    Specifier = m.Specifier,
-                    Margin = m.Margin,
-                    Favourite = m.Favourite,
-                    ProfitPercentage = m.ProfitPercentage,
-                    Outcomes = m.Outcomes.Select(o => new ClientOutcome
-                    {
-                        Id = o.Id,
-                        Description = o.Description,
-                        Odds = o.Odds,
-                        StakePercentage = o.StakePercentage
-                    }).ToList()
-                }).ToList(),
-                LastUpdated = DateTime.UtcNow
-            }).ToList();
+            // Process arbitrage matches
+            var clientArbitrageMatches = arbitrageMatches.Select(match => CreateClientMatch(match)).ToList();
+            _lastSentArbitrageMatches = clientArbitrageMatches;
+            await _hubContext.Clients.All.SendAsync("ReceiveArbitrageLiveMatches", clientArbitrageMatches);
 
-            // Store the last sent matches for new clients
-            _lastSentMatches = clientMatches;
+            // Process all matches
+            var allMatches = ProcessAllEvents(allEvents);
+            var clientAllMatches = allMatches.Select(match => CreateClientMatch(match)).ToList();
+            _lastSentAllMatches = clientAllMatches;
+            await _hubContext.Clients.All.SendAsync("ReceiveAllLiveMatches", clientAllMatches);
 
-            await _hubContext.Clients.All.SendAsync("ReceiveArbitrageLiveMatches", clientMatches);
-            
             _logger.LogInformation(
-                "Streamed {MatchCount} matches with {ArbitrageCount} arbitrage opportunities",
-                clientMatches.Count,
-                clientMatches.Sum(m => m.Markets.Count));
+                "Streamed {ArbitrageMatchCount} arbitrage matches and {AllMatchCount} total matches",
+                clientArbitrageMatches.Count,
+                clientAllMatches.Count);
         }
         catch (Exception ex)
         {
@@ -347,8 +348,45 @@ public partial class ArbitrageLiveMatchBackgroundService : BackgroundService
         }
     }
 
-    // Method to get the last sent matches (can be called by a hub method)
-    public static List<ClientMatch> GetLastSentMatches() => _lastSentMatches;
+    private ClientMatch CreateClientMatch(Match match)
+    {
+        return new ClientMatch
+        {
+            Id = match.Id,
+            SeasonId = match.SeasonId,
+            Teams = new ClientTeams
+            {
+                Home = new ClientTeam { Id = match.Teams.Home.Id, Name = match.Teams.Home.Name },
+                Away = new ClientTeam { Id = match.Teams.Away.Id, Name = match.Teams.Away.Name }
+            },
+            TournamentName = match.TournamentName,
+            Score = match.Score,
+            Period = match.Period,
+            MatchStatus = match.MatchStatus,
+            PlayedTime = match.PlayedTime,
+            Markets = match.Markets.Select(m => new ClientMarket
+            {
+                Id = m.Id,
+                Description = m.Description,
+                Specifier = m.Specifier,
+                Margin = m.Margin,
+                Favourite = m.Favourite,
+                ProfitPercentage = m.ProfitPercentage,
+                Outcomes = m.Outcomes.Select(o => new ClientOutcome
+                {
+                    Id = o.Id,
+                    Description = o.Description,
+                    Odds = o.Odds,
+                    StakePercentage = o.StakePercentage
+                }).ToList()
+            }).ToList(),
+            LastUpdated = DateTime.UtcNow
+        };
+    }
+
+    // Methods to get the last sent matches (can be called by hub methods)
+    public static List<ClientMatch> GetLastSentArbitrageMatches() => _lastSentArbitrageMatches;
+    public static List<ClientMatch> GetLastSentAllMatches() => _lastSentAllMatches;
 }
 
 public class ApiResponse
