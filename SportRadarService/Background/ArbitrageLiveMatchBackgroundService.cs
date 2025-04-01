@@ -135,7 +135,7 @@ public partial class ArbitrageLiveMatchBackgroundService : BackgroundService
     {
         var potentialMarkets = ProcessMarkets(eventData);
         var arbitrageMarkets = potentialMarkets
-            .Where(m => m.hasArbitrage)
+            .Where(m => m.hasArbitrage && m.market.ProfitPercentage > 0.1m) // Only include markets with actual arbitrage opportunities
             .Select(m => m.market)
             .ToList();
 
@@ -306,8 +306,8 @@ public partial class ArbitrageLiveMatchBackgroundService : BackgroundService
         var totalInverse = market.Outcomes.Sum(o => 1m / o.Odds);
         var profitPercentage = ((1 / totalInverse) - 1) * 100;
 
-        // For Next Goal markets, we might want to adjust the minimum profit threshold
-        var minProfitThreshold = market.Description?.ToLower() == "next goal" ? 0.1m : 0m;
+        // For Next Goal markets, we require a minimum profit threshold
+        var minProfitThreshold = 0.1m; // 0.1% minimum profit for Next Goal markets
 
         if (profitPercentage <= minProfitThreshold)
             return (false, new List<decimal>(), 0m);
