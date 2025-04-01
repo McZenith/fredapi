@@ -192,6 +192,15 @@ public static class SportMatchRoutes
         var retryDelayMs = 1000; // Start with 1 second delay
         var logger = serviceProvider.GetRequiredService<ILogger<Program>>();
 
+        // Create cache key based on query parameters
+        var cacheKey = $"prediction_data_page_{pagination.Page}_size_{pagination.PageSize}_start_{context.Request.Query["startTime"]}_end_{context.Request.Query["endTime"]}";
+
+        // Try to get from cache first
+        if (_cache.TryGetValue(cacheKey, out object cachedResponse))
+        {
+            return Results.Json(cachedResponse, GetCleanSerializerOptions());
+        }
+
         while (retryCount < maxRetries)
         {
             try
@@ -221,7 +230,7 @@ public static class SportMatchRoutes
 
                 var collection = mongoDbService.GetCollection<MongoEnrichedMatch>("EnrichedSportMatches");
 
-                // Optimized projection with only required fields
+                // Ultra-optimized projection with only the exact fields needed for prediction
                 var projection = Builders<MongoEnrichedMatch>.Projection
                     .Include(m => m.MatchId)
                     .Include(m => m.MatchTime)
@@ -286,7 +295,11 @@ public static class SportMatchRoutes
                     HasPrevious = paginationInfo.HasPrevious
                 };
 
-                // Return result without caching
+                // Cache the response for 1 minute
+                var cacheOptions = new MemoryCacheEntryOptions()
+                    .SetAbsoluteExpiration(TimeSpan.FromMinutes(1));
+                _cache.Set(cacheKey, predictionData, cacheOptions);
+
                 return Results.Json(predictionData, GetCleanSerializerOptions());
             }
             catch (MongoConnectionException ex)
