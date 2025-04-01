@@ -23,7 +23,8 @@ public partial class ArbitrageLiveMatchBackgroundService : BackgroundService
     private static List<ClientMatch> _lastSentAllMatches = new List<ClientMatch>();
 
     private const int DelayMinutes = 1;
-    private const decimal MaxAcceptableMargin = 10.0m;
+    private const decimal MaxAcceptableMargin = 100.1m;
+    private const decimal MinProfitThreshold = 0.05m;
 
     public ArbitrageLiveMatchBackgroundService(
         ILogger<ArbitrageLiveMatchBackgroundService> logger,
@@ -135,7 +136,7 @@ public partial class ArbitrageLiveMatchBackgroundService : BackgroundService
     {
         var potentialMarkets = ProcessMarkets(eventData);
         var arbitrageMarkets = potentialMarkets
-            .Where(m => m.hasArbitrage && m.market.ProfitPercentage > 0.1m) // Only include markets with actual arbitrage opportunities
+            .Where(m => m.hasArbitrage && m.market.ProfitPercentage > MinProfitThreshold)
             .Select(m => m.market)
             .ToList();
 
@@ -306,10 +307,7 @@ public partial class ArbitrageLiveMatchBackgroundService : BackgroundService
         var totalInverse = market.Outcomes.Sum(o => 1m / o.Odds);
         var profitPercentage = ((1 / totalInverse) - 1) * 100;
 
-        // For Next Goal markets, we require a minimum profit threshold
-        var minProfitThreshold = 0.1m; // 0.1% minimum profit for Next Goal markets
-
-        if (profitPercentage <= minProfitThreshold)
+        if (profitPercentage <= MinProfitThreshold)
             return (false, new List<decimal>(), 0m);
 
         var stakePercentages = CalculateStakePercentages(market.Outcomes, totalInverse);
@@ -401,7 +399,7 @@ public partial class ArbitrageLiveMatchBackgroundService : BackgroundService
                     .Where(m =>
                         ((m.Description?.ToLower().EndsWith("goal") ?? false) || (m.Description?.ToLower().Contains("goalscorer") ?? false)) &&
                         m.Specifier?.StartsWith("goalnr=") == true &&
-                        m.ProfitPercentage > 0.1m)
+                        m.ProfitPercentage > MinProfitThreshold)
                     .ToList();
                 _logger.LogDebug($"Created arbitrage client match {match.Id} with situation: {enrichedMatch?.MatchSituation != null}, details: {enrichedMatch?.MatchDetails != null}");
                 return clientMatch;
