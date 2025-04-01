@@ -6,7 +6,7 @@ using fredapi.SportRadarService.Transformers;
 using MongoDB.Driver;
 using MarketData = fredapi.SportRadarService.Background.ArbitrageLiveMatchBackgroundService.MarketData;
 using Microsoft.Extensions.Caching.Memory;
-
+using Microsoft.Extensions.Logging;
 
 using TeamTableSliceModel = fredapi.SportRadarService.Background.TeamTableSliceModel;
 using MongoDB.Bson;
@@ -190,6 +190,10 @@ public static class SportMatchRoutes
         const int maxRetries = 3;
         var retryCount = 0;
         var retryDelayMs = 1000; // Start with 1 second delay
+        var logger = serviceProvider.GetRequiredService<ILogger<Program>>();
+        const int maxConcurrentBatches = 3; // Maximum number of concurrent batch operations
+        const int batchSize = 20; // Smaller batch size for concurrent processing
+        const int batchDelayMs = 100; // Delay between batch operations
 
         while (retryCount < maxRetries)
         {
@@ -234,28 +238,37 @@ public static class SportMatchRoutes
                     .Include(m => m.LastXStatsTeam2);
 
                 // Get total count with a separate query to avoid timeout
-                var totalMatchCount = await collection.CountDocumentsAsync(filter);
+                var totalMatchCount = await collection.CountDocumentsAsync(filter, new CountOptions { MaxTime = TimeSpan.FromSeconds(30) });
 
-                // Get matches in smaller batches to avoid timeout
-                var batchSize = 50; // Process 50 matches at a time
                 var skip = (pagination.Page - 1) * pagination.PageSize;
                 var matches = new List<MongoEnrichedMatch>();
+                var semaphore = new SemaphoreSlim(maxConcurrentBatches);
 
-                while (matches.Count < pagination.PageSize && skip < totalMatchCount)
+                // Calculate number of batches needed
+                var totalBatches = (int)Math.Ceiling((double)pagination.PageSize / batchSize);
+                var batchTasks = new List<Task<List<MongoEnrichedMatch>>>();
+
+                // Create batch tasks
+                for (var i = 0; i < totalBatches; i++)
                 {
-                    var batch = await collection
-                        .FindWithDiskUse(filter)
-                        .Project<MongoEnrichedMatch>(projection)
-                        .SortBy(m => m.MatchTime)
-                        .Skip(skip)
-                        .Limit(batchSize)
-                        .ToListAsync();
+                    var currentSkip = skip + (i * batchSize);
+                    if (currentSkip >= totalMatchCount) break;
 
-                    if (!batch.Any()) break;
-
-                    matches.AddRange(batch);
-                    skip += batchSize;
+                    batchTasks.Add(ProcessBatchAsync(
+                        collection,
+                        filter,
+                        projection,
+                        currentSkip,
+                        batchSize,
+                        semaphore,
+                        logger,
+                        batchDelayMs
+                    ));
                 }
+
+                // Wait for all batches to complete
+                var batchResults = await Task.WhenAll(batchTasks);
+                matches.AddRange(batchResults.SelectMany(batch => batch));
 
                 // Transform matches to enriched format and filter out SRL teams
                 var enrichedMatches = matches
@@ -304,24 +317,104 @@ public static class SportMatchRoutes
                 retryCount++;
                 if (retryCount >= maxRetries)
                 {
-                    Console.WriteLine($"Error in GetPredictionData after {maxRetries} retries: {ex.Message}");
-                    Console.WriteLine($"Stack trace: {ex.StackTrace}");
-                    return Results.Problem($"Database connection error after {maxRetries} retries: {ex.Message}");
+                    logger.LogError(ex, "Database connection error after {MaxRetries} retries", maxRetries);
+                    return Results.Problem(
+                        detail: $"Database connection error after {maxRetries} retries: {ex.Message}",
+                        title: "Database Connection Error",
+                        statusCode: 503);
                 }
 
                 var delay = retryDelayMs * Math.Pow(2, retryCount - 1);
-                Console.WriteLine($"Retry {retryCount} of {maxRetries} after {delay}ms delay. Error: {ex.Message}");
+                logger.LogWarning(
+                    "Retry {RetryCount} of {MaxRetries} after {Delay}ms delay. Error: {Error}",
+                    retryCount,
+                    maxRetries,
+                    delay,
+                    ex.Message);
+
+                await Task.Delay((int)delay);
+            }
+            catch (MongoExecutionTimeoutException ex)
+            {
+                retryCount++;
+                if (retryCount >= maxRetries)
+                {
+                    logger.LogError(ex, "Query execution timeout after {MaxRetries} retries", maxRetries);
+                    return Results.Problem(
+                        detail: $"Query execution timeout after {maxRetries} retries: {ex.Message}",
+                        title: "Query Timeout",
+                        statusCode: 504);
+                }
+
+                var delay = retryDelayMs * Math.Pow(2, retryCount - 1);
+                logger.LogWarning(
+                    "Retry {RetryCount} of {MaxRetries} after {Delay}ms delay. Error: {Error}",
+                    retryCount,
+                    maxRetries,
+                    delay,
+                    ex.Message);
+
                 await Task.Delay((int)delay);
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"Error in GetPredictionData: {ex.Message}");
-                Console.WriteLine($"Stack trace: {ex.StackTrace}");
-                return Results.Problem($"Error fetching prediction data: {ex.Message}");
+                logger.LogError(ex, "Unexpected error in GetPredictionData");
+                return Results.Problem(
+                    detail: $"Error fetching prediction data: {ex.Message}",
+                    title: "Internal Server Error",
+                    statusCode: 500);
             }
         }
 
-        return Results.Problem("Failed to fetch prediction data after all retries");
+        return Results.Problem(
+            detail: "Failed to fetch prediction data after all retries",
+            title: "Service Unavailable",
+            statusCode: 503);
+    }
+
+    private static async Task<List<MongoEnrichedMatch>> ProcessBatchAsync(
+        IMongoCollection<MongoEnrichedMatch> collection,
+        FilterDefinition<MongoEnrichedMatch> filter,
+        ProjectionDefinition<MongoEnrichedMatch> projection,
+        int skip,
+        int batchSize,
+        SemaphoreSlim semaphore,
+        ILogger logger,
+        int batchDelayMs)
+    {
+        await semaphore.WaitAsync();
+        try
+        {
+            // Add a small delay between batches to prevent overwhelming the database
+            await Task.Delay(batchDelayMs);
+
+            return await collection
+                .FindWithDiskUse(filter)
+                .Project<MongoEnrichedMatch>(projection)
+                .SortBy(m => m.MatchTime)
+                .Skip(skip)
+                .Limit(batchSize)
+                .ToListAsync(CancellationToken.None);
+        }
+        catch (MongoExecutionTimeoutException ex)
+        {
+            logger.LogWarning(ex, "Batch query timed out for skip {Skip}. Retrying with smaller batch size.", skip);
+            // Retry with smaller batch size
+            return await ProcessBatchAsync(
+                collection,
+                filter,
+                projection,
+                skip,
+                Math.Max(5, batchSize / 2),
+                semaphore,
+                logger,
+                batchDelayMs
+            );
+        }
+        finally
+        {
+            semaphore.Release();
+        }
     }
 }
 
