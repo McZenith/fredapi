@@ -23,7 +23,7 @@ public partial class ArbitrageLiveMatchBackgroundService : BackgroundService
     private static List<ClientMatch> _lastSentAllMatches = new List<ClientMatch>();
 
     private const int DelayMinutes = 1;
-    private const decimal MaxAcceptableMargin = 100.1m;
+    private const decimal MaxAcceptableMargin = 10.0m;
     private const decimal MinProfitThreshold = 0.05m;
 
     public ArbitrageLiveMatchBackgroundService(
@@ -172,12 +172,9 @@ public partial class ArbitrageLiveMatchBackgroundService : BackgroundService
     {
         return eventData.Markets
             .Where(m => IsValidMarketStatus(m))
-            .Where(m =>
-                ((m.Desc?.ToLower().EndsWith("goal") ?? false) || (m.Desc?.ToLower().Contains("goalscorer") ?? false)) &&
-                m.Specifier?.StartsWith("goalnr=") == true) // Only include Next Goal markets with correct specifier
             .Where(m => _marketValidator.ValidateMarket(m))
             .Select(m => ProcessMarket(m, eventData.EventId))
-            .Where(m => m.market.Outcomes.Any() && m.market.Outcomes.Count == 2) // Ensure we have exactly 2 outcomes for Next Goal
+            .Where(m => m.market.Outcomes.Any())
             .ToList();
     }
 
@@ -307,7 +304,7 @@ public partial class ArbitrageLiveMatchBackgroundService : BackgroundService
         var totalInverse = market.Outcomes.Sum(o => 1m / o.Odds);
         var profitPercentage = ((1 / totalInverse) - 1) * 100;
 
-        if (profitPercentage <= MinProfitThreshold)
+        if (profitPercentage <= 0)
             return (false, new List<decimal>(), 0m);
 
         var stakePercentages = CalculateStakePercentages(market.Outcomes, totalInverse);
@@ -391,17 +388,36 @@ public partial class ArbitrageLiveMatchBackgroundService : BackgroundService
             // Create client matches with enriched data for arbitrage matches (Next Goal markets with arbitrage only)
             var clientArbitrageMatches = arbitrageMatches.Select(match =>
             {
-                // Find the enriched version of this match from allMatches
-                var enrichedMatch = allMatches.FirstOrDefault(m => m.Id == match.Id);
-                var clientMatch = CreateClientMatch(enrichedMatch ?? match);
+                var enrichedMatch = allEvents.FirstOrDefault(e => e.EventId == match.Id.ToString());
+                var clientMatch = CreateClientMatch(match);
+
+                // Log all markets before filtering
+                _logger.LogDebug($"Match {match.Id} has {clientMatch.Markets.Count} markets before filtering");
+                foreach (var market in clientMatch.Markets)
+                {
+                    _logger.LogDebug($"Market {market.Id} ({market.Description}): Profit={market.ProfitPercentage:F2}%, IsNextGoal={market.Description.Contains("Next Goal")}");
+                }
+
                 // Ensure only Next Goal markets with arbitrage are included
                 clientMatch.Markets = clientMatch.Markets
                     .Where(m =>
-                        ((m.Description?.ToLower().EndsWith("goal") ?? false) || (m.Description?.ToLower().Contains("goalscorer") ?? false)) &&
-                        m.Specifier?.StartsWith("goalnr=") == true &&
-                        m.ProfitPercentage > MinProfitThreshold)
+                    {
+                        var isNextGoal = m.Description.Contains("Next Goal");
+                        var hasProfit = m.ProfitPercentage > MinProfitThreshold;
+                        if (!isNextGoal)
+                        {
+                            _logger.LogDebug($"Market {m.Id} filtered out: Not a Next Goal market");
+                        }
+                        if (!hasProfit)
+                        {
+                            _logger.LogDebug($"Market {m.Id} filtered out: Profit {m.ProfitPercentage:F2}% below threshold {MinProfitThreshold:F2}%");
+                        }
+                        return isNextGoal && hasProfit;
+                    })
                     .ToList();
-                _logger.LogDebug($"Created arbitrage client match {match.Id} with situation: {enrichedMatch?.MatchSituation != null}, details: {enrichedMatch?.MatchDetails != null}");
+
+                _logger.LogDebug($"Match {match.Id} has {clientMatch.Markets.Count} markets after filtering");
+
                 return clientMatch;
             }).Where(m => m.Markets.Any()).ToList(); // Only include matches that have valid arbitrage markets
             _lastSentArbitrageMatches = clientArbitrageMatches;
