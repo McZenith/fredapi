@@ -377,24 +377,35 @@ public partial class ArbitrageLiveMatchBackgroundService : BackgroundService
                 await AddHumanLikeDelay(2000, 3000);
             }
 
-            // Create client matches with enriched data for all matches
+            // Create client matches with enriched data for all matches (1X2 markets only)
             var clientAllMatches = allMatches.Select(match =>
             {
                 var clientMatch = CreateClientMatch(match);
+                // Ensure only 1X2 markets are included
+                clientMatch.Markets = clientMatch.Markets
+                    .Where(m => m.Description?.ToLower() == "match result" || m.Description?.ToLower() == "1x2")
+                    .ToList();
                 _logger.LogDebug($"Created client match {match.Id} with situation: {match.MatchSituation != null}, details: {match.MatchDetails != null}");
                 return clientMatch;
             }).ToList();
             _lastSentAllMatches = clientAllMatches;
 
-            // Create client matches with enriched data for arbitrage matches
+            // Create client matches with enriched data for arbitrage matches (Next Goal markets with arbitrage only)
             var clientArbitrageMatches = arbitrageMatches.Select(match =>
             {
                 // Find the enriched version of this match from allMatches
                 var enrichedMatch = allMatches.FirstOrDefault(m => m.Id == match.Id);
                 var clientMatch = CreateClientMatch(enrichedMatch ?? match);
+                // Ensure only Next Goal markets with arbitrage are included
+                clientMatch.Markets = clientMatch.Markets
+                    .Where(m =>
+                        ((m.Description?.ToLower().EndsWith("goal") ?? false) || (m.Description?.ToLower().Contains("goalscorer") ?? false)) &&
+                        m.Specifier?.StartsWith("goalnr=") == true &&
+                        m.ProfitPercentage > 0.1m)
+                    .ToList();
                 _logger.LogDebug($"Created arbitrage client match {match.Id} with situation: {enrichedMatch?.MatchSituation != null}, details: {enrichedMatch?.MatchDetails != null}");
                 return clientMatch;
-            }).ToList();
+            }).Where(m => m.Markets.Any()).ToList(); // Only include matches that have valid arbitrage markets
             _lastSentArbitrageMatches = clientArbitrageMatches;
 
             // Send both messages with enriched data
