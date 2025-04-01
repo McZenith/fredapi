@@ -191,9 +191,6 @@ public static class SportMatchRoutes
         var retryCount = 0;
         var retryDelayMs = 1000; // Start with 1 second delay
         var logger = serviceProvider.GetRequiredService<ILogger<Program>>();
-        const int maxConcurrentBatches = 3; // Maximum number of concurrent batch operations
-        const int batchSize = 20; // Smaller batch size for concurrent processing
-        const int batchDelayMs = 100; // Delay between batch operations
 
         while (retryCount < maxRetries)
         {
@@ -206,7 +203,6 @@ public static class SportMatchRoutes
                 pagination.PageSize = pagination.PageSize > 100 ? 100 : pagination.PageSize;
 
                 // Default time range: 90 mins ago to 24 hours ahead
-                // But allow configuring via query parameters if present
                 var startTime = context.Request.Query.TryGetValue("startTime", out var startTimeStr) &&
                                 DateTime.TryParse(startTimeStr, out var parsedStartTime)
                     ? parsedStartTime.ToUniversalTime()
@@ -223,14 +219,14 @@ public static class SportMatchRoutes
                     Builders<MongoEnrichedMatch>.Filter.Lte(m => m.MatchTime, endTime)
                 );
 
-                // Get matches with pagination using FindWithDiskUse for better performance
                 var collection = mongoDbService.GetCollection<MongoEnrichedMatch>("EnrichedSportMatches");
 
-                // Use a projection to only get the fields we need
+                // Optimized projection with only required fields
                 var projection = Builders<MongoEnrichedMatch>.Projection
                     .Include(m => m.MatchId)
                     .Include(m => m.MatchTime)
-                    .Include(m => m.OriginalMatch)
+                    .Include(m => m.OriginalMatch.Teams.Home.Name)
+                    .Include(m => m.OriginalMatch.Teams.Away.Name)
                     .Include(m => m.Team1LastX)
                     .Include(m => m.Team2LastX)
                     .Include(m => m.TeamTableSlice)
@@ -241,34 +237,15 @@ public static class SportMatchRoutes
                 var totalMatchCount = await collection.CountDocumentsAsync(filter, new CountOptions { MaxTime = TimeSpan.FromSeconds(30) });
 
                 var skip = (pagination.Page - 1) * pagination.PageSize;
-                var matches = new List<MongoEnrichedMatch>();
-                var semaphore = new SemaphoreSlim(maxConcurrentBatches);
 
-                // Calculate number of batches needed
-                var totalBatches = (int)Math.Ceiling((double)pagination.PageSize / batchSize);
-                var batchTasks = new List<Task<List<MongoEnrichedMatch>>>();
-
-                // Create batch tasks
-                for (var i = 0; i < totalBatches; i++)
-                {
-                    var currentSkip = skip + (i * batchSize);
-                    if (currentSkip >= totalMatchCount) break;
-
-                    batchTasks.Add(ProcessBatchAsync(
-                        collection,
-                        filter,
-                        projection,
-                        currentSkip,
-                        batchSize,
-                        semaphore,
-                        logger,
-                        batchDelayMs
-                    ));
-                }
-
-                // Wait for all batches to complete
-                var batchResults = await Task.WhenAll(batchTasks);
-                matches.AddRange(batchResults.SelectMany(batch => batch));
+                // Single efficient query with proper sorting and pagination
+                var matches = await collection
+                    .FindWithDiskUse(filter)
+                    .Project<MongoEnrichedMatch>(projection)
+                    .SortBy(m => m.MatchTime)
+                    .Skip(skip)
+                    .Limit(pagination.PageSize)
+                    .ToListAsync();
 
                 // Transform matches to enriched format and filter out SRL teams
                 var enrichedMatches = matches
@@ -370,51 +347,6 @@ public static class SportMatchRoutes
             detail: "Failed to fetch prediction data after all retries",
             title: "Service Unavailable",
             statusCode: 503);
-    }
-
-    private static async Task<List<MongoEnrichedMatch>> ProcessBatchAsync(
-        IMongoCollection<MongoEnrichedMatch> collection,
-        FilterDefinition<MongoEnrichedMatch> filter,
-        ProjectionDefinition<MongoEnrichedMatch> projection,
-        int skip,
-        int batchSize,
-        SemaphoreSlim semaphore,
-        ILogger logger,
-        int batchDelayMs)
-    {
-        await semaphore.WaitAsync();
-        try
-        {
-            // Add a small delay between batches to prevent overwhelming the database
-            await Task.Delay(batchDelayMs);
-
-            return await collection
-                .FindWithDiskUse(filter)
-                .Project<MongoEnrichedMatch>(projection)
-                .SortBy(m => m.MatchTime)
-                .Skip(skip)
-                .Limit(batchSize)
-                .ToListAsync(CancellationToken.None);
-        }
-        catch (MongoExecutionTimeoutException ex)
-        {
-            logger.LogWarning(ex, "Batch query timed out for skip {Skip}. Retrying with smaller batch size.", skip);
-            // Retry with smaller batch size
-            return await ProcessBatchAsync(
-                collection,
-                filter,
-                projection,
-                skip,
-                Math.Max(5, batchSize / 2),
-                semaphore,
-                logger,
-                batchDelayMs
-            );
-        }
-        finally
-        {
-            semaphore.Release();
-        }
     }
 }
 
