@@ -134,15 +134,23 @@ public partial class ArbitrageLiveMatchBackgroundService : BackgroundService
 
     private Match ProcessSingleEvent(Event eventData)
     {
+        _logger.LogDebug($"Processing event {eventData.EventId}");
         var potentialMarkets = ProcessMarkets(eventData);
         var arbitrageMarkets = potentialMarkets
             .Where(m => m.hasArbitrage && m.market.ProfitPercentage > MinProfitThreshold)
             .Select(m => m.market)
             .ToList();
 
+        _logger.LogDebug($"Found {arbitrageMarkets.Count} arbitrage markets for event {eventData.EventId}");
+        foreach (var market in arbitrageMarkets)
+        {
+            _logger.LogDebug($"Arbitrage market {market.Id}: {market.Description}, Profit={market.ProfitPercentage:F2}%");
+        }
+
         // Only create a match if there are actual arbitrage opportunities
         if (!arbitrageMarkets.Any())
         {
+            _logger.LogDebug($"No arbitrage opportunities found for event {eventData.EventId}");
             return null;
         }
 
@@ -170,12 +178,21 @@ public partial class ArbitrageLiveMatchBackgroundService : BackgroundService
 
     private List<(Market market, bool hasArbitrage)> ProcessMarkets(Event eventData)
     {
-        return eventData.Markets
+        _logger.LogDebug($"Processing markets for match {eventData.EventId}");
+        var markets = eventData.Markets
             .Where(m => IsValidMarketStatus(m))
             .Where(m => _marketValidator.ValidateMarket(m))
             .Select(m => ProcessMarket(m, eventData.EventId))
             .Where(m => m.market.Outcomes.Any())
             .ToList();
+
+        _logger.LogDebug($"Found {markets.Count} valid markets for match {eventData.EventId}");
+        foreach (var (market, hasArbitrage) in markets)
+        {
+            _logger.LogDebug($"Market {market.Id} ({market.Description}): HasArbitrage={hasArbitrage}, Margin={market.Margin:F2}%, Profit={market.ProfitPercentage:F2}%");
+        }
+
+        return markets;
     }
 
     private bool IsValidMarketStatus(MarketData market)
@@ -187,6 +204,7 @@ public partial class ArbitrageLiveMatchBackgroundService : BackgroundService
     {
         try
         {
+            _logger.LogDebug($"Processing market {marketData.Id} for match {matchId}");
             var market = new Market
             {
                 Id = marketData.Id,
@@ -199,6 +217,7 @@ public partial class ArbitrageLiveMatchBackgroundService : BackgroundService
             if (!market.Outcomes.Any() || 
                 !_marketValidator.ValidateMarket(marketData, market.Outcomes.Count))
             {
+                _logger.LogDebug($"Market {marketData.Id} invalid: No outcomes or failed validation");
                 return (market, false);
             }
 
@@ -209,6 +228,11 @@ public partial class ArbitrageLiveMatchBackgroundService : BackgroundService
             {
                 UpdateMarketWithArbitrageData(market, stakePercentages, profitPercentage);
                 LogArbitrageOpportunity(matchId, market);
+                _logger.LogDebug($"Found arbitrage in market {marketData.Id}: Profit={profitPercentage:F2}%, Margin={market.Margin:F2}%");
+            }
+            else
+            {
+                _logger.LogDebug($"No arbitrage in market {marketData.Id}: Profit={profitPercentage:F2}%, Margin={market.Margin:F2}%");
             }
 
             return (market, hasArbitrage);
@@ -292,20 +316,33 @@ public partial class ArbitrageLiveMatchBackgroundService : BackgroundService
     private (bool hasArbitrage, List<decimal> stakePercentages, decimal profitPercentage) 
         CalculateArbitrageOpportunity(Market market)
     {
-        if (!market.Outcomes.Any()) 
+        if (!market.Outcomes.Any())
+        {
+            _logger.LogDebug($"No outcomes in market {market.Id}");
             return (false, new List<decimal>(), 0m);
+        }
 
         var margin = CalculateMarginPercentage(market.Outcomes);
         market.Margin = margin;
 
+        _logger.LogDebug($"Market {market.Id} margin: {margin:F2}%");
+
         if (margin > MaxAcceptableMargin)
+        {
+            _logger.LogDebug($"Market {market.Id} margin {margin:F2}% exceeds max {MaxAcceptableMargin}%");
             return (false, new List<decimal>(), 0m);
+        }
 
         var totalInverse = market.Outcomes.Sum(o => 1m / o.Odds);
         var profitPercentage = ((1 / totalInverse) - 1) * 100;
 
+        _logger.LogDebug($"Market {market.Id} profit: {profitPercentage:F2}%");
+
         if (profitPercentage <= 0)
+        {
+            _logger.LogDebug($"Market {market.Id} profit {profitPercentage:F2}% is not positive");
             return (false, new List<decimal>(), 0m);
+        }
 
         var stakePercentages = CalculateStakePercentages(market.Outcomes, totalInverse);
         return (true, stakePercentages, Math.Round(profitPercentage, 2));
@@ -385,7 +422,7 @@ public partial class ArbitrageLiveMatchBackgroundService : BackgroundService
             }).ToList();
             _lastSentAllMatches = clientAllMatches;
 
-            // Create client matches with enriched data for arbitrage matches (Next Goal markets with arbitrage only)
+            // Create client matches with enriched data for arbitrage matches
             var clientArbitrageMatches = arbitrageMatches.Select(match =>
             {
                 var enrichedMatch = allEvents.FirstOrDefault(e => e.EventId == match.Id.ToString());
@@ -395,27 +432,10 @@ public partial class ArbitrageLiveMatchBackgroundService : BackgroundService
                 _logger.LogDebug($"Match {match.Id} has {clientMatch.Markets.Count} markets before filtering");
                 foreach (var market in clientMatch.Markets)
                 {
-                    _logger.LogDebug($"Market {market.Id} ({market.Description}): Profit={market.ProfitPercentage:F2}%, IsNextGoal={market.Description.Contains("Next Goal")}");
+                    _logger.LogDebug($"Market {market.Id} ({market.Description}): Profit={market.ProfitPercentage:F2}%");
                 }
 
-                // Ensure only Next Goal markets with arbitrage are included
-                clientMatch.Markets = clientMatch.Markets
-                    .Where(m =>
-                    {
-                        var isNextGoal = m.Description.Contains("Next Goal");
-                        var hasProfit = m.ProfitPercentage > MinProfitThreshold;
-                        if (!isNextGoal)
-                        {
-                            _logger.LogDebug($"Market {m.Id} filtered out: Not a Next Goal market");
-                        }
-                        if (!hasProfit)
-                        {
-                            _logger.LogDebug($"Market {m.Id} filtered out: Profit {m.ProfitPercentage:F2}% below threshold {MinProfitThreshold:F2}%");
-                        }
-                        return isNextGoal && hasProfit;
-                    })
-                    .ToList();
-
+                // No additional filtering needed here since we already filtered in ProcessSingleEvent
                 _logger.LogDebug($"Match {match.Id} has {clientMatch.Markets.Count} markets after filtering");
 
                 return clientMatch;
