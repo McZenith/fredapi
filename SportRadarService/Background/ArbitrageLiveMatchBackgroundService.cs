@@ -171,10 +171,12 @@ public partial class ArbitrageLiveMatchBackgroundService : BackgroundService
     {
         return eventData.Markets
             .Where(m => IsValidMarketStatus(m))
-            .Where(m => m.Desc?.ToLower() == "match result" || m.Desc?.ToLower() == "1x2") // Only include 1X2 markets
+            .Where(m =>
+                ((m.Desc?.ToLower().EndsWith("goal") ?? false) || (m.Desc?.ToLower().Contains("goalscorer") ?? false)) &&
+                m.Specifier?.StartsWith("goalnr=") == true) // Only include Next Goal markets with correct specifier
             .Where(m => _marketValidator.ValidateMarket(m))
             .Select(m => ProcessMarket(m, eventData.EventId))
-            .Where(m => m.market.Outcomes.Any() && m.market.Outcomes.Count == 3) // Ensure we have exactly 3 outcomes (1X2)
+            .Where(m => m.market.Outcomes.Any() && m.market.Outcomes.Count == 2) // Ensure we have exactly 2 outcomes for Next Goal
             .ToList();
     }
 
@@ -304,7 +306,10 @@ public partial class ArbitrageLiveMatchBackgroundService : BackgroundService
         var totalInverse = market.Outcomes.Sum(o => 1m / o.Odds);
         var profitPercentage = ((1 / totalInverse) - 1) * 100;
 
-        if (profitPercentage <= 0) 
+        // For Next Goal markets, we might want to adjust the minimum profit threshold
+        var minProfitThreshold = market.Description?.ToLower() == "next goal" ? 0.1m : 0m;
+
+        if (profitPercentage <= minProfitThreshold)
             return (false, new List<decimal>(), 0m);
 
         var stakePercentages = CalculateStakePercentages(market.Outcomes, totalInverse);
