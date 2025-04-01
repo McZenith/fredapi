@@ -117,7 +117,7 @@ public partial class ArbitrageLiveMatchBackgroundService : BackgroundService
     {
         return events
             .Select(ProcessSingleEvent)
-            .Where(m => m.Markets.Any())
+            .Where(m => m != null && m.Markets.Any()) // Only include matches with actual arbitrage opportunities
             .Where(m => !m.Teams.Away.Name.ToUpper().Contains("SRL") || !m.Teams.Home.Name.ToUpper().Contains("SRL"))
             .ToList();
     }
@@ -138,6 +138,12 @@ public partial class ArbitrageLiveMatchBackgroundService : BackgroundService
             .Where(m => m.hasArbitrage)
             .Select(m => m.market)
             .ToList();
+
+        // Only create a match if there are actual arbitrage opportunities
+        if (!arbitrageMarkets.Any())
+        {
+            return null;
+        }
 
         return CreateMatch(eventData, arbitrageMarkets);
     }
@@ -165,9 +171,10 @@ public partial class ArbitrageLiveMatchBackgroundService : BackgroundService
     {
         return eventData.Markets
             .Where(m => IsValidMarketStatus(m))
+            .Where(m => m.Desc?.ToLower() == "match result" || m.Desc?.ToLower() == "1x2") // Only include 1X2 markets
             .Where(m => _marketValidator.ValidateMarket(m))
             .Select(m => ProcessMarket(m, eventData.EventId))
-            .Where(m => m.market.Outcomes.Any())
+            .Where(m => m.market.Outcomes.Any() && m.market.Outcomes.Count == 3) // Ensure we have exactly 3 outcomes (1X2)
             .ToList();
     }
 
