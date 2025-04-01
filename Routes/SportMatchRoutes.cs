@@ -233,18 +233,32 @@ public static class SportMatchRoutes
                     .Include(m => m.LastXStatsTeam1)
                     .Include(m => m.LastXStatsTeam2);
 
+                // Get total count with a separate query to avoid timeout
                 var totalMatchCount = await collection.CountDocumentsAsync(filter);
 
-                var mongoMatches = await collection
-                    .FindWithDiskUse(filter)
-                    .Project<MongoEnrichedMatch>(projection)
-                    .SortBy(m => m.MatchTime)
-                    .Skip((pagination.Page - 1) * pagination.PageSize)
-                    .Limit(pagination.PageSize)
-                    .ToListAsync();
+                // Get matches in smaller batches to avoid timeout
+                var batchSize = 50; // Process 50 matches at a time
+                var skip = (pagination.Page - 1) * pagination.PageSize;
+                var matches = new List<MongoEnrichedMatch>();
+
+                while (matches.Count < pagination.PageSize && skip < totalMatchCount)
+                {
+                    var batch = await collection
+                        .FindWithDiskUse(filter)
+                        .Project<MongoEnrichedMatch>(projection)
+                        .SortBy(m => m.MatchTime)
+                        .Skip(skip)
+                        .Limit(batchSize)
+                        .ToListAsync();
+
+                    if (!batch.Any()) break;
+
+                    matches.AddRange(batch);
+                    skip += batchSize;
+                }
 
                 // Transform matches to enriched format and filter out SRL teams
-                var enrichedMatches = mongoMatches
+                var enrichedMatches = matches
                     .Select(m => m.ToEnrichedSportMatch())
                     .Where(m => m != null)
                     .Where(m =>

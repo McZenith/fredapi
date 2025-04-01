@@ -33,12 +33,15 @@ public class MongoDbService
 
             // Configure MongoDB client settings with retry options
             var settings = MongoClientSettings.FromConnectionString(_mongoDBSettings.ConnectionString);
-            settings.ServerSelectionTimeout = TimeSpan.FromSeconds(30);
-            settings.ConnectTimeout = TimeSpan.FromSeconds(30);
-            settings.SocketTimeout = TimeSpan.FromSeconds(30);
-            settings.MaxConnectionPoolSize = 100;
+            settings.ServerSelectionTimeout = TimeSpan.FromSeconds(60);
+            settings.ConnectTimeout = TimeSpan.FromSeconds(60);
+            settings.SocketTimeout = TimeSpan.FromSeconds(120);
+            settings.MaxConnectionPoolSize = 200;
             settings.RetryReads = true;
             settings.RetryWrites = true;
+            settings.WaitQueueSize = 500;
+            settings.WaitQueueTimeout = TimeSpan.FromSeconds(60);
+            settings.MaxConnectionIdleTime = TimeSpan.FromMinutes(5);
 
             // Connect to MongoDB
             _mongoClient = new MongoClient(settings);
