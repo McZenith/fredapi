@@ -5,7 +5,6 @@ using fredapi.Utils;
 using Microsoft.AspNetCore.Http.Connections;
 using fredapi.SportRadarService.Background;
 using Microsoft.AspNetCore.ResponseCompression;
-using MongoDB.Driver;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -97,23 +96,6 @@ using (var scope = app.Services.CreateScope())
             "EnrichedSportMatches",
             "MatchTime",
             descending: true);
-
-        // Create compound index for prediction data queries
-        var indexKeysDefinition = Builders<fredapi.Routes.MongoEnrichedMatch>.IndexKeys
-            .Ascending(m => m.MatchTime)
-            .Ascending(m => m.OriginalMatch.Teams.Home.Name)
-            .Ascending(m => m.OriginalMatch.Teams.Away.Name);
-
-        var indexOptions = new CreateIndexOptions<fredapi.Routes.MongoEnrichedMatch>
-        {
-            Name = "PredictionDataQueryIndex",
-            Background = true
-        };
-
-        await mongoDbService.CreateIndexAsync(
-            "EnrichedSportMatches",
-            indexKeysDefinition,
-            indexOptions);
 
         logger.LogInformation("Successfully created MongoDB indexes at startup");
     }
