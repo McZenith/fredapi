@@ -189,6 +189,15 @@ public static class SportMatchRoutes
     {
         try
         {
+            // Create a cache key based on the request parameters
+            var cacheKey = $"prediction_data_page_{pagination.Page}_size_{pagination.PageSize}_start_{context.Request.Query["startTime"]}_end_{context.Request.Query["endTime"]}";
+
+            // Try to get from cache first
+            if (_cache.TryGetValue(cacheKey, out object cachedResponse))
+            {
+                return Results.Json(cachedResponse, GetCleanSerializerOptions());
+            }
+
             // Get SportMatchesPredictionTransformer from DI
             var transformer = serviceProvider.GetRequiredService<SportMatchesPredictionTransformer>();
 
@@ -226,11 +235,15 @@ public static class SportMatchRoutes
 
             // Transform matches to enriched format and filter out SRL teams
             var enrichedMatches = mongoMatches
-                .Select(m => m.ToEnrichedSportMatch()) // This already calls ToLocalTime()
+                .Select(m => m.ToEnrichedSportMatch())
                 .Where(m => m != null)
                 .Where(m =>
-                    !(m.OriginalMatch?.Teams?.Home?.Name?.Contains("SRL", StringComparison.OrdinalIgnoreCase) == true ||
-                      m.OriginalMatch?.Teams?.Away?.Name?.Contains("SRL", StringComparison.OrdinalIgnoreCase) == true))
+                {
+                    var homeTeam = m?.OriginalMatch?.Teams?.Home?.Name;
+                    var awayTeam = m?.OriginalMatch?.Teams?.Away?.Name;
+                    return !(homeTeam?.Contains("SRL", StringComparison.OrdinalIgnoreCase) == true ||
+                            awayTeam?.Contains("SRL", StringComparison.OrdinalIgnoreCase) == true);
+                })
                 .ToList();
 
             if (!enrichedMatches.Any())
@@ -263,7 +276,11 @@ public static class SportMatchRoutes
                 HasPrevious = paginationInfo.HasPrevious
             };
 
-            // Return result without caching
+            // Cache the response
+            var cacheOptions = new MemoryCacheEntryOptions()
+                .SetAbsoluteExpiration(TimeSpan.FromMinutes(5));
+            _cache.Set(cacheKey, predictionData, cacheOptions);
+
             return Results.Json(predictionData, GetCleanSerializerOptions());
         }
         catch (Exception ex)
