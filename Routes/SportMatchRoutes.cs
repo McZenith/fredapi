@@ -195,8 +195,16 @@ public static class SportMatchRoutes
             // Set maximum page size to 100
             pagination.PageSize = pagination.PageSize > 100 ? 100 : pagination.PageSize;
 
+            // Create cache key based on parameters
+            var cacheKey = $"prediction_data_page_{pagination.Page}_size_{pagination.PageSize}";
+
+            // Try to get from cache first
+            if (_cache.TryGetValue(cacheKey, out SportRadarService.Transformers.PredictionData cachedData))
+            {
+                return Results.Json(cachedData, GetCleanSerializerOptions());
+            }
+
             // Default time range: 90 mins ago to 24 hours ahead
-            // But allow configuring via query parameters if present
             var startTime = context.Request.Query.TryGetValue("startTime", out var startTimeStr) &&
                             DateTime.TryParse(startTimeStr, out var parsedStartTime)
                 ? parsedStartTime.ToUniversalTime()
@@ -207,10 +215,16 @@ public static class SportMatchRoutes
                 ? parsedEndTime.ToUniversalTime()
                 : DateTime.UtcNow.AddHours(24);
 
-            // Get matches from DB with time filter
+            // Build filter with SRL exclusion at database level
             var filter = Builders<MongoEnrichedMatch>.Filter.And(
                 Builders<MongoEnrichedMatch>.Filter.Gte(m => m.MatchTime, startTime),
-                Builders<MongoEnrichedMatch>.Filter.Lte(m => m.MatchTime, endTime)
+                Builders<MongoEnrichedMatch>.Filter.Lte(m => m.MatchTime, endTime),
+                Builders<MongoEnrichedMatch>.Filter.Not(
+                    Builders<MongoEnrichedMatch>.Filter.Or(
+                        Builders<MongoEnrichedMatch>.Filter.Regex(m => m.OriginalMatch.Teams.Home.Name, new BsonRegularExpression("SRL", "i")),
+                        Builders<MongoEnrichedMatch>.Filter.Regex(m => m.OriginalMatch.Teams.Away.Name, new BsonRegularExpression("SRL", "i"))
+                    )
+                )
             );
 
             // Get matches with pagination
@@ -224,13 +238,10 @@ public static class SportMatchRoutes
                 .Limit(pagination.PageSize)
                 .ToListAsync();
 
-            // Transform matches to enriched format and filter out SRL teams
+            // Transform matches to enriched format
             var enrichedMatches = mongoMatches
-                .Select(m => m.ToEnrichedSportMatch()) // This already calls ToLocalTime()
+                .Select(m => m.ToEnrichedSportMatch())
                 .Where(m => m != null)
-                .Where(m =>
-                    !(m.OriginalMatch?.Teams?.Home?.Name?.Contains("SRL", StringComparison.OrdinalIgnoreCase) == true ||
-                      m.OriginalMatch?.Teams?.Away?.Name?.Contains("SRL", StringComparison.OrdinalIgnoreCase) == true))
                 .ToList();
 
             if (!enrichedMatches.Any())
@@ -238,8 +249,24 @@ public static class SportMatchRoutes
                 return Results.NotFound("No matches found in the specified time range");
             }
 
-            // Use the transformer to convert the data
-            var predictionData = transformer.TransformToPredictionData(enrichedMatches);
+            // Process matches in parallel batches
+            const int batchSize = 10; // Adjust based on your needs
+            var batches = enrichedMatches
+                .Select((match, index) => new { match, index })
+                .GroupBy(x => x.index / batchSize)
+                .Select(g => g.Select(x => x.match).ToList())
+                .ToList();
+
+            // Process batches concurrently
+            var tasks = batches.Select(async batch =>
+            {
+                return transformer.TransformToPredictionData(batch);
+            });
+
+            var batchResults = await Task.WhenAll(tasks);
+
+            // Use the first batch result as the base
+            var predictionData = batchResults.First();
 
             // Create pagination info
             var paginationInfo = new PaginationInfo
@@ -263,7 +290,11 @@ public static class SportMatchRoutes
                 HasPrevious = paginationInfo.HasPrevious
             };
 
-            // Return result without caching
+            // Cache the result
+            var cacheOptions = new MemoryCacheEntryOptions()
+                .SetAbsoluteExpiration(TimeSpan.FromMinutes(5));
+            _cache.Set(cacheKey, predictionData, cacheOptions);
+
             return Results.Json(predictionData, GetCleanSerializerOptions());
         }
         catch (Exception ex)

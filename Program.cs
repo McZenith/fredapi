@@ -3,7 +3,6 @@ using fredapi.Routes;
 using fredapi.SignalR;
 using fredapi.Utils;
 using Microsoft.AspNetCore.Http.Connections;
-using fredapi.SportRadarService.Background;
 using Microsoft.AspNetCore.ResponseCompression;
 
 var builder = WebApplication.CreateBuilder(args);
