@@ -189,6 +189,10 @@ public static class SportMatchRoutes
     {
         try
         {
+            // Add response headers for compression and caching
+            context.Response.Headers.Add("Cache-Control", "public, max-age=300"); // 5 minute cache
+            context.Response.Headers.Add("Vary", "Accept-Encoding");
+
             // Get SportMatchesPredictionTransformer from DI
             var transformer = serviceProvider.GetRequiredService<SportMatchesPredictionTransformer>();
 
@@ -215,6 +219,13 @@ public static class SportMatchRoutes
                 ? parsedEndTime.ToUniversalTime()
                 : DateTime.UtcNow.AddHours(24);
 
+            // Add index hint for better query performance
+            var collection = mongoDbService.GetCollection<MongoEnrichedMatch>("EnrichedSportMatches");
+            var findOptions = new FindOptions
+            {
+                Hint = "{ MatchTime: 1 }"  // Use the existing index on MatchTime
+            };
+
             // Build filter with SRL exclusion at database level
             var filter = Builders<MongoEnrichedMatch>.Filter.And(
                 Builders<MongoEnrichedMatch>.Filter.Gte(m => m.MatchTime, startTime),
@@ -227,60 +238,70 @@ public static class SportMatchRoutes
                 )
             );
 
-            // Get matches with pagination
-            var collection = mongoDbService.GetCollection<MongoEnrichedMatch>("EnrichedSportMatches");
-
-            // Log time for count operation
-            var countStartTime = DateTime.UtcNow;
-            var totalMatchCount = await collection.CountDocumentsAsync(filter);
-            var countDuration = DateTime.UtcNow - countStartTime;
-            Console.WriteLine($"Database count operation took: {countDuration.TotalMilliseconds}ms");
-
-            // Log time for find operation
-            var findStartTime = DateTime.UtcNow;
-            var mongoMatches = await collection
-                .Find(filter)
+            // Get matches with pagination - use async count for better performance
+            var countTask = collection.CountDocumentsAsync(filter);
+            var findTask = collection
+                .Find(filter, findOptions)
                 .SortBy(m => m.MatchTime)
                 .Skip((pagination.Page - 1) * pagination.PageSize)
                 .Limit(pagination.PageSize)
                 .ToListAsync();
-            var findDuration = DateTime.UtcNow - findStartTime;
-            Console.WriteLine($"Database find operation took: {findDuration.TotalMilliseconds}ms");
-            Console.WriteLine($"Retrieved {mongoMatches.Count} matches");
 
-            // Transform matches to enriched format
-            var transformStartTime = DateTime.UtcNow;
-            var enrichedMatches = mongoMatches
-                .Select(m => m.ToEnrichedSportMatch())
-                .Where(m => m != null)
-                .ToList();
-            var transformDuration = DateTime.UtcNow - transformStartTime;
-            Console.WriteLine($"Match transformation took: {transformDuration.TotalMilliseconds}ms");
+            // Execute both operations concurrently
+            await Task.WhenAll(countTask, findTask);
+            var totalMatchCount = await countTask;
+            var mongoMatches = await findTask;
 
-            if (!enrichedMatches.Any())
+            // Transform matches to enriched format using parallel processing
+            var enrichedMatches = await Task.WhenAll(mongoMatches.Select(async m =>
+            {
+                try
+                {
+                    return m.ToEnrichedSportMatch();
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"Error transforming match {m.MatchId}: {ex.Message}");
+                    return null;
+                }
+            }));
+
+            var validMatches = enrichedMatches.Where(m => m != null).ToList();
+
+            if (!validMatches.Any())
             {
                 return Results.NotFound("No matches found in the specified time range");
             }
 
-            // Process matches in parallel batches
-            const int batchSize = 10; // Adjust based on your needs
-            var batches = enrichedMatches
+            // Process matches in parallel with optimized batch size
+            const int batchSize = 20; // Increased batch size for better throughput
+            var batches = validMatches
                 .Select((match, index) => new { match, index })
                 .GroupBy(x => x.index / batchSize)
                 .Select(g => g.Select(x => x.match).ToList())
                 .ToList();
 
-            // Process batches concurrently
-            var batchStartTime = DateTime.UtcNow;
-            var tasks = batches.Select(async batch =>
+            // Process batches concurrently with timeout
+            var batchTasks = batches.Select(async batch =>
             {
-                return transformer.TransformToPredictionData(batch);
+                using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10)); // 10 second timeout per batch
+                try
+                {
+                    return await Task.Run(() => transformer.TransformToPredictionData(batch), cts.Token);
+                }
+                catch (OperationCanceledException)
+                {
+                    Console.WriteLine($"Batch processing timed out for {batch.Count} matches");
+                    return null;
+                }
             });
 
-            var batchResults = await Task.WhenAll(tasks);
-            var batchDuration = DateTime.UtcNow - batchStartTime;
-            Console.WriteLine($"Batch processing took: {batchDuration.TotalMilliseconds}ms");
-            Console.WriteLine($"Processed {batches.Count} batches of {batchSize} matches each");
+            var batchResults = (await Task.WhenAll(batchTasks)).Where(r => r != null).ToList();
+
+            if (!batchResults.Any())
+            {
+                return Results.StatusCode(500);
+            }
 
             // Use the first batch result as the base
             var predictionData = batchResults.First();
@@ -307,9 +328,10 @@ public static class SportMatchRoutes
                 HasPrevious = paginationInfo.HasPrevious
             };
 
-            // Cache the result
+            // Cache the result with sliding expiration
             var cacheOptions = new MemoryCacheEntryOptions()
-                .SetAbsoluteExpiration(TimeSpan.FromMinutes(5));
+                .SetAbsoluteExpiration(TimeSpan.FromMinutes(5))
+                .SetSlidingExpiration(TimeSpan.FromMinutes(2));
             _cache.Set(cacheKey, predictionData, cacheOptions);
 
             return Results.Json(predictionData, GetCleanSerializerOptions());
