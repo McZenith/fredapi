@@ -215,7 +215,7 @@ public static class SportMatchRoutes
                 ? parsedEndTime.ToUniversalTime()
                 : DateTime.UtcNow.AddHours(24);
 
-            // Get matches from DB with time filter
+            // Build filter with SRL exclusion at database level
             var filter = Builders<MongoEnrichedMatch>.Filter.And(
                 Builders<MongoEnrichedMatch>.Filter.Gte(m => m.MatchTime, startTime),
                 Builders<MongoEnrichedMatch>.Filter.Lte(m => m.MatchTime, endTime),
@@ -230,26 +230,32 @@ public static class SportMatchRoutes
             // Get matches with pagination
             var collection = mongoDbService.GetCollection<MongoEnrichedMatch>("EnrichedSportMatches");
 
-            var sw = System.Diagnostics.Stopwatch.StartNew();
+            // Log time for count operation
+            var countStartTime = DateTime.UtcNow;
             var totalMatchCount = await collection.CountDocumentsAsync(filter);
-            sw.Stop();
-            Console.WriteLine($"[{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff}] Database count query took: {sw.ElapsedMilliseconds}ms");
+            var countDuration = DateTime.UtcNow - countStartTime;
+            Console.WriteLine($"Database count operation took: {countDuration.TotalMilliseconds}ms");
 
-            sw.Restart();
+            // Log time for find operation
+            var findStartTime = DateTime.UtcNow;
             var mongoMatches = await collection
                 .Find(filter)
                 .SortBy(m => m.MatchTime)
                 .Skip((pagination.Page - 1) * pagination.PageSize)
                 .Limit(pagination.PageSize)
                 .ToListAsync();
-            sw.Stop();
-            Console.WriteLine($"[{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff}] Database fetch query took: {sw.ElapsedMilliseconds}ms");
+            var findDuration = DateTime.UtcNow - findStartTime;
+            Console.WriteLine($"Database find operation took: {findDuration.TotalMilliseconds}ms");
+            Console.WriteLine($"Retrieved {mongoMatches.Count} matches");
 
             // Transform matches to enriched format
+            var transformStartTime = DateTime.UtcNow;
             var enrichedMatches = mongoMatches
                 .Select(m => m.ToEnrichedSportMatch())
                 .Where(m => m != null)
                 .ToList();
+            var transformDuration = DateTime.UtcNow - transformStartTime;
+            Console.WriteLine($"Match transformation took: {transformDuration.TotalMilliseconds}ms");
 
             if (!enrichedMatches.Any())
             {
@@ -265,12 +271,16 @@ public static class SportMatchRoutes
                 .ToList();
 
             // Process batches concurrently
+            var batchStartTime = DateTime.UtcNow;
             var tasks = batches.Select(async batch =>
             {
                 return transformer.TransformToPredictionData(batch);
             });
 
             var batchResults = await Task.WhenAll(tasks);
+            var batchDuration = DateTime.UtcNow - batchStartTime;
+            Console.WriteLine($"Batch processing took: {batchDuration.TotalMilliseconds}ms");
+            Console.WriteLine($"Processed {batches.Count} batches of {batchSize} matches each");
 
             // Use the first batch result as the base
             var predictionData = batchResults.First();
