@@ -47,16 +47,6 @@ public static class SportMatchRoutes
             .WithName("GetEnrichedMatchByIdNew")
             .WithDescription("Get an enriched sport match by its ID")
             .WithOpenApi();
-
-        // Prediction data endpoint
-        group.MapGet("/prediction-data", async (
-            MongoDbService mongoDbService,
-            [AsParameters] PaginationParameters pagination,
-            IServiceProvider serviceProvider,
-            HttpContext context) => await GetPredictionData(mongoDbService, pagination, serviceProvider, context))
-            .WithName("GetPredictionData")
-            .WithOpenApi();
-
         return group;
     }
 
