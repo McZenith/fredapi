@@ -1,6 +1,7 @@
 using fredapi.Database;
 using fredapi.Routes;
 using fredapi.SignalR;
+using fredapi.SportRadarService.Background;
 using fredapi.Utils;
 using Microsoft.AspNetCore.Http.Connections;
 using Microsoft.AspNetCore.ResponseCompression;
@@ -125,8 +126,6 @@ app.MapHub<LiveMatchHub>("/livematchhub", options =>
     options.TransportMaxBufferSize = 100 * 1024;
 });
 
-// Configure SignalR endpoint
-app.MapHub<SportMatchHub>("/sportMatchHub");
 
 // Health check endpoint
 app.MapGet("/health/database", async (MongoDbService mongoService) =>
