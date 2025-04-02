@@ -5,6 +5,7 @@ using fredapi.SportRadarService.Transformers;
 using Microsoft.AspNetCore.SignalR;
 using MongoDB.Bson;
 using MongoDB.Driver;
+using Microsoft.Extensions.Caching.Memory;
 
 namespace fredapi.SportRadarService.Background;
 
@@ -12,14 +13,17 @@ public class PredictionDataBackgroundService : BackgroundService
 {
     private readonly ILogger<PredictionDataBackgroundService> _logger;
     private readonly IServiceProvider _serviceProvider;
+    private readonly IMemoryCache _cache;
     private readonly TimeSpan _updateInterval = TimeSpan.FromHours(1);
 
     public PredictionDataBackgroundService(
         ILogger<PredictionDataBackgroundService> logger,
-        IServiceProvider serviceProvider)
+        IServiceProvider serviceProvider,
+        IMemoryCache cache)
     {
         _logger = logger;
         _serviceProvider = serviceProvider;
+        _cache = cache;
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -131,6 +135,10 @@ public class PredictionDataBackgroundService : BackgroundService
                         HasPrevious = false
                     }
                 };
+
+                // Cache the prediction data before broadcasting
+                _cache.Set("prediction_data", predictionData, TimeSpan.FromHours(1));
+                _logger.LogInformation("Cached prediction data with expiration of 1 hour");
 
                 // Broadcast to all connected clients
                 await hubContext.Clients.All.SendAsync("ReceivePredictionData", predictionData, stoppingToken);
