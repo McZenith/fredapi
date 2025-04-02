@@ -109,15 +109,33 @@ public class PredictionDataBackgroundService : BackgroundService
                 }
 
                 // Combine all batch results
-                var predictionData = batchResults.First();
-                predictionData.Pagination = new fredapi.SportRadarService.Transformers.PaginationInfo
+                var predictionData = new fredapi.SportRadarService.Transformers.PredictionDataResponse
                 {
-                    CurrentPage = 1,
-                    TotalPages = 1,
-                    PageSize = enrichedMatches.Count,
-                    TotalItems = enrichedMatches.Count,
-                    HasNext = false,
-                    HasPrevious = false
+                    Data = new fredapi.SportRadarService.Transformers.PredictionData
+                    {
+                        UpcomingMatches = batchResults.SelectMany(r => r.Data.UpcomingMatches).ToList(),
+                        Metadata = new fredapi.SportRadarService.Transformers.PredictionMetadata
+                        {
+                            Total = enrichedMatches.Count,
+                            Date = DateTime.Now.ToString("yyyy-MM-dd"),
+                            LeagueData = batchResults
+                                .SelectMany(r => r.Data.Metadata.LeagueData)
+                                .GroupBy(x => x.Key)
+                                .ToDictionary(
+                                    g => g.Key,
+                                    g => g.First().Value
+                                )
+                        }
+                    },
+                    Pagination = new fredapi.SportRadarService.Transformers.PaginationInfo
+                    {
+                        CurrentPage = 1,
+                        TotalPages = 1,
+                        PageSize = enrichedMatches.Count,
+                        TotalItems = enrichedMatches.Count,
+                        HasNext = false,
+                        HasPrevious = false
+                    }
                 };
 
                 // Cache the result
