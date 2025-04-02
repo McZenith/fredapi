@@ -1,5 +1,4 @@
 using System.Text.Json.Serialization;
-using System.Collections.Generic;
 using fredapi.SportRadarService.Background;
 
 namespace fredapi.Model

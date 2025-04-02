@@ -1,13 +1,8 @@
-using System.Text.Json;
 using fredapi.Database;
 using fredapi.Hubs;
 using fredapi.Routes;
 using fredapi.SportRadarService.Transformers;
 using Microsoft.AspNetCore.SignalR;
-using Microsoft.Extensions.Caching.Memory;
-using Microsoft.Extensions.DependencyInjection;
-using Microsoft.Extensions.Hosting;
-using Microsoft.Extensions.Logging;
 using MongoDB.Bson;
 using MongoDB.Driver;
 
@@ -17,18 +12,14 @@ public class PredictionDataBackgroundService : BackgroundService
 {
     private readonly ILogger<PredictionDataBackgroundService> _logger;
     private readonly IServiceProvider _serviceProvider;
-    private readonly IMemoryCache _cache;
-    private readonly TimeSpan _updateInterval = TimeSpan.FromHours(3);
-    private readonly TimeSpan _cacheDuration = TimeSpan.FromHours(3);
+    private readonly TimeSpan _updateInterval = TimeSpan.FromHours(1);
 
     public PredictionDataBackgroundService(
         ILogger<PredictionDataBackgroundService> logger,
-        IServiceProvider serviceProvider,
-        IMemoryCache cache)
+        IServiceProvider serviceProvider)
     {
         _logger = logger;
         _serviceProvider = serviceProvider;
-        _cache = cache;
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -108,6 +99,8 @@ public class PredictionDataBackgroundService : BackgroundService
                     return;
                 }
 
+                var currentTime = DateTime.UtcNow;
+
                 // Combine all batch results
                 var predictionData = new fredapi.SportRadarService.Transformers.PredictionDataResponse
                 {
@@ -117,7 +110,8 @@ public class PredictionDataBackgroundService : BackgroundService
                         Metadata = new fredapi.SportRadarService.Transformers.PredictionMetadata
                         {
                             Total = enrichedMatches.Count,
-                            Date = DateTime.Now.ToString("yyyy-MM-dd"),
+                            Date = currentTime.ToString("yyyy-MM-dd"),
+                            LastUpdated = currentTime.ToString("yyyy-MM-ddTHH:mm:ssZ"),
                             LeagueData = batchResults
                                 .SelectMany(r => r.Data.Metadata.LeagueData)
                                 .GroupBy(x => x.Key)
@@ -137,9 +131,6 @@ public class PredictionDataBackgroundService : BackgroundService
                         HasPrevious = false
                     }
                 };
-
-                // Cache the result
-                _cache.Set("prediction_data", predictionData, _cacheDuration);
 
                 // Broadcast to all connected clients
                 await hubContext.Clients.All.SendAsync("ReceivePredictionData", predictionData, stoppingToken);

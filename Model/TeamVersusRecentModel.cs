@@ -1,7 +1,5 @@
 using System.Text.Json.Serialization;
-using System.Collections.Generic;
 using fredapi.SportRadarService.Background;
-using MongoDB.Bson.Serialization.Attributes;
 
 namespace fredapi.Model
 {

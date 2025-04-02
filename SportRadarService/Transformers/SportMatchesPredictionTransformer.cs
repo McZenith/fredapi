@@ -48,6 +48,7 @@ namespace fredapi.SportRadarService.Transformers
                         {
                             Total = sportMatches.Count,
                             Date = DateTime.Now.ToString("yyyy-MM-dd"),
+                            LastUpdated = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"),
                             LeagueData = new Dictionary<string, LeagueMetadata>()
                         }
                     },
@@ -411,6 +412,7 @@ namespace fredapi.SportRadarService.Transformers
                     {
                         Total = 0,
                         Date = DateTime.Now.ToString("yyyy-MM-dd"),
+                        LastUpdated = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"),
                         LeagueData = new Dictionary<string, LeagueMetadata>()
                     }
                 },
@@ -3887,6 +3889,8 @@ namespace fredapi.SportRadarService.Transformers
         [JsonPropertyName("total")] public int Total { get; set; }
 
         [JsonPropertyName("date")] public string Date { get; set; }
+
+        [JsonPropertyName("lastUpdated")] public string LastUpdated { get; set; }
 
         [JsonPropertyName("leagueData")] public Dictionary<string, LeagueMetadata> LeagueData { get; set; }
     }

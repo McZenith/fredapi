@@ -2,9 +2,7 @@ using System.Text.Json;
 using System.Text.Json.Serialization;
 using fredapi.SignalR;
 using fredapi.Utils;
-using fredapi.Model;
 using fredapi.Model.MatchSituationStats;
-using fredapi.Model.Live;
 using Microsoft.AspNetCore.Http.HttpResults;
 using Microsoft.AspNetCore.SignalR;
 

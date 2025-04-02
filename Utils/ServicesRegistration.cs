@@ -1,8 +1,6 @@
 using fredapi.Database;
-using fredapi.SignalR;
 using fredapi.SportRadarService.Background;
 using fredapi.SportRadarService.Background.ArbitrageLiveMatchBackgroundService;
-using fredapi.SportRadarService.Background.UpcomingArbitrageBackgroundService;
 using fredapi.SportRadarService.TokenService;
 using fredapi.SportRadarService.Transformers;
 

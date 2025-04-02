@@ -1,28 +1,13 @@
-using System;
-using System.Collections.Generic;
 using System.Text.Json;
 using System.Text.Json.Serialization;
-using System.IO;
-using System.Linq;
-using System.Threading;
-using System.Threading.Tasks;
-using fredapi.Utils;
 using fredapi.Database;
 using MongoDB.Driver;
 using MongoDB.Bson;
 using MongoDB.Bson.Serialization.Attributes;
-using Microsoft.Extensions.DependencyInjection;
-using Microsoft.Extensions.Hosting;
-using Microsoft.Extensions.Logging;
-using System.Net.Http;
-using System.Net.Http.Json;
 using fredapi.SportRadarService.Background.ArbitrageLiveMatchBackgroundService;
 using fredapi.SportRadarService.Background.UpcomingArbitrageBackgroundService;
-using fredapi.SportRadarService.TokenService;
 using ApiResponse = fredapi.SportRadarService.Background.UpcomingArbitrageBackgroundService.ApiResponse;
-using Market = fredapi.SportRadarService.Background.UpcomingArbitrageBackgroundService.Market;
 using Microsoft.AspNetCore.Http.HttpResults;
-using System.Globalization;
 using System.Runtime.Serialization;
 
 namespace fredapi.SportRadarService.Background;
