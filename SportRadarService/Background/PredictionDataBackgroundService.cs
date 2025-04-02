@@ -32,8 +32,6 @@ public class PredictionDataBackgroundService : BackgroundService
         {
             try
             {
-                _logger.LogInformation("Starting prediction data update at: {time}", DateTimeOffset.Now);
-
                 using var scope = _serviceProvider.CreateScope();
                 var mongoDbService = scope.ServiceProvider.GetRequiredService<MongoDbService>();
                 var transformer = scope.ServiceProvider.GetRequiredService<SportMatchesPredictionTransformer>();
@@ -62,7 +60,6 @@ public class PredictionDataBackgroundService : BackgroundService
 
                 if (!matches.Any())
                 {
-                    _logger.LogInformation("No matches found in the specified time range");
                     return;
                 }
 
@@ -138,12 +135,9 @@ public class PredictionDataBackgroundService : BackgroundService
 
                 // Cache the prediction data before broadcasting
                 _cache.Set("prediction_data", predictionData, TimeSpan.FromHours(1));
-                _logger.LogInformation("Cached prediction data with expiration of 1 hour");
 
                 // Broadcast to all connected clients
                 await hubContext.Clients.All.SendAsync("ReceivePredictionData", predictionData, stoppingToken);
-
-                _logger.LogInformation("Prediction data update completed at: {time}", DateTimeOffset.Now);
             }
             catch (Exception ex)
             {

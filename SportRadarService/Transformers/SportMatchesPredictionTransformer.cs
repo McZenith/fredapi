@@ -30,11 +30,9 @@ namespace fredapi.SportRadarService.Transformers
             var stopwatch = Stopwatch.StartNew();
             try
             {
-                _logger.LogInformation($"Starting transformation of {sportMatches?.Count ?? 0} sport matches");
 
                 if (sportMatches == null || !sportMatches.Any())
                 {
-                    _logger.LogWarning("No sport matches provided for transformation");
                     return CreateEmptyPredictionResponse();
                 }
 
@@ -74,7 +72,6 @@ namespace fredapi.SportRadarService.Transformers
                     {
                         if (!IsValidMatch(sportMatch))
                         {
-                            _logger.LogWarning($"Skipping invalid match with ID: {sportMatch?.MatchId ?? "unknown"}");
                             skipCount++;
                             continue;
                         }
@@ -89,12 +86,9 @@ namespace fredapi.SportRadarService.Transformers
                             UpdateLeagueMetadata(result.Data.Metadata, upcomingMatch);
                             successCount++;
 
-                            _logger.LogInformation(
-                                $"Successfully transformed match {sportMatch.MatchId} ({upcomingMatch.HomeTeam.Name} vs {upcomingMatch.AwayTeam.Name})");
                         }
                         else
                         {
-                            _logger.LogWarning($"Failed to create upcoming match data for match {sportMatch?.MatchId}");
                             skipCount++;
                         }
                     }
@@ -107,8 +101,6 @@ namespace fredapi.SportRadarService.Transformers
                 }
 
                 stopwatch.Stop();
-                _logger.LogInformation($"Transformation completed in {stopwatch.ElapsedMilliseconds}ms. " +
-                                       $"Success: {successCount}, Skipped: {skipCount}, Errors: {errorCount}");
 
                 // Ensure pagination reflects the actual content
                 result.Pagination.TotalItems = successCount;
@@ -357,38 +349,32 @@ namespace fredapi.SportRadarService.Transformers
         {
             if (sportMatch == null)
             {
-                _logger.LogWarning("Match is null");
                 return false;
             }
 
             if (sportMatch.OriginalMatch == null)
             {
-                _logger.LogWarning($"Match {sportMatch.MatchId} has null OriginalMatch");
                 return false;
             }
 
             if (string.IsNullOrEmpty(sportMatch.MatchId))
             {
-                _logger.LogWarning("Match has null or empty MatchId");
                 return false;
             }
 
             if (sportMatch.OriginalMatch.Teams == null)
             {
-                _logger.LogWarning($"Match {sportMatch.MatchId} has null Teams");
                 return false;
             }
 
             if (sportMatch.OriginalMatch.Teams.Home == null || sportMatch.OriginalMatch.Teams.Away == null)
             {
-                _logger.LogWarning($"Match {sportMatch.MatchId} has null Home or Away team");
                 return false;
             }
 
             if (string.IsNullOrEmpty(sportMatch.OriginalMatch.Teams.Home.Name) ||
                 string.IsNullOrEmpty(sportMatch.OriginalMatch.Teams.Away.Name))
             {
-                _logger.LogWarning($"Match {sportMatch.MatchId} has null or empty team names");
                 return false;
             }
 
@@ -438,7 +424,6 @@ namespace fredapi.SportRadarService.Transformers
                 // Parse match ID
                 if (!int.TryParse(sportMatch.MatchId, out int matchId))
                 {
-                    _logger.LogWarning($"Unable to parse match ID '{sportMatch.MatchId}' as integer");
                     // Use a hash code as fallback ID
                     matchId = sportMatch.MatchId.GetHashCode();
                 }
@@ -448,7 +433,6 @@ namespace fredapi.SportRadarService.Transformers
                 if (matchTime == DateTime.MinValue)
                 {
                     matchTime = DateTime.Now.AddDays(1);
-                    _logger.LogWarning($"Match {sportMatch.MatchId} has invalid date, using default: {matchTime}");
                 }
 
                 // Ensure we're using local time for display
@@ -1064,7 +1048,6 @@ namespace fredapi.SportRadarService.Transformers
                 sportMatch.TeamTableSlice.TableRows == null ||
                 !sportMatch.TeamTableSlice.TableRows.Any())
             {
-                _logger.LogWarning($"Missing table data for match {sportMatch.MatchId}");
                 return 0;
             }
 
@@ -1075,7 +1058,6 @@ namespace fredapi.SportRadarService.Transformers
 
             if (teamRow != null)
             {
-                _logger.LogInformation($"Found exact match for team {teamName} at position {teamRow.Pos}");
                 return teamRow.Pos;
             }
 
@@ -1089,8 +1071,6 @@ namespace fredapi.SportRadarService.Transformers
 
             if (teamRow != null)
             {
-                _logger.LogInformation(
-                    $"Found partial match for team {teamName} with {teamRow.Team?.Name} at position {teamRow.Pos}");
                 return teamRow.Pos;
             }
 
@@ -1100,8 +1080,6 @@ namespace fredapi.SportRadarService.Transformers
 
             if (teamRow != null)
             {
-                _logger.LogInformation(
-                    $"Found abbreviation match for team {teamName} with {teamRow.Team?.Abbr} at position {teamRow.Pos}");
                 return teamRow.Pos;
             }
 
@@ -1114,9 +1092,7 @@ namespace fredapi.SportRadarService.Transformers
 
                 if (teamRow != null)
                 {
-                    _logger.LogInformation(
-                        $"Found ID match for team {teamName} with ID {teamId} at position {teamRow.Pos}");
-                    return teamRow.Pos;
+                  
                 }
             }
 
@@ -1127,12 +1103,10 @@ namespace fredapi.SportRadarService.Transformers
 
             if (teamRow != null)
             {
-                _logger.LogInformation(
-                    $"Found normalized match for team {teamName} with {teamRow.Team?.Name} at position {teamRow.Pos}");
+                
                 return teamRow.Pos;
             }
 
-            _logger.LogWarning($"Could not find position for team {teamName} in table data");
 
             // Default to middle position as fallback
             return sportMatch.TeamTableSlice.TableRows.Count > 0
@@ -1296,7 +1270,6 @@ namespace fredapi.SportRadarService.Transformers
 
             if (!recentMatches.Any())
             {
-                _logger.LogWarning($"No valid recent matches found for {teamName}");
                 return "";
             }
 
@@ -1855,7 +1828,6 @@ namespace fredapi.SportRadarService.Transformers
 
             if (sportMatch?.TeamVersusRecent == null || sportMatch.TeamVersusRecent.Matches == null)
             {
-                _logger.LogWarning($"No TeamVersusRecent data for match {sportMatch?.MatchId}");
                 return emptyHeadToHead;
             }
 
@@ -1871,7 +1843,6 @@ namespace fredapi.SportRadarService.Transformers
 
                 if (string.IsNullOrEmpty(homeTeamName) || string.IsNullOrEmpty(awayTeamName))
                 {
-                    _logger.LogWarning($"Missing team names for match {sportMatch.MatchId}");
                     return emptyHeadToHead;
                 }
 
@@ -1884,7 +1855,6 @@ namespace fredapi.SportRadarService.Transformers
 
                 if (!headToHeadMatches.Any())
                 {
-                    _logger.LogWarning($"No valid H2H matches found for {homeTeamName} vs {awayTeamName}");
 
                     // Try with more lenient matching
                     headToHeadMatches = sportMatch.TeamVersusRecent.Matches
@@ -1895,7 +1865,6 @@ namespace fredapi.SportRadarService.Transformers
 
                     if (!headToHeadMatches.Any())
                     {
-                        _logger.LogWarning($"No H2H matches found even with lenient matching");
                         return emptyHeadToHead;
                     }
                 }
@@ -2532,7 +2501,6 @@ namespace fredapi.SportRadarService.Transformers
                     case 'D': score += weight * 0.5; break;
                     case 'L': break; // No points for loss
                     default:
-                        _logger.LogWarning($"Invalid form character: {c}");
                         continue; // Skip invalid characters
                 }
 
@@ -2822,7 +2790,6 @@ namespace fredapi.SportRadarService.Transformers
                     case 'D': adjustment = 0.0; break;
                     case 'L': adjustment = -10.0; break;
                     default:
-                        _logger.LogWarning($"Invalid form character: {result}");
                         continue; // Skip invalid characters
                 }
 

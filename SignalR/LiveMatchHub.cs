@@ -18,13 +18,10 @@ public class LiveMatchHub : Hub
 
     public override async Task OnConnectedAsync()
     {
-        _logger.LogInformation($"Client connected: {Context.ConnectionId}");
-
         // Send the last cached arbitrage matches to the newly connected client
         var cachedArbitrageMatches = ArbitrageLiveMatchBackgroundService.GetLastSentArbitrageMatches();
         if (cachedArbitrageMatches.Any())
         {
-            _logger.LogInformation($"Sending cached {cachedArbitrageMatches.Count} arbitrage matches to client: {Context.ConnectionId}");
             await Clients.Caller.SendAsync("ReceiveArbitrageLiveMatches", cachedArbitrageMatches);
         }
 
@@ -32,14 +29,12 @@ public class LiveMatchHub : Hub
         var cachedAllMatches = ArbitrageLiveMatchBackgroundService.GetLastSentAllMatches();
         if (cachedAllMatches.Any())
         {
-            _logger.LogInformation($"Sending cached {cachedAllMatches.Count} all matches to client: {Context.ConnectionId}");
             await Clients.Caller.SendAsync("ReceiveAllLiveMatches", cachedAllMatches);
         }
 
         // Send cached prediction data if available
         if (_cache.TryGetValue("prediction_data", out var predictionData))
         {
-            _logger.LogInformation($"Sending cached prediction data to client: {Context.ConnectionId}");
             await Clients.Caller.SendAsync("ReceivePredictionData", predictionData);
         }
 
@@ -48,7 +43,6 @@ public class LiveMatchHub : Hub
 
     public override async Task OnDisconnectedAsync(Exception? exception)
     {
-        _logger.LogInformation($"Client disconnected: {Context.ConnectionId}");
         await base.OnDisconnectedAsync(exception);
     }
 
