@@ -189,26 +189,14 @@ public static class SportMatchRoutes
     {
         try
         {
-            // Add response headers for compression and caching
-            context.Response.Headers.Add("Cache-Control", "public, max-age=300"); // 5 minute cache
-            context.Response.Headers.Add("Vary", "Accept-Encoding");
-
             // Get SportMatchesPredictionTransformer from DI
             var transformer = serviceProvider.GetRequiredService<SportMatchesPredictionTransformer>();
 
             // Set maximum page size to 100
             pagination.PageSize = pagination.PageSize > 100 ? 100 : pagination.PageSize;
 
-            // Create cache key based on parameters
-            var cacheKey = $"prediction_data_page_{pagination.Page}_size_{pagination.PageSize}";
-
-            // Try to get from cache first
-            if (_cache.TryGetValue(cacheKey, out SportRadarService.Transformers.PredictionData cachedData))
-            {
-                return Results.Json(cachedData, GetCleanSerializerOptions());
-            }
-
             // Default time range: 90 mins ago to 24 hours ahead
+            // But allow configuring via query parameters if present
             var startTime = context.Request.Query.TryGetValue("startTime", out var startTimeStr) &&
                             DateTime.TryParse(startTimeStr, out var parsedStartTime)
                 ? parsedStartTime.ToUniversalTime()
@@ -219,92 +207,39 @@ public static class SportMatchRoutes
                 ? parsedEndTime.ToUniversalTime()
                 : DateTime.UtcNow.AddHours(24);
 
-            // Add index hint for better query performance
-            var collection = mongoDbService.GetCollection<MongoEnrichedMatch>("EnrichedSportMatches");
-            var findOptions = new FindOptions
-            {
-                Hint = "{ MatchTime: 1 }"  // Use the existing index on MatchTime
-            };
-
-            // Build filter with SRL exclusion at database level
+            // Get matches from DB with time filter
             var filter = Builders<MongoEnrichedMatch>.Filter.And(
                 Builders<MongoEnrichedMatch>.Filter.Gte(m => m.MatchTime, startTime),
-                Builders<MongoEnrichedMatch>.Filter.Lte(m => m.MatchTime, endTime),
-                Builders<MongoEnrichedMatch>.Filter.Not(
-                    Builders<MongoEnrichedMatch>.Filter.Or(
-                        Builders<MongoEnrichedMatch>.Filter.Regex(m => m.OriginalMatch.Teams.Home.Name, new BsonRegularExpression("SRL", "i")),
-                        Builders<MongoEnrichedMatch>.Filter.Regex(m => m.OriginalMatch.Teams.Away.Name, new BsonRegularExpression("SRL", "i"))
-                    )
-                )
+                Builders<MongoEnrichedMatch>.Filter.Lte(m => m.MatchTime, endTime)
             );
 
-            // Get matches with pagination - use async count for better performance
-            var countTask = collection.CountDocumentsAsync(filter);
-            var findTask = collection
-                .Find(filter, findOptions)
+            // Get matches with pagination
+            var collection = mongoDbService.GetCollection<MongoEnrichedMatch>("EnrichedSportMatches");
+            var totalMatchCount = await collection.CountDocumentsAsync(filter);
+
+            var mongoMatches = await collection
+                .Find(filter)
                 .SortBy(m => m.MatchTime)
                 .Skip((pagination.Page - 1) * pagination.PageSize)
                 .Limit(pagination.PageSize)
                 .ToListAsync();
 
-            // Execute both operations concurrently
-            await Task.WhenAll(countTask, findTask);
-            var totalMatchCount = await countTask;
-            var mongoMatches = await findTask;
+            // Transform matches to enriched format and filter out SRL teams
+            var enrichedMatches = mongoMatches
+                .Select(m => m.ToEnrichedSportMatch()) // This already calls ToLocalTime()
+                .Where(m => m != null)
+                .Where(m =>
+                    !(m.OriginalMatch?.Teams?.Home?.Name?.Contains("SRL", StringComparison.OrdinalIgnoreCase) == true ||
+                      m.OriginalMatch?.Teams?.Away?.Name?.Contains("SRL", StringComparison.OrdinalIgnoreCase) == true))
+                .ToList();
 
-            // Transform matches to enriched format using parallel processing
-            var enrichedMatches = await Task.WhenAll(mongoMatches.Select(async m =>
-            {
-                try
-                {
-                    return m.ToEnrichedSportMatch();
-                }
-                catch (Exception ex)
-                {
-                    Console.WriteLine($"Error transforming match {m.MatchId}: {ex.Message}");
-                    return null;
-                }
-            }));
-
-            var validMatches = enrichedMatches.Where(m => m != null).ToList();
-
-            if (!validMatches.Any())
+            if (!enrichedMatches.Any())
             {
                 return Results.NotFound("No matches found in the specified time range");
             }
 
-            // Process matches in parallel with optimized batch size
-            const int batchSize = 20; // Increased batch size for better throughput
-            var batches = validMatches
-                .Select((match, index) => new { match, index })
-                .GroupBy(x => x.index / batchSize)
-                .Select(g => g.Select(x => x.match).ToList())
-                .ToList();
-
-            // Process batches concurrently with timeout
-            var batchTasks = batches.Select(async batch =>
-            {
-                using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10)); // 10 second timeout per batch
-                try
-                {
-                    return await Task.Run(() => transformer.TransformToPredictionData(batch), cts.Token);
-                }
-                catch (OperationCanceledException)
-                {
-                    Console.WriteLine($"Batch processing timed out for {batch.Count} matches");
-                    return null;
-                }
-            });
-
-            var batchResults = (await Task.WhenAll(batchTasks)).Where(r => r != null).ToList();
-
-            if (!batchResults.Any())
-            {
-                return Results.StatusCode(500);
-            }
-
-            // Use the first batch result as the base
-            var predictionData = batchResults.First();
+            // Use the transformer to convert the data
+            var predictionData = transformer.TransformToPredictionData(enrichedMatches);
 
             // Create pagination info
             var paginationInfo = new PaginationInfo
@@ -328,12 +263,7 @@ public static class SportMatchRoutes
                 HasPrevious = paginationInfo.HasPrevious
             };
 
-            // Cache the result with sliding expiration
-            var cacheOptions = new MemoryCacheEntryOptions()
-                .SetAbsoluteExpiration(TimeSpan.FromMinutes(5))
-                .SetSlidingExpiration(TimeSpan.FromMinutes(2));
-            _cache.Set(cacheKey, predictionData, cacheOptions);
-
+            // Return result without caching
             return Results.Json(predictionData, GetCleanSerializerOptions());
         }
         catch (Exception ex)
