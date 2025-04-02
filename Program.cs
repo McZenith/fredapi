@@ -46,6 +46,9 @@ builder.Services.AddCors(options =>
     });
 });
 
+// Add Memory Cache
+builder.Services.AddMemoryCache();
+
 // SignalR configuration with MessagePack
 builder.Services.AddSignalR(options =>
 {
