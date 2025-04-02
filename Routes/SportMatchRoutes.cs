@@ -215,7 +215,7 @@ public static class SportMatchRoutes
                 ? parsedEndTime.ToUniversalTime()
                 : DateTime.UtcNow.AddHours(24);
 
-            // Build filter with SRL exclusion at database level
+            // Get matches from DB with time filter
             var filter = Builders<MongoEnrichedMatch>.Filter.And(
                 Builders<MongoEnrichedMatch>.Filter.Gte(m => m.MatchTime, startTime),
                 Builders<MongoEnrichedMatch>.Filter.Lte(m => m.MatchTime, endTime),
@@ -229,14 +229,21 @@ public static class SportMatchRoutes
 
             // Get matches with pagination
             var collection = mongoDbService.GetCollection<MongoEnrichedMatch>("EnrichedSportMatches");
-            var totalMatchCount = await collection.CountDocumentsAsync(filter);
 
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            var totalMatchCount = await collection.CountDocumentsAsync(filter);
+            sw.Stop();
+            Console.WriteLine($"[{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff}] Database count query took: {sw.ElapsedMilliseconds}ms");
+
+            sw.Restart();
             var mongoMatches = await collection
                 .Find(filter)
                 .SortBy(m => m.MatchTime)
                 .Skip((pagination.Page - 1) * pagination.PageSize)
                 .Limit(pagination.PageSize)
                 .ToListAsync();
+            sw.Stop();
+            Console.WriteLine($"[{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff}] Database fetch query took: {sw.ElapsedMilliseconds}ms");
 
             // Transform matches to enriched format
             var enrichedMatches = mongoMatches
