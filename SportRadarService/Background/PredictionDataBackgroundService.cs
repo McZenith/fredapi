@@ -40,7 +40,7 @@ public class PredictionDataBackgroundService : BackgroundService
                 var hubContext = scope.ServiceProvider.GetRequiredService<IHubContext<LiveMatchHub>>();
 
                 // Get all matches for the next 24 hours
-                var startTime = DateTime.UtcNow.AddMinutes(-90);
+                var startTime = DateTime.UtcNow.AddMinutes(-300);
                 var endTime = DateTime.UtcNow.AddHours(24);
 
                 var collection = mongoDbService.GetCollection<MongoEnrichedMatch>("EnrichedSportMatches");
