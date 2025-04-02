@@ -6,7 +6,7 @@ using fredapi.SportRadarService.Transformers;
 using MongoDB.Driver;
 using MarketData = fredapi.SportRadarService.Background.ArbitrageLiveMatchBackgroundService.MarketData;
 using Microsoft.Extensions.Caching.Memory;
-using Microsoft.Extensions.Logging;
+
 
 using TeamTableSliceModel = fredapi.SportRadarService.Background.TeamTableSliceModel;
 using MongoDB.Bson;
@@ -187,179 +187,91 @@ public static class SportMatchRoutes
         IServiceProvider serviceProvider,
         HttpContext context)
     {
-        const int maxRetries = 3;
-        var retryCount = 0;
-        var retryDelayMs = 1000; // Start with 1 second delay
-        var logger = serviceProvider.GetRequiredService<ILogger<Program>>();
-
-        // Create cache key based on query parameters
-        var cacheKey = $"prediction_data_page_{pagination.Page}_size_{pagination.PageSize}_start_{context.Request.Query["startTime"]}_end_{context.Request.Query["endTime"]}";
-
-        // Try to get from cache first
-        if (_cache.TryGetValue(cacheKey, out object cachedResponse))
+        try
         {
-            return Results.Json(cachedResponse, GetCleanSerializerOptions());
-        }
+            // Get SportMatchesPredictionTransformer from DI
+            var transformer = serviceProvider.GetRequiredService<SportMatchesPredictionTransformer>();
 
-        while (retryCount < maxRetries)
+            // Set maximum page size to 100
+            pagination.PageSize = pagination.PageSize > 100 ? 100 : pagination.PageSize;
+
+            // Default time range: 90 mins ago to 24 hours ahead
+            // But allow configuring via query parameters if present
+            var startTime = context.Request.Query.TryGetValue("startTime", out var startTimeStr) &&
+                            DateTime.TryParse(startTimeStr, out var parsedStartTime)
+                ? parsedStartTime.ToUniversalTime()
+                : DateTime.UtcNow.AddMinutes(-90);
+
+            var endTime = context.Request.Query.TryGetValue("endTime", out var endTimeStr) &&
+                          DateTime.TryParse(endTimeStr, out var parsedEndTime)
+                ? parsedEndTime.ToUniversalTime()
+                : DateTime.UtcNow.AddHours(24);
+
+            // Get matches from DB with time filter
+            var filter = Builders<MongoEnrichedMatch>.Filter.And(
+                Builders<MongoEnrichedMatch>.Filter.Gte(m => m.MatchTime, startTime),
+                Builders<MongoEnrichedMatch>.Filter.Lte(m => m.MatchTime, endTime)
+            );
+
+            // Get matches with pagination
+            var collection = mongoDbService.GetCollection<MongoEnrichedMatch>("EnrichedSportMatches");
+            var totalMatchCount = await collection.CountDocumentsAsync(filter);
+
+            var mongoMatches = await collection
+                .Find(filter)
+                .SortBy(m => m.MatchTime)
+                .Skip((pagination.Page - 1) * pagination.PageSize)
+                .Limit(pagination.PageSize)
+                .ToListAsync();
+
+            // Transform matches to enriched format and filter out SRL teams
+            var enrichedMatches = mongoMatches
+                .Select(m => m.ToEnrichedSportMatch()) // This already calls ToLocalTime()
+                .Where(m => m != null)
+                .Where(m =>
+                    !(m.OriginalMatch?.Teams?.Home?.Name?.Contains("SRL", StringComparison.OrdinalIgnoreCase) == true ||
+                      m.OriginalMatch?.Teams?.Away?.Name?.Contains("SRL", StringComparison.OrdinalIgnoreCase) == true))
+                .ToList();
+
+            if (!enrichedMatches.Any())
+            {
+                return Results.NotFound("No matches found in the specified time range");
+            }
+
+            // Use the transformer to convert the data
+            var predictionData = transformer.TransformToPredictionData(enrichedMatches);
+
+            // Create pagination info
+            var paginationInfo = new PaginationInfo
+            {
+                CurrentPage = pagination.Page,
+                PageSize = pagination.PageSize,
+                TotalItems = totalMatchCount,
+                TotalPages = (int)Math.Ceiling((double)totalMatchCount / pagination.PageSize),
+                HasNext = pagination.Page < (int)Math.Ceiling((double)totalMatchCount / pagination.PageSize),
+                HasPrevious = pagination.Page > 1
+            };
+
+            // Set the pagination info
+            predictionData.Pagination = new SportRadarService.Transformers.PaginationInfo
+            {
+                CurrentPage = paginationInfo.CurrentPage,
+                TotalPages = paginationInfo.TotalPages,
+                PageSize = paginationInfo.PageSize,
+                TotalItems = (int)paginationInfo.TotalItems,
+                HasNext = paginationInfo.HasNext,
+                HasPrevious = paginationInfo.HasPrevious
+            };
+
+            // Return result without caching
+            return Results.Json(predictionData, GetCleanSerializerOptions());
+        }
+        catch (Exception ex)
         {
-            try
-            {
-                // Get SportMatchesPredictionTransformer from DI
-                var transformer = serviceProvider.GetRequiredService<SportMatchesPredictionTransformer>();
-
-                // Set maximum page size to 100
-                pagination.PageSize = pagination.PageSize > 100 ? 100 : pagination.PageSize;
-
-                // Default time range: 90 mins ago to 24 hours ahead
-                var startTime = context.Request.Query.TryGetValue("startTime", out var startTimeStr) &&
-                                DateTime.TryParse(startTimeStr, out var parsedStartTime)
-                    ? parsedStartTime.ToUniversalTime()
-                    : DateTime.UtcNow.AddMinutes(-90);
-
-                var endTime = context.Request.Query.TryGetValue("endTime", out var endTimeStr) &&
-                              DateTime.TryParse(endTimeStr, out var parsedEndTime)
-                    ? parsedEndTime.ToUniversalTime()
-                    : DateTime.UtcNow.AddHours(24);
-
-                // Get matches from DB with time filter
-                var filter = Builders<MongoEnrichedMatch>.Filter.And(
-                    Builders<MongoEnrichedMatch>.Filter.Gte(m => m.MatchTime, startTime),
-                    Builders<MongoEnrichedMatch>.Filter.Lte(m => m.MatchTime, endTime)
-                );
-
-                var collection = mongoDbService.GetCollection<MongoEnrichedMatch>("EnrichedSportMatches");
-
-                // Ultra-optimized projection with only the exact fields needed for prediction
-                var projection = Builders<MongoEnrichedMatch>.Projection
-                    .Include(m => m.MatchId)
-                    .Include(m => m.MatchTime)
-                    .Include(m => m.OriginalMatch.Teams.Home.Name)
-                    .Include(m => m.OriginalMatch.Teams.Away.Name)
-                    .Include(m => m.Team1LastX)
-                    .Include(m => m.Team2LastX)
-                    .Include(m => m.TeamTableSlice)
-                    .Include(m => m.LastXStatsTeam1)
-                    .Include(m => m.LastXStatsTeam2);
-
-                // Get total count with a separate query to avoid timeout
-                var totalMatchCount = await collection.CountDocumentsAsync(filter, new CountOptions { MaxTime = TimeSpan.FromSeconds(30) });
-
-                var skip = (pagination.Page - 1) * pagination.PageSize;
-
-                // Single efficient query with proper sorting and pagination
-                var matches = await collection
-                    .FindWithDiskUse(filter)
-                    .Project<MongoEnrichedMatch>(projection)
-                    .SortBy(m => m.MatchTime)
-                    .Skip(skip)
-                    .Limit(pagination.PageSize)
-                    .ToListAsync();
-
-                // Transform matches to enriched format and filter out SRL teams
-                var enrichedMatches = matches
-                    .Select(m => m.ToEnrichedSportMatch())
-                    .Where(m => m != null)
-                    .Where(m =>
-                        !(m.OriginalMatch?.Teams?.Home?.Name?.Contains("SRL", StringComparison.OrdinalIgnoreCase) == true ||
-                          m.OriginalMatch?.Teams?.Away?.Name?.Contains("SRL", StringComparison.OrdinalIgnoreCase) == true))
-                    .ToList();
-
-                if (!enrichedMatches.Any())
-                {
-                    return Results.NotFound("No matches found in the specified time range");
-                }
-
-                // Use the transformer to convert the data
-                var predictionData = transformer.TransformToPredictionData(enrichedMatches);
-
-                // Create pagination info
-                var paginationInfo = new PaginationInfo
-                {
-                    CurrentPage = pagination.Page,
-                    PageSize = pagination.PageSize,
-                    TotalItems = totalMatchCount,
-                    TotalPages = (int)Math.Ceiling((double)totalMatchCount / pagination.PageSize),
-                    HasNext = pagination.Page < (int)Math.Ceiling((double)totalMatchCount / pagination.PageSize),
-                    HasPrevious = pagination.Page > 1
-                };
-
-                // Set the pagination info
-                predictionData.Pagination = new SportRadarService.Transformers.PaginationInfo
-                {
-                    CurrentPage = paginationInfo.CurrentPage,
-                    TotalPages = paginationInfo.TotalPages,
-                    PageSize = paginationInfo.PageSize,
-                    TotalItems = (int)paginationInfo.TotalItems,
-                    HasNext = paginationInfo.HasNext,
-                    HasPrevious = paginationInfo.HasPrevious
-                };
-
-                // Cache the response for 1 minute
-                var cacheOptions = new MemoryCacheEntryOptions()
-                    .SetAbsoluteExpiration(TimeSpan.FromMinutes(1));
-                _cache.Set(cacheKey, predictionData, cacheOptions);
-
-                return Results.Json(predictionData, GetCleanSerializerOptions());
-            }
-            catch (MongoConnectionException ex)
-            {
-                retryCount++;
-                if (retryCount >= maxRetries)
-                {
-                    logger.LogError(ex, "Database connection error after {MaxRetries} retries", maxRetries);
-                    return Results.Problem(
-                        detail: $"Database connection error after {maxRetries} retries: {ex.Message}",
-                        title: "Database Connection Error",
-                        statusCode: 503);
-                }
-
-                var delay = retryDelayMs * Math.Pow(2, retryCount - 1);
-                logger.LogWarning(
-                    "Retry {RetryCount} of {MaxRetries} after {Delay}ms delay. Error: {Error}",
-                    retryCount,
-                    maxRetries,
-                    delay,
-                    ex.Message);
-
-                await Task.Delay((int)delay);
-            }
-            catch (MongoExecutionTimeoutException ex)
-            {
-                retryCount++;
-                if (retryCount >= maxRetries)
-                {
-                    logger.LogError(ex, "Query execution timeout after {MaxRetries} retries", maxRetries);
-                    return Results.Problem(
-                        detail: $"Query execution timeout after {maxRetries} retries: {ex.Message}",
-                        title: "Query Timeout",
-                        statusCode: 504);
-                }
-
-                var delay = retryDelayMs * Math.Pow(2, retryCount - 1);
-                logger.LogWarning(
-                    "Retry {RetryCount} of {MaxRetries} after {Delay}ms delay. Error: {Error}",
-                    retryCount,
-                    maxRetries,
-                    delay,
-                    ex.Message);
-
-                await Task.Delay((int)delay);
-            }
-            catch (Exception ex)
-            {
-                logger.LogError(ex, "Unexpected error in GetPredictionData");
-                return Results.Problem(
-                    detail: $"Error fetching prediction data: {ex.Message}",
-                    title: "Internal Server Error",
-                    statusCode: 500);
-            }
+            Console.WriteLine($"Error in GetPredictionData: {ex.Message}");
+            Console.WriteLine($"Stack trace: {ex.StackTrace}");
+            return Results.Problem($"Error fetching prediction data: {ex.Message}");
         }
-
-        return Results.Problem(
-            detail: "Failed to fetch prediction data after all retries",
-            title: "Service Unavailable",
-            statusCode: 503);
     }
 }
 
