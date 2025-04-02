@@ -57,6 +57,9 @@ builder.Services.AddSignalR(options =>
     options.MaximumParallelInvocationsPerClient = 2;
 }).AddMessagePackProtocol();
 
+// Add background services
+builder.Services.AddHostedService<PredictionDataBackgroundService>();
+
 // MongoDB configuration
 builder.Services.Configure<MongoDbSettings>(
     builder.Configuration.GetSection("MongoDb"));
@@ -121,6 +124,9 @@ app.MapHub<LiveMatchHub>("/livematchhub", options =>
     options.ApplicationMaxBufferSize = 100 * 1024; // 100KB
     options.TransportMaxBufferSize = 100 * 1024;
 });
+
+// Configure SignalR endpoint
+app.MapHub<SportMatchHub>("/sportMatchHub");
 
 // Health check endpoint
 app.MapGet("/health/database", async (MongoDbService mongoService) =>
