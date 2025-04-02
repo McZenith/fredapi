@@ -1,20 +1,30 @@
 using fredapi.Model;
 using Microsoft.AspNetCore.SignalR;
+using Microsoft.Extensions.Caching.Memory;
 using fredapi.SportRadarService.Background.ArbitrageLiveMatchBackgroundService;
 
 namespace fredapi.SignalR;
 
-public class LiveMatchHub(ILogger<LiveMatchHub> logger) : Hub
+public class LiveMatchHub : Hub
 {
+    private readonly IMemoryCache _cache;
+    private readonly ILogger<LiveMatchHub> _logger;
+
+    public LiveMatchHub(IMemoryCache cache, ILogger<LiveMatchHub> logger)
+    {
+        _cache = cache;
+        _logger = logger;
+    }
+
     public override async Task OnConnectedAsync()
     {
-        logger.LogInformation($"Client connected: {Context.ConnectionId}");
+        _logger.LogInformation($"Client connected: {Context.ConnectionId}");
 
         // Send the last cached arbitrage matches to the newly connected client
         var cachedArbitrageMatches = ArbitrageLiveMatchBackgroundService.GetLastSentArbitrageMatches();
         if (cachedArbitrageMatches.Any())
         {
-            logger.LogInformation($"Sending cached {cachedArbitrageMatches.Count} arbitrage matches to client: {Context.ConnectionId}");
+            _logger.LogInformation($"Sending cached {cachedArbitrageMatches.Count} arbitrage matches to client: {Context.ConnectionId}");
             await Clients.Caller.SendAsync("ReceiveArbitrageLiveMatches", cachedArbitrageMatches);
         }
 
@@ -22,8 +32,15 @@ public class LiveMatchHub(ILogger<LiveMatchHub> logger) : Hub
         var cachedAllMatches = ArbitrageLiveMatchBackgroundService.GetLastSentAllMatches();
         if (cachedAllMatches.Any())
         {
-            logger.LogInformation($"Sending cached {cachedAllMatches.Count} all matches to client: {Context.ConnectionId}");
+            _logger.LogInformation($"Sending cached {cachedAllMatches.Count} all matches to client: {Context.ConnectionId}");
             await Clients.Caller.SendAsync("ReceiveAllLiveMatches", cachedAllMatches);
+        }
+
+        // Send cached prediction data if available
+        if (_cache.TryGetValue("prediction_data", out var predictionData))
+        {
+            _logger.LogInformation($"Sending cached prediction data to client: {Context.ConnectionId}");
+            await Clients.Caller.SendAsync("ReceivePredictionData", predictionData);
         }
 
         await base.OnConnectedAsync();
@@ -31,12 +48,32 @@ public class LiveMatchHub(ILogger<LiveMatchHub> logger) : Hub
 
     public override async Task OnDisconnectedAsync(Exception? exception)
     {
-        logger.LogInformation($"Client disconnected: {Context.ConnectionId}");
+        _logger.LogInformation($"Client disconnected: {Context.ConnectionId}");
         await base.OnDisconnectedAsync(exception);
     }
 
     public async Task SendMatches(List<EnrichedMatch> matches)
     {
         await Clients.All.SendAsync("ReceiveLiveMatches", matches);
+    }
+
+    public async Task RequestPredictionData()
+    {
+        try
+        {
+            if (_cache.TryGetValue("prediction_data", out var predictionData))
+            {
+                await Clients.Caller.SendAsync("ReceivePredictionData", predictionData);
+            }
+            else
+            {
+                await Clients.Caller.SendAsync("Error", "Prediction data not available");
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error sending prediction data to client {ConnectionId}", Context.ConnectionId);
+            await Clients.Caller.SendAsync("Error", "Failed to send prediction data");
+        }
     }
 }

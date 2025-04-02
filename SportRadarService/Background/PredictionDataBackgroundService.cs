@@ -1,6 +1,6 @@
 using fredapi.Database;
-using fredapi.Hubs;
 using fredapi.Routes;
+using fredapi.SignalR;
 using fredapi.SportRadarService.Transformers;
 using Microsoft.AspNetCore.SignalR;
 using MongoDB.Bson;
@@ -33,7 +33,7 @@ public class PredictionDataBackgroundService : BackgroundService
                 using var scope = _serviceProvider.CreateScope();
                 var mongoDbService = scope.ServiceProvider.GetRequiredService<MongoDbService>();
                 var transformer = scope.ServiceProvider.GetRequiredService<SportMatchesPredictionTransformer>();
-                var hubContext = scope.ServiceProvider.GetRequiredService<IHubContext<SportMatchHub>>();
+                var hubContext = scope.ServiceProvider.GetRequiredService<IHubContext<LiveMatchHub>>();
 
                 // Get all matches for the next 24 hours
                 var startTime = DateTime.UtcNow.AddMinutes(-90);
