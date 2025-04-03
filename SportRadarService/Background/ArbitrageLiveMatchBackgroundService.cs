@@ -384,17 +384,13 @@ public partial class ArbitrageLiveMatchBackgroundService : BackgroundService
             foreach (var matchBatch in allMatches.Chunk(5))
             {
                 // Add a random delay before processing each batch (1-2 seconds)
-                await AddHumanLikeDelay(1000, 2000);
-
                 foreach (var match in matchBatch)
                 {
                     try
                     {
                         // Fetch match situation and details data
                         await FetchMatchSituationAndDetails(match);
-                        _logger.LogDebug($"Enriched match {match.Id} with situation and details");
                         // Add a random delay between matches (800ms-1.2s)
-                        await AddHumanLikeDelay(800, 1200);
                     }
                     catch (Exception ex)
                     {
@@ -404,7 +400,6 @@ public partial class ArbitrageLiveMatchBackgroundService : BackgroundService
                     }
                 }
                 // Add delay between batches (2-3 seconds)
-                await AddHumanLikeDelay(2000, 3000);
             }
 
             // Create client matches with enriched data for all matches (1X2 markets only)
@@ -470,7 +465,6 @@ public partial class ArbitrageLiveMatchBackgroundService : BackgroundService
         {
             try
             {
-                await AddHumanLikeDelay(300, 500);
                 var result = await task.Value;
                 await AddHumanLikeDelay(300, 500);
                 if (result is Ok<JsonDocument> okResult && okResult.Value != null)
@@ -674,7 +668,6 @@ public partial class ArbitrageLiveMatchBackgroundService : BackgroundService
                         }
                     }
                 }
-                await AddHumanLikeDelay(300, 500);
             }
             catch (Exception ex)
             {
