@@ -55,7 +55,7 @@ public partial class ArbitrageLiveMatchBackgroundService : BackgroundService
             {
                 try
                 {
-                    await Task.Delay(TimeSpan.FromMinutes(DelayMinutes), stoppingToken);
+                    await Task.Delay(TimeSpan.FromSeconds(DelayMinutes), stoppingToken);
                 }
                 catch (OperationCanceledException)
                 {
