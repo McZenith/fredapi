@@ -178,25 +178,23 @@ namespace fredapi.SportRadarService.Transformers
             // Ensure confidence score is reasonable
             if (match.ConfidenceScore <= 0 || match.ConfidenceScore > 100)
             {
-                // Generate a random but deterministic value between 20-40 based on match ID
-                Random random = new Random(match.Id);
-                match.ConfidenceScore = 20 + random.Next(0, 20);
+                match.ConfidenceScore = 0;
             }
 
             // Ensure reasonable values for key metrics
             if (match.AverageGoals <= 0)
             {
-                match.AverageGoals = (match.HomeTeam.AvgHomeGoals + match.AwayTeam.AvgAwayGoals) / 2;
+                match.AverageGoals = (match.HomeTeam?.AvgHomeGoals ?? 0 + match.AwayTeam?.AvgAwayGoals ?? 0) / 2;
             }
 
             if (match.ExpectedGoals <= 0)
             {
-                match.ExpectedGoals = match.AverageGoals * 1.1; // Slightly higher than average
+                match.ExpectedGoals = match.AverageGoals;
             }
 
             if (match.DefensiveStrength <= 0)
             {
-                match.DefensiveStrength = 1.0; // Neutral value
+                match.DefensiveStrength = 0;
             }
 
             // Ensure odds object exists with reasonable values
@@ -204,29 +202,29 @@ namespace fredapi.SportRadarService.Transformers
             {
                 match.Odds = new MatchOdds
                 {
-                    HomeWin = 2.5,
-                    Draw = 3.2,
-                    AwayWin = 2.8,
-                    Over15Goals = 1.4,
-                    Under15Goals = 2.8,
-                    Over25Goals = 2.0,
-                    Under25Goals = 1.8,
-                    BttsYes = 1.9,
-                    BttsNo = 1.9
+                    HomeWin = 0,
+                    Draw = 0,
+                    AwayWin = 0,
+                    Over15Goals = 0,
+                    Under15Goals = 0,
+                    Over25Goals = 0,
+                    Under25Goals = 0,
+                    BttsYes = 0,
+                    BttsNo = 0
                 };
             }
             else
             {
-                // Fill in any missing odds with reasonable values
-                if (match.Odds.HomeWin <= 0) match.Odds.HomeWin = 2.5;
-                if (match.Odds.Draw <= 0) match.Odds.Draw = 3.2;
-                if (match.Odds.AwayWin <= 0) match.Odds.AwayWin = 2.8;
-                if (match.Odds.Over15Goals <= 0) match.Odds.Over15Goals = 1.4;
-                if (match.Odds.Under15Goals <= 0) match.Odds.Under15Goals = 2.8;
-                if (match.Odds.Over25Goals <= 0) match.Odds.Over25Goals = 2.0;
-                if (match.Odds.Under25Goals <= 0) match.Odds.Under25Goals = 1.8;
-                if (match.Odds.BttsYes <= 0) match.Odds.BttsYes = 1.9;
-                if (match.Odds.BttsNo <= 0) match.Odds.BttsNo = 1.9;
+                // Fill in any missing odds with zeros
+                if (match.Odds.HomeWin <= 0) match.Odds.HomeWin = 0;
+                if (match.Odds.Draw <= 0) match.Odds.Draw = 0;
+                if (match.Odds.AwayWin <= 0) match.Odds.AwayWin = 0;
+                if (match.Odds.Over15Goals <= 0) match.Odds.Over15Goals = 0;
+                if (match.Odds.Under15Goals <= 0) match.Odds.Under15Goals = 0;
+                if (match.Odds.Over25Goals <= 0) match.Odds.Over25Goals = 0;
+                if (match.Odds.Under25Goals <= 0) match.Odds.Under25Goals = 0;
+                if (match.Odds.BttsYes <= 0) match.Odds.BttsYes = 0;
+                if (match.Odds.BttsNo <= 0) match.Odds.BttsNo = 0;
             }
 
             // Ensure head-to-head exists with reasonable defaults if no data
@@ -249,16 +247,16 @@ namespace fredapi.SportRadarService.Transformers
             {
                 match.CornerStats = new CornerStats
                 {
-                    HomeAvg = match.HomeTeam.AvgCorners ?? 5.0,
-                    AwayAvg = match.AwayTeam.AvgCorners ?? 5.0,
-                    TotalAvg = (match.HomeTeam.AvgCorners ?? 5.0) + (match.AwayTeam.AvgCorners ?? 5.0)
+                    HomeAvg = match.HomeTeam?.AvgCorners ?? 0,
+                    AwayAvg = match.AwayTeam?.AvgCorners ?? 0,
+                    TotalAvg = (match.HomeTeam?.AvgCorners ?? 0) + (match.AwayTeam?.AvgCorners ?? 0)
                 };
             }
             else
             {
                 // Fill in missing corner stats
-                if (match.CornerStats.HomeAvg <= 0) match.CornerStats.HomeAvg = match.HomeTeam.AvgCorners ?? 5.0;
-                if (match.CornerStats.AwayAvg <= 0) match.CornerStats.AwayAvg = match.AwayTeam.AvgCorners ?? 5.0;
+                if (match.CornerStats.HomeAvg <= 0) match.CornerStats.HomeAvg = match.HomeTeam?.AvgCorners ?? 0;
+                if (match.CornerStats.AwayAvg <= 0) match.CornerStats.AwayAvg = match.AwayTeam?.AvgCorners ?? 0;
                 if (match.CornerStats.TotalAvg <= 0)
                     match.CornerStats.TotalAvg = match.CornerStats.HomeAvg + match.CornerStats.AwayAvg;
             }
@@ -268,80 +266,29 @@ namespace fredapi.SportRadarService.Transformers
             {
                 match.ScoringPatterns = new ScoringPatterns
                 {
-                    HomeFirstGoalRate = match.HomeTeam.ScoringFirstWinRate ?? 50,
-                    AwayFirstGoalRate = match.AwayTeam.ScoringFirstWinRate ?? 50,
-                    HomeLateGoalRate = match.HomeTeam.LateGoalRate ?? 30,
-                    AwayLateGoalRate = match.AwayTeam.LateGoalRate ?? 30
+                    HomeFirstGoalRate = match.HomeTeam?.ScoringFirstWinRate ?? 0,
+                    AwayFirstGoalRate = match.AwayTeam?.ScoringFirstWinRate ?? 0,
+                    HomeLateGoalRate = match.HomeTeam?.LateGoalRate ?? 0,
+                    AwayLateGoalRate = match.AwayTeam?.LateGoalRate ?? 0
                 };
             }
             else
             {
                 // Fill in missing scoring patterns
                 if (match.ScoringPatterns.HomeFirstGoalRate <= 0)
-                    match.ScoringPatterns.HomeFirstGoalRate = match.HomeTeam.ScoringFirstWinRate ?? 50;
+                    match.ScoringPatterns.HomeFirstGoalRate = match.HomeTeam?.ScoringFirstWinRate ?? 0;
                 if (match.ScoringPatterns.AwayFirstGoalRate <= 0)
-                    match.ScoringPatterns.AwayFirstGoalRate = match.AwayTeam.ScoringFirstWinRate ?? 50;
+                    match.ScoringPatterns.AwayFirstGoalRate = match.AwayTeam?.ScoringFirstWinRate ?? 0;
                 if (match.ScoringPatterns.HomeLateGoalRate <= 0)
-                    match.ScoringPatterns.HomeLateGoalRate = match.HomeTeam.LateGoalRate ?? 30;
+                    match.ScoringPatterns.HomeLateGoalRate = match.HomeTeam?.LateGoalRate ?? 0;
                 if (match.ScoringPatterns.AwayLateGoalRate <= 0)
-                    match.ScoringPatterns.AwayLateGoalRate = match.AwayTeam.LateGoalRate ?? 30;
+                    match.ScoringPatterns.AwayLateGoalRate = match.AwayTeam?.LateGoalRate ?? 0;
             }
 
             // Ensure reasons for prediction exists - generate based on actual data
             if (match.ReasonsForPrediction == null || !match.ReasonsForPrediction.Any())
             {
-                var reasons = new List<string>();
-
-                // Add form-based reason
-                if (!string.IsNullOrEmpty(match.HomeTeam.Form))
-                {
-                    reasons.Add($"{match.HomeTeam.Name} form: {match.HomeTeam.Form}");
-                }
-
-                if (!string.IsNullOrEmpty(match.AwayTeam.Form))
-                {
-                    reasons.Add($"{match.AwayTeam.Name} form: {match.AwayTeam.Form}");
-                }
-
-                // Add scoring potential reason
-                string scoringPotential = match.ExpectedGoals > 2.5
-                    ? "High"
-                    : (match.ExpectedGoals > 1.5 ? "Moderate" : "Low");
-                reasons.Add(
-                    $"{scoringPotential}-scoring potential: {match.HomeTeam.Name} ({match.HomeTeam.HomeAverageGoalsScored:0.00} home) vs {match.AwayTeam.Name} ({match.AwayTeam.AwayAverageGoalsScored:0.00} away)");
-
-                // Add H2H reason if applicable
-                if (match.HeadToHead.Matches > 0)
-                {
-                    double avgGoals = (double)(match.HeadToHead.GoalsScored + match.HeadToHead.GoalsConceded) /
-                                      match.HeadToHead.Matches;
-                    string h2hScoring = avgGoals > 2.5 ? "High" : (avgGoals > 1.5 ? "Moderate" : "Low");
-                    reasons.Add($"H2H: {h2hScoring}-scoring fixtures averaging {avgGoals:0.0} goals per game");
-                }
-
-                // Add odds-based reason
-                if (match.Odds.HomeWin > 0 && match.Odds.AwayWin > 0)
-                {
-                    string favoriteStrength = match.Favorite == "home"
-                        ? (match.Odds.HomeWin < 2.0 ? "Strong" : "Moderate")
-                        : (match.Odds.AwayWin < 2.0 ? "Strong" : "Moderate");
-
-                    string favoriteTeam = match.Favorite == "home" ? match.HomeTeam.Name :
-                        match.Favorite == "away" ? match.AwayTeam.Name : "Draw";
-
-                    if (match.Favorite != "draw")
-                    {
-                        reasons.Add(
-                            $"{favoriteStrength} favorite: {favoriteTeam} (H: {match.Odds.HomeWin:0.00}, A: {match.Odds.AwayWin:0.00})");
-                    }
-                    else
-                    {
-                        reasons.Add(
-                            $"Draw likely: Tight odds (H: {match.Odds.HomeWin:0.00}, A: {match.Odds.AwayWin:0.00})");
-                    }
-                }
-
-                match.ReasonsForPrediction = reasons;
+                match.ReasonsForPrediction = new List<string>();
             }
         }
 
@@ -484,11 +431,11 @@ namespace fredapi.SportRadarService.Transformers
                 // Generate reasons for prediction
                 var reasons = GeneratePredictionReasons(sportMatch, homeTeam, awayTeam, oddsInfo, expectedGoals);
 
-                // Calculate average goals - use a value that matches the example
-                double averageGoals = 1.53; // Matching the example
+                // Calculate average goals
+                double averageGoals = CalculateAverageGoals(sportMatch, homeTeam, awayTeam);
 
-                // Calculate defensive strength - also match the example
-                double defensiveStrength = 1.15; // Matching the example
+                // Calculate defensive strength
+                double defensiveStrength = CalculateDefensiveStrength(sportMatch, homeTeam, awayTeam);
 
                 return new UpcomingMatch
                 {
@@ -701,8 +648,8 @@ namespace fredapi.SportRadarService.Transformers
                     Logo = "",
                     Form = "",
                     IsHomeTeam = isHome,
-                    FormStrength = 50,
-                    FormRating = 50,
+                    FormStrength = 0,
+                    FormRating = 0,
                     GoalDistribution = new Dictionary<string, object>(),
                     OpponentName = isHome
                         ? sportMatch?.OriginalMatch?.Teams?.Away?.Name ?? "Unknown Away Team"
@@ -2378,107 +2325,48 @@ namespace fredapi.SportRadarService.Transformers
         {
             try
             {
-                // Use the actual scoring data from team stats
-                double homeExpected = 0;
-                double awayExpected = 0;
+                // Base on actual scoring averages
+                double homeScoring = homeTeam.HomeAverageGoalsScored;
+                double awayScoring = awayTeam.AwayAverageGoalsScored;
+                double homeDefence = 1 / Math.Max(homeTeam.HomeAverageGoalsConceded, 0.01);
+                double awayDefence = 1 / Math.Max(awayTeam.AwayAverageGoalsConceded, 0.01);
 
-                var homeStats = sportMatch.Team1ScoringConceding?.Stats;
-                var awayStats = sportMatch.Team2ScoringConceding?.Stats;
-
-                // First attempt: Use stats if they exist
-                if (homeStats != null && homeStats.Scoring?.GoalsScoredAverage?.Home > 0 &&
-                    awayStats != null && awayStats.Conceding?.GoalsConcededAverage?.Away > 0)
-                {
-                    // Get home team's average goals scored at home
-                    double homeGoalsScored = homeStats.Scoring.GoalsScoredAverage.Home;
-
-                    // Get away team's average goals conceded away
-                    double awayConceded = awayStats.Conceding.GoalsConcededAverage.Away;
-
-                    // Calculate expected goals for home team
-                    homeExpected = (homeGoalsScored + awayConceded) / 2;
-                }
-                else if (homeTeam.HomeAverageGoalsScored > 0 && awayTeam.AwayAverageGoalsConceded > 0)
-                {
-                    // Use team data from extracted stats
-                    homeExpected = (homeTeam.HomeAverageGoalsScored + awayTeam.AwayAverageGoalsConceded) / 2;
-                }
-                else
-                {
-                    // If no specific data, use general averages
-                    homeExpected = 1.3; // Typical home expected goals
-                }
-
-                // Same approach for away expected goals
-                if (awayStats != null && awayStats.Scoring?.GoalsScoredAverage?.Away > 0 &&
-                    homeStats != null && homeStats.Conceding?.GoalsConcededAverage?.Home > 0)
-                {
-                    // Get away team's average goals scored away
-                    double awayGoalsScored = awayStats.Scoring.GoalsScoredAverage.Away;
-
-                    // Get home team's average goals conceded at home
-                    double homeConceded = homeStats.Conceding.GoalsConcededAverage.Home;
-
-                    // Calculate expected goals for away team
-                    awayExpected = (awayGoalsScored + homeConceded) / 2;
-                }
-                else if (awayTeam.AwayAverageGoalsScored > 0 && homeTeam.HomeAverageGoalsConceded > 0)
-                {
-                    // Use team data from extracted stats
-                    awayExpected = (awayTeam.AwayAverageGoalsScored + homeTeam.HomeAverageGoalsConceded) / 2;
-                }
-                else
-                {
-                    // If no specific data, use general averages
-                    awayExpected = 0.9; // Typical away expected goals
-                }
-
-                // If we still don't have valid data, check head-to-head history
-                if (homeExpected <= 0 && awayExpected <= 0)
-                {
-                    var h2h = CreateHeadToHeadData(sportMatch);
-                    if (h2h != null && h2h.Matches > 0)
-                    {
-                        double avgGoals = (double)(h2h.GoalsScored + h2h.GoalsConceded) / h2h.Matches;
-
-                        // Distribute expected goals between home and away based on home advantage
-                        homeExpected = avgGoals * 0.6; // Home teams typically score more
-                        awayExpected = avgGoals * 0.4;
-                    }
-                    else
-                    {
-                        // Last resort: use league average if available, otherwise defaults
-                        double leagueAvg = CalculateLeagueAvgGoals(sportMatch);
-                        homeExpected = leagueAvg > 0 ? leagueAvg * 0.6 : 1.3;
-                        awayExpected = leagueAvg > 0 ? leagueAvg * 0.4 : 0.9;
-                    }
-                }
+                // Normalize defense factors
+                homeDefence = Math.Min(Math.Max(homeDefence, 0.5), 1.5);
+                awayDefence = Math.Min(Math.Max(awayDefence, 0.5), 1.5);
 
                 // Adjust for form
-                if (!string.IsNullOrEmpty(homeTeam.Form) && !string.IsNullOrEmpty(awayTeam.Form))
-                {
-                    double homeForm = CalculateFormNumeric(homeTeam.Form);
-                    double awayForm = CalculateFormNumeric(awayTeam.Form);
+                double homeForm = CalculateFormNumeric(homeTeam.Form);
+                double awayForm = CalculateFormNumeric(awayTeam.Form);
 
-                    homeExpected *= (1 + (homeForm - 0.5) * 0.2); // Adjust by ±10%
-                    awayExpected *= (1 + (awayForm - 0.5) * 0.2); // Adjust by ±10%
+                // Expected goals with adjustments
+                double homeExpected = homeScoring * (2 - awayDefence) * (1 + (homeForm - 0.5) * 0.2);
+                double awayExpected = awayScoring * (2 - homeDefence) * (1 + (awayForm - 0.5) * 0.2);
+
+                // Account for league average if available
+                double leagueAvgGoals = CalculateLeagueAvgGoals(sportMatch);
+                if (leagueAvgGoals > 0)
+                {
+                    // Adjust towards league average
+                    homeExpected = (homeExpected * 0.7) + (leagueAvgGoals * 0.5 * 0.3);
+                    awayExpected = (awayExpected * 0.7) + (leagueAvgGoals * 0.5 * 0.3);
                 }
 
-                // Total expected goals
+                // Total expected
                 double totalExpected = homeExpected + awayExpected;
 
                 // Sanity check: don't return unrealistic values
                 if (totalExpected > 6)
                     totalExpected = 6;
                 if (totalExpected < 0.5)
-                    totalExpected = 2.1; // Conservative average for football
+                    totalExpected = 0;
 
                 return Math.Round(totalExpected, 2);
             }
             catch (Exception ex)
             {
                 _logger.LogError(ex, $"Error calculating expected goals for match {sportMatch?.MatchId}: {ex.Message}");
-                return 2.1; // Fallback to typical average
+                return 0;
             }
         }
 
@@ -2487,7 +2375,7 @@ namespace fredapi.SportRadarService.Transformers
         private double CalculateFormNumeric(string form)
         {
             if (string.IsNullOrEmpty(form))
-                return 0.5; // Neutral
+                return 0;
 
             double score = 0;
             double weight = 1.0;
@@ -2508,10 +2396,7 @@ namespace fredapi.SportRadarService.Transformers
                 weight *= 0.8; // Exponential decay for older results
             }
 
-            double result = totalWeight > 0 ? score / totalWeight : 0.5;
-
-            // Ensure result is in 0-1 range
-            return Math.Min(Math.Max(result, 0), 1);
+            return totalWeight > 0 ? score / totalWeight : 0;
         }
 
         /// <summary>
@@ -2551,7 +2436,7 @@ namespace fredapi.SportRadarService.Transformers
             catch (Exception ex)
             {
                 _logger.LogError(ex, $"Error calculating average goals for match {sportMatch?.MatchId}: {ex.Message}");
-                return 2.5; // Fallback to typical average
+                return 0;
             }
         }
 
@@ -2572,14 +2457,14 @@ namespace fredapi.SportRadarService.Transformers
                 // Use actual goals conceded data as primary factor
                 double homeDefense = homeTeam.HomeAverageGoalsConceded > 0
                     ? 1.0 / homeTeam.HomeAverageGoalsConceded
-                    : 1.5;
+                    : 0;
                 double awayDefense = awayTeam.AwayAverageGoalsConceded > 0
                     ? 1.0 / awayTeam.AwayAverageGoalsConceded
-                    : 1.5;
+                    : 0;
 
                 // Normalize to reasonable range (0.5 to 1.5)
-                homeDefense = Math.Min(Math.Max(homeDefense, 0.5), 1.5);
-                awayDefense = Math.Min(Math.Max(awayDefense, 0.5), 1.5);
+                homeDefense = Math.Min(Math.Max(homeDefense, 0), 1.5);
+                awayDefense = Math.Min(Math.Max(awayDefense, 0), 1.5);
 
                 // Factor in clean sheets as secondary factor
                 homeDefense *= (1 + homeCleanSheetRate * 0.2);
@@ -2594,13 +2479,13 @@ namespace fredapi.SportRadarService.Transformers
                 // Combine with weighted average (more weight on home team)
                 double combinedDefense = (homeDefense * 0.6) + (awayDefense * 0.4);
 
-                // Final adjustment to match example output
-                return Math.Round(Math.Min(Math.Max(combinedDefense, 0.8), 1.5), 2);
+                // Final adjustment
+                return Math.Round(Math.Min(Math.Max(combinedDefense, 0), 1.5), 2);
             }
             catch (Exception ex)
             {
                 _logger.LogError(ex, $"Error calculating defensive strength: {ex.Message}");
-                return 1.15; // Fallback value matching example
+                return 0;
             }
         }
 
