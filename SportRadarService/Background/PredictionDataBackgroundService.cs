@@ -9,22 +9,13 @@ using Microsoft.Extensions.Caching.Memory;
 
 namespace fredapi.SportRadarService.Background;
 
-public class PredictionDataBackgroundService : BackgroundService
+public class PredictionDataBackgroundService(
+    ILogger<PredictionDataBackgroundService> logger,
+    IServiceProvider serviceProvider,
+    IMemoryCache cache)
+    : BackgroundService
 {
-    private readonly ILogger<PredictionDataBackgroundService> _logger;
-    private readonly IServiceProvider _serviceProvider;
-    private readonly IMemoryCache _cache;
-    private readonly TimeSpan _updateInterval = TimeSpan.FromHours(1);
-
-    public PredictionDataBackgroundService(
-        ILogger<PredictionDataBackgroundService> logger,
-        IServiceProvider serviceProvider,
-        IMemoryCache cache)
-    {
-        _logger = logger;
-        _serviceProvider = serviceProvider;
-        _cache = cache;
-    }
+    private readonly TimeSpan _updateInterval = TimeSpan.FromMinutes(5);
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
@@ -32,7 +23,7 @@ public class PredictionDataBackgroundService : BackgroundService
         {
             try
             {
-                using var scope = _serviceProvider.CreateScope();
+                using var scope = serviceProvider.CreateScope();
                 var mongoDbService = scope.ServiceProvider.GetRequiredService<MongoDbService>();
                 var transformer = scope.ServiceProvider.GetRequiredService<SportMatchesPredictionTransformer>();
                 var hubContext = scope.ServiceProvider.GetRequiredService<IHubContext<LiveMatchHub>>();
@@ -87,7 +78,7 @@ public class PredictionDataBackgroundService : BackgroundService
                     }
                     catch (OperationCanceledException)
                     {
-                        _logger.LogWarning($"Batch processing timed out for {batch.Count} matches");
+                        logger.LogWarning($"Batch processing timed out for {batch.Count} matches");
                         return null;
                     }
                 });
@@ -96,19 +87,19 @@ public class PredictionDataBackgroundService : BackgroundService
 
                 if (!batchResults.Any())
                 {
-                    _logger.LogError("No valid prediction data generated");
+                    logger.LogError("No valid prediction data generated");
                     return;
                 }
 
                 var currentTime = DateTime.UtcNow;
 
                 // Combine all batch results
-                var predictionData = new fredapi.SportRadarService.Transformers.PredictionDataResponse
+                var predictionData = new PredictionDataResponse
                 {
-                    Data = new fredapi.SportRadarService.Transformers.PredictionData
+                    Data = new PredictionData
                     {
                         UpcomingMatches = batchResults.SelectMany(r => r.Data.UpcomingMatches).ToList(),
-                        Metadata = new fredapi.SportRadarService.Transformers.PredictionMetadata
+                        Metadata = new PredictionMetadata
                         {
                             Total = enrichedMatches.Count,
                             Date = currentTime.ToString("yyyy-MM-dd"),
@@ -122,7 +113,7 @@ public class PredictionDataBackgroundService : BackgroundService
                                 )
                         }
                     },
-                    Pagination = new fredapi.SportRadarService.Transformers.PaginationInfo
+                    Pagination = new Transformers.PaginationInfo
                     {
                         CurrentPage = 1,
                         TotalPages = 1,
@@ -134,14 +125,14 @@ public class PredictionDataBackgroundService : BackgroundService
                 };
 
                 // Cache the prediction data before broadcasting
-                _cache.Set("prediction_data", predictionData, TimeSpan.FromHours(1));
+                cache.Set("prediction_data", predictionData, TimeSpan.FromHours(1));
 
                 // Broadcast to all connected clients
                 await hubContext.Clients.All.SendAsync("ReceivePredictionData", predictionData, stoppingToken);
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "Error occurred while updating prediction data");
+                logger.LogError(ex, "Error occurred while updating prediction data");
             }
 
             // Wait for the next update interval

@@ -12,8 +12,8 @@ var builder = WebApplication.CreateBuilder(args);
 builder.Services.AddResponseCompression(options =>
 {
     options.EnableForHttps = true;
-    options.Providers.Add<Microsoft.AspNetCore.ResponseCompression.BrotliCompressionProvider>();
-    options.Providers.Add<Microsoft.AspNetCore.ResponseCompression.GzipCompressionProvider>();
+    options.Providers.Add<BrotliCompressionProvider>();
+    options.Providers.Add<GzipCompressionProvider>();
 });
 
 builder.Services.Configure<BrotliCompressionProviderOptions>(options =>
@@ -61,8 +61,6 @@ builder.Services.AddSignalR(options =>
     options.MaximumParallelInvocationsPerClient = 2;
 }).AddMessagePackProtocol();
 
-// Add background services
-builder.Services.AddHostedService<PredictionDataBackgroundService>();
 
 // MongoDB configuration
 builder.Services.Configure<MongoDbSettings>(
@@ -77,17 +75,11 @@ builder.Services.Configure<MongoDbSettings>(options =>
 });
 
 builder.Services.AddSportRadarService();
-builder.Services.AddOpenApi();
 
 var app = builder.Build();
 
 // Enable response compression
 app.UseResponseCompression();
-
-if (app.Environment.IsDevelopment()) 
-{
-    app.MapOpenApi();
-}
 
 // Create MongoDB indexes for optimizing sort operations
 using (var scope = app.Services.CreateScope())
@@ -98,7 +90,7 @@ using (var scope = app.Services.CreateScope())
     try
     {
         // Create index on MatchTime field (descending) for EnrichedSportMatches collection
-        await mongoDbService.CreateIndexAsync<fredapi.Routes.MongoEnrichedMatch>(
+        await mongoDbService.CreateIndexAsync<MongoEnrichedMatch>(
             "EnrichedSportMatches",
             "MatchTime",
             descending: true);
