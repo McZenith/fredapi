@@ -15,8 +15,8 @@ public class PredictionDataBackgroundService(
     IMemoryCache cache)
     : BackgroundService
 {
-    private readonly TimeSpan _updateInterval = TimeSpan.FromMinutes(5);
-
+    private readonly TimeSpan _updateInterval = TimeSpan.FromHours(1);
+    
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         while (!stoppingToken.IsCancellationRequested)
@@ -33,38 +33,59 @@ public class PredictionDataBackgroundService(
                 var endTime = DateTime.UtcNow.AddHours(24);
 
                 var collection = mongoDbService.GetCollection<MongoEnrichedMatch>("EnrichedSportMatches");
-                var filter = Builders<MongoEnrichedMatch>.Filter.And(
-                    Builders<MongoEnrichedMatch>.Filter.Gte(m => m.MatchTime, startTime),
-                    Builders<MongoEnrichedMatch>.Filter.Lte(m => m.MatchTime, endTime),
-                    Builders<MongoEnrichedMatch>.Filter.Not(
-                        Builders<MongoEnrichedMatch>.Filter.Or(
-                            Builders<MongoEnrichedMatch>.Filter.Regex(m => m.OriginalMatch.Teams.Home.Name, new BsonRegularExpression("SRL", "i")),
-                            Builders<MongoEnrichedMatch>.Filter.Regex(m => m.OriginalMatch.Teams.Away.Name, new BsonRegularExpression("SRL", "i"))
-                        )
-                    )
-                );
-
-                var matches = await collection
-                    .Find(filter)
-                    .SortBy(m => m.MatchTime)
-                    .ToListAsync(stoppingToken);
-
-                if (!matches.Any())
+                
+                // Split the query into smaller date ranges to process in separate queries
+                var timeRanges = GetTimeRanges(startTime, endTime, 4); // Split into 4 chunks
+                var allMatches = new List<MongoEnrichedMatch>();
+                
+                // Process each time range separately
+                foreach (var (rangeStart, rangeEnd) in timeRanges)
                 {
-                    return;
+                    try
+                    {
+                        var filter = CreateFilter(rangeStart, rangeEnd);
+                        
+                        // Use Find but with explicit timeout and lower batch size
+                        var options = new FindOptions<MongoEnrichedMatch>
+                        {
+                            BatchSize = 50,
+                            MaxTime = TimeSpan.FromSeconds(30)
+                        };
+                        
+                        using var cursor = await collection.FindAsync(filter, options, stoppingToken);
+                        var rangeMatches = await cursor.ToListAsync(stoppingToken);
+                        allMatches.AddRange(rangeMatches);
+                        
+                        logger.LogInformation($"Retrieved {rangeMatches.Count} matches between {rangeStart} and {rangeEnd}");
+                    }
+                    catch (Exception ex)
+                    {
+                        logger.LogError(ex, $"Error retrieving matches between {rangeStart} and {rangeEnd}");
+                        // Continue with next range even if this one fails
+                    }
                 }
 
+                if (!allMatches.Any())
+                {
+                    logger.LogInformation("No upcoming matches found");
+                    await Task.Delay(_updateInterval, stoppingToken);
+                    continue;
+                }
+
+                // Sort the matches after combining all chunks
+                allMatches = allMatches.OrderBy(m => m.MatchTime).ToList();
+
                 // Transform matches to enriched format
-                var enrichedMatches = matches
+                var enrichedMatches = allMatches
                     .Select(m => m.ToEnrichedSportMatch())
                     .Where(m => m != null)
                     .ToList();
 
                 // Process matches in batches
-                const int batchSize = 20;
+                const int transformBatchSize = 20;
                 var batches = enrichedMatches
                     .Select((match, index) => new { match, index })
-                    .GroupBy(x => x.index / batchSize)
+                    .GroupBy(x => x.index / transformBatchSize)
                     .Select(g => g.Select(x => x.match).ToList())
                     .ToList();
 
@@ -88,7 +109,8 @@ public class PredictionDataBackgroundService(
                 if (!batchResults.Any())
                 {
                     logger.LogError("No valid prediction data generated");
-                    return;
+                    await Task.Delay(_updateInterval, stoppingToken);
+                    continue;
                 }
 
                 var currentTime = DateTime.UtcNow;
@@ -129,6 +151,8 @@ public class PredictionDataBackgroundService(
 
                 // Broadcast to all connected clients
                 await hubContext.Clients.All.SendAsync("ReceivePredictionData", predictionData, stoppingToken);
+                
+                logger.LogInformation($"Successfully updated prediction data for {enrichedMatches.Count} matches");
             }
             catch (Exception ex)
             {
@@ -137,6 +161,33 @@ public class PredictionDataBackgroundService(
 
             // Wait for the next update interval
             await Task.Delay(_updateInterval, stoppingToken);
+        }
+    }
+    
+    private FilterDefinition<MongoEnrichedMatch> CreateFilter(DateTime rangeStart, DateTime rangeEnd)
+    {
+        return Builders<MongoEnrichedMatch>.Filter.And(
+            Builders<MongoEnrichedMatch>.Filter.Gte(m => m.MatchTime, rangeStart),
+            Builders<MongoEnrichedMatch>.Filter.Lt(m => m.MatchTime, rangeEnd),
+            Builders<MongoEnrichedMatch>.Filter.Not(
+                Builders<MongoEnrichedMatch>.Filter.Or(
+                    Builders<MongoEnrichedMatch>.Filter.Regex(m => m.OriginalMatch.Teams.Home.Name, new BsonRegularExpression("SRL", "i")),
+                    Builders<MongoEnrichedMatch>.Filter.Regex(m => m.OriginalMatch.Teams.Away.Name, new BsonRegularExpression("SRL", "i"))
+                )
+            )
+        );
+    }
+    
+    private IEnumerable<(DateTime start, DateTime end)> GetTimeRanges(DateTime start, DateTime end, int chunks)
+    {
+        var totalHours = (end - start).TotalHours;
+        var chunkSize = totalHours / chunks;
+        
+        for (int i = 0; i < chunks; i++)
+        {
+            var chunkStart = start.AddHours(i * chunkSize);
+            var chunkEnd = (i == chunks - 1) ? end : start.AddHours((i + 1) * chunkSize);
+            yield return (chunkStart, chunkEnd);
         }
     }
 }
