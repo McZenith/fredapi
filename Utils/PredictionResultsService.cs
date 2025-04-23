@@ -1,4 +1,3 @@
-
 using System.Collections.Concurrent;
 using fredapi.Database;
 using fredapi.Routes;
@@ -18,7 +17,6 @@ namespace fredapi.Utils;
 public class PredictionResultsService
 {
     private readonly ILogger<PredictionResultsService> _logger;
-    private readonly MongoDbService _mongoDbService;
     private readonly IMemoryCache _cache;
     private readonly IHubContext<LiveMatchHub> _hubContext;
     private readonly PredictionEnrichedMatchService _predictionEnrichedMatchService;
@@ -28,13 +26,11 @@ public class PredictionResultsService
     
     public PredictionResultsService(
         ILogger<PredictionResultsService> logger,
-        MongoDbService mongoDbService,
         IMemoryCache cache,
         IHubContext<LiveMatchHub> hubContext,
         PredictionEnrichedMatchService predictionEnrichedMatchService)
     {
         _logger = logger;
-        _mongoDbService = mongoDbService;
         _cache = cache;
         _hubContext = hubContext;
         _predictionEnrichedMatchService = predictionEnrichedMatchService;
@@ -70,7 +66,8 @@ public class PredictionResultsService
                 try
                 {
                     var matchId = matchGroup.Key;
-                    var snapshots = matchGroup.OrderBy(s => s.Timestamp).ToList();
+                    var matchSnapshots = await _predictionEnrichedMatchService.GetMatchSnapshotsAsync(matchId);
+                    var snapshots = matchSnapshots.OrderBy(s => s.Timestamp).ToList();
                     
                     // Need at least 2 snapshots (pre-match and final)
                     if (snapshots.Count < 2)
@@ -81,7 +78,7 @@ public class PredictionResultsService
                     var lastSnapshot = snapshots.Last();
                     
                     // Calculate prediction accuracy
-                    var predictionResult = CalculatePredictionResult(firstSnapshot, lastSnapshot);
+                    var predictionResult = CalculatePredictionResultWithTimelineSnapshots(snapshots);
                     if (predictionResult != null)
                     {
                         predictionResults.Add(predictionResult);
@@ -121,12 +118,19 @@ public class PredictionResultsService
     }
     
     /// <summary>
-    /// Calculates prediction accuracy for a match
+    /// Calculates prediction accuracy for a match with 9 timeline snapshots
     /// </summary>
-    private PredictionResult CalculatePredictionResult(MatchSnapshot firstSnapshot, MatchSnapshot lastSnapshot)
+    private PredictionResult CalculatePredictionResultWithTimelineSnapshots(List<MatchSnapshot> snapshots)
     {
         try
         {
+            if (!snapshots.Any())
+                return null;
+                
+            // Get first and last snapshots
+            var firstSnapshot = snapshots.First();
+            var lastSnapshot = snapshots.Last();
+            
             // Extract prediction data
             var predictionData = firstSnapshot.PredictionData;
             if (predictionData == null)
@@ -162,27 +166,8 @@ public class PredictionResultsService
             // Consider prediction accurate if within 1 goal of actual
             bool isGoalPredictionAccurate = Math.Abs(totalGoals - expectedGoals) <= 1;
             
-            // Get mid-game snapshot if available
-            MatchSnapshot midSnapshot = null;
-            var midTimePoint = 45; // Ideally halftime
-            
-            // Find a snapshot close to 45 minutes
-            var snapshots = _predictionEnrichedMatchService.GetMatchSnapshotsAsync(lastSnapshot.MatchId).Result
-                .OrderBy(s => s.Timestamp).ToList();
-                
-            if (snapshots.Count > 2)
-            {
-                midSnapshot = snapshots
-                    .Where(s => ParsePlayedTime(s.PlayedTime) >= 30 && ParsePlayedTime(s.PlayedTime) <= 60)
-                    .OrderBy(s => Math.Abs(ParsePlayedTime(s.PlayedTime) - midTimePoint))
-                    .FirstOrDefault();
-                    
-                // If no snapshot in desired range, take middle snapshot
-                if (midSnapshot == null)
-                {
-                    midSnapshot = snapshots[snapshots.Count / 2];
-                }
-            }
+            // Find 9 snapshots across the match timeline (0-10, 10-20, ..., 80-90)
+            var timelineSnapshots = GetTimelineSnapshots(snapshots);
             
             // Create the prediction result
             return new PredictionResult
@@ -199,18 +184,19 @@ public class PredictionResultsService
                 IsPredictionCorrect = isPredictionCorrect,
                 IsGoalPredictionAccurate = isGoalPredictionAccurate,
                 
-                // Include statistics if available
-                LiveStats = midSnapshot != null ? new LiveStats
+                // Include timeline statistics
+                TimelineStats = timelineSnapshots.Select(s => new LiveStats
                 {
-                    PlayedTime = midSnapshot.PlayedTime,
-                    Score = midSnapshot.Score,
-                    HomeDangerousAttacks = midSnapshot.MatchSituation?.Home?.TotalDangerousAttacks ?? 0,
-                    AwayDangerousAttacks = midSnapshot.MatchSituation?.Away?.TotalDangerousAttacks ?? 0,
-                    HomeShotsOnTarget = midSnapshot.MatchDetails?.Home?.ShotsOnTarget ?? 0,
-                    AwayShotsOnTarget = midSnapshot.MatchDetails?.Away?.ShotsOnTarget ?? 0,
-                    HomeCornerKicks = midSnapshot.MatchDetails?.Home?.CornerKicks ?? 0,
-                    AwayCornerKicks = midSnapshot.MatchDetails?.Away?.CornerKicks ?? 0
-                } : null,
+                    PlayedTime = s.PlayedTime,
+                    Score = s.Score,
+                    HomeDangerousAttacks = s.MatchSituation?.Home?.TotalDangerousAttacks ?? 0,
+                    AwayDangerousAttacks = s.MatchSituation?.Away?.TotalDangerousAttacks ?? 0,
+                    HomeShotsOnTarget = s.MatchDetails?.Home?.ShotsOnTarget ?? 0,
+                    AwayShotsOnTarget = s.MatchDetails?.Away?.ShotsOnTarget ?? 0,
+                    HomeCornerKicks = s.MatchDetails?.Home?.CornerKicks ?? 0,
+                    AwayCornerKicks = s.MatchDetails?.Away?.CornerKicks ?? 0,
+                    Timestamp = s.Timestamp
+                }).ToList(),
                 
                 FinalStats = new LiveStats
                 {
@@ -221,15 +207,86 @@ public class PredictionResultsService
                     HomeShotsOnTarget = lastSnapshot.MatchDetails?.Home?.ShotsOnTarget ?? 0,
                     AwayShotsOnTarget = lastSnapshot.MatchDetails?.Away?.ShotsOnTarget ?? 0,
                     HomeCornerKicks = lastSnapshot.MatchDetails?.Home?.CornerKicks ?? 0,
-                    AwayCornerKicks = lastSnapshot.MatchDetails?.Away?.CornerKicks ?? 0
+                    AwayCornerKicks = lastSnapshot.MatchDetails?.Away?.CornerKicks ?? 0,
+                    Timestamp = lastSnapshot.Timestamp
                 }
             };
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, $"Error calculating prediction result for match {lastSnapshot.MatchId}");
+            _logger.LogError(ex, $"Error calculating prediction result with timeline snapshots for match {snapshots.FirstOrDefault()?.MatchId}");
             return null;
         }
+    }
+    
+    /// <summary>
+    /// Gets 9 snapshots across the match timeline (0-10, 10-20, ..., 80-90)
+    /// </summary>
+    private List<MatchSnapshot> GetTimelineSnapshots(List<MatchSnapshot> allSnapshots)
+    {
+        var result = new List<MatchSnapshot>();
+        
+        // Define 9 time ranges (0-10, 10-20, ..., 80-90)
+        var timeRanges = new List<(int Start, int End)>
+        {
+            (0, 10),
+            (10, 20),
+            (20, 30),
+            (30, 40),
+            (40, 50), // Includes halftime
+            (50, 60),
+            (60, 70),
+            (70, 80),
+            (80, 90)  // Plus any added time
+        };
+        
+        // Find best snapshot for each time range
+        foreach (var (start, end) in timeRanges)
+        {
+            // First try to find snapshots within this exact range
+            var rangeSnapshots = allSnapshots
+                .Where(s => {
+                    var minutes = ParsePlayedTime(s.PlayedTime);
+                    return minutes >= start && minutes < end;
+                })
+                .ToList();
+                
+            // If we have snapshots in this range, pick the one closest to the middle of the range
+            if (rangeSnapshots.Any())
+            {
+                var middleTime = start + (end - start) / 2;
+                var bestSnapshot = rangeSnapshots
+                    .OrderBy(s => Math.Abs(ParsePlayedTime(s.PlayedTime) - middleTime))
+                    .First();
+                    
+                result.Add(bestSnapshot);
+            }
+            else
+            {
+                // If no snapshots in this exact range, find closest one
+                var middleTime = start + (end - start) / 2;
+                var bestSnapshot = allSnapshots
+                    .OrderBy(s => Math.Abs(ParsePlayedTime(s.PlayedTime) - middleTime))
+                    .First();
+                    
+                result.Add(bestSnapshot);
+            }
+        }
+        
+        // Ensure we have exactly 9 snapshots
+        while (result.Count < 9)
+        {
+            // If we don't have enough snapshots, duplicate the last one
+            result.Add(result.LastOrDefault() ?? allSnapshots.LastOrDefault());
+        }
+        
+        // If we somehow got more than 9, trim the excess
+        if (result.Count > 9)
+        {
+            result = result.Take(9).ToList();
+        }
+        
+        return result;
     }
     
     /// <summary>
@@ -348,7 +405,8 @@ public class PredictionResult
     
     public bool IsGoalPredictionAccurate { get; set; }
     
-    public LiveStats LiveStats { get; set; }
+    // Timeline snapshots (9 points throughout the match)
+    public List<LiveStats> TimelineStats { get; set; } = new List<LiveStats>();
     
     public LiveStats FinalStats { get; set; }
 }
@@ -373,6 +431,9 @@ public class LiveStats
     public int HomeCornerKicks { get; set; }
     
     public int AwayCornerKicks { get; set; }
+    
+    // Added timestamp for better timeline visualization
+    public DateTime Timestamp { get; set; }
 }
 
 /// <summary>
