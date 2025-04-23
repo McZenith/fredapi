@@ -153,7 +153,7 @@ sportRadarGroup.MapMatchesEndpoints();
 sportRadarGroup.MapMatchOddsEndpoint();
 sportRadarGroup.MapMatchDetailsEndpoint();
 sportRadarGroup.MapArbitrageRoutes();
-sportRadarGroup.MapGroup("/matchdata").MapLiveMatchDataRoutes();
-sportRadarGroup.MapGroup("/predictionresults").MapPredictionResultsRoutes();
+sportRadarGroup.MapLiveMatchDataRoutes();
+sportRadarGroup.MapPredictionResultsRoutes();
 
 app.Run();

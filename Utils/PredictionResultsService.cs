@@ -57,8 +57,8 @@ public class PredictionResultsService
             
             // Filter snapshots to find completed matches
             var completedMatchGroups = allSnapshots
-                .Where(s => s.MatchStatus.Contains("finish", StringComparison.OrdinalIgnoreCase) || 
-                           s.MatchStatus.Contains("ended", StringComparison.OrdinalIgnoreCase))
+                .Where(s => s.PlayedTime.Contains("90:", StringComparison.OrdinalIgnoreCase) || 
+                           s.MatchStatus.Contains("Ended", StringComparison.OrdinalIgnoreCase))
                 .GroupBy(s => s.MatchId)
                 .ToList();
                 
