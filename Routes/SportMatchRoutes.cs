@@ -341,7 +341,7 @@ public class MongoEnrichedMatch
             SeasonId = this.SeasonId,
             OriginalMatch = this.OriginalMatch,
             MatchTime = this.MatchTime.ToLocalTime(),
-            Markets = this.Markets,
+            Markets = this.OriginalMatch.Markets,
             Team1LastX = this.Team1LastX,
             Team2LastX = this.Team2LastX,
             TeamVersusRecent = this.TeamVersusRecent,
