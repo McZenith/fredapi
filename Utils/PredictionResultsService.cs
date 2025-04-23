@@ -70,12 +70,8 @@ public class PredictionResultsService
                     var snapshots = matchSnapshots.OrderBy(s => s.Timestamp).ToList();
                     
                     // Need at least 2 snapshots (pre-match and final)
-                    if (snapshots.Count < 2)
+                    if (snapshots.Count < 9)
                         continue;
-                        
-                    // Get first (pre-match) and last (final) snapshots
-                    var firstSnapshot = snapshots.First();
-                    var lastSnapshot = snapshots.Last();
                     
                     // Calculate prediction accuracy
                     var predictionResult = CalculatePredictionResultWithTimelineSnapshots(snapshots);
