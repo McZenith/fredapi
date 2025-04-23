@@ -12,6 +12,9 @@ public static class ServicesRegistration
     {
         services.AddHttpClient<SportRadarService.SportRadarService>();
         services.AddScoped<SportMatchesPredictionTransformer>();
+        services.AddSingleton<PredictionResultsService>();
+        services.AddSingleton<PredictionEnrichedMatchService>();
+
 
         services.AddScoped<ISportRadarTokenService, SportRadarTokenService>();
         //services.AddScoped<IRedisService, RedisService>();

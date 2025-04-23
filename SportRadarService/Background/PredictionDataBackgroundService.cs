@@ -4,6 +4,7 @@ using fredapi.Routes;
 using fredapi.SignalR;
 using fredapi.SportRadarService.TokenService;
 using fredapi.SportRadarService.Transformers;
+using fredapi.Utils;
 using Microsoft.AspNetCore.SignalR;
 using MongoDB.Bson;
 using MongoDB.Driver;
@@ -16,6 +17,8 @@ public class PredictionDataBackgroundService : BackgroundService
     private readonly ILogger<PredictionDataBackgroundService> _logger;
     private readonly IServiceProvider _serviceProvider;
     private readonly IMemoryCache _cache;
+    private readonly PredictionResultsService _predictionResultsService;
+
     
     // Constants for better management
     private const string CACHE_KEY_PREDICTION_DATA = "prediction_data";
@@ -35,12 +38,15 @@ public class PredictionDataBackgroundService : BackgroundService
     public PredictionDataBackgroundService(
         ILogger<PredictionDataBackgroundService> logger,
         IServiceProvider serviceProvider,
-        IMemoryCache cache)
+        IMemoryCache cache,
+        PredictionResultsService predictionResultsService) // Add this parameter
     {
         _logger = logger;
         _serviceProvider = serviceProvider;
         _cache = cache;
+        _predictionResultsService = predictionResultsService; // Initialize the field
     }
+
     
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
@@ -48,7 +54,11 @@ public class PredictionDataBackgroundService : BackgroundService
         {
             try
             {
+                // Update prediction data (existing functionality)
                 await UpdatePredictionDataAsync(stoppingToken);
+            
+                // New: Process prediction results for completed matches
+                await ProcessPredictionResultsAsync(stoppingToken);
             }
             catch (Exception ex)
             {
@@ -67,6 +77,22 @@ public class PredictionDataBackgroundService : BackgroundService
             }
         }
     }
+    
+    private async Task ProcessPredictionResultsAsync(CancellationToken stoppingToken)
+    {
+        try
+        {
+            _logger.LogInformation("Processing prediction results for completed matches");
+        
+            // Process completed matches from the last 24 hours
+            await _predictionResultsService.ProcessCompletedMatchesAsync(stoppingToken);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error processing prediction results");
+        }
+    }
+
     
     private async Task UpdatePredictionDataAsync(CancellationToken stoppingToken)
     {

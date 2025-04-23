@@ -6,6 +6,7 @@ using System.Net.Http.Headers;
 using fredapi.SignalR;
 using fredapi.Utils;
 using fredapi.Model.MatchSituationStats;
+using fredapi.SportRadarService.Transformers;
 using Microsoft.AspNetCore.Http.HttpResults;
 using Microsoft.AspNetCore.SignalR;
 using Microsoft.Extensions.Caching.Memory;
@@ -20,6 +21,8 @@ public partial class ArbitrageLiveMatchBackgroundService : BackgroundService
     private readonly MarketValidator _marketValidator;
     private readonly IServiceProvider _serviceProvider;
     private readonly IMemoryCache _cache;
+    private readonly PredictionEnrichedMatchService _predictionEnrichedMatchService;
+
 
     // Thread-safe collections for concurrent access
     private static readonly ConcurrentBag<ClientMatch> _lastSentArbitrageMatches = new();
@@ -65,6 +68,8 @@ public partial class ArbitrageLiveMatchBackgroundService : BackgroundService
         _marketValidator = new MarketValidator(logger);
         _serviceProvider = serviceProvider;
         _cache = cache;
+
+        _predictionEnrichedMatchService = serviceProvider.GetRequiredService<PredictionEnrichedMatchService>();
 
         // Configure HttpClient with optimized settings
         _httpClient = new HttpClient(_httpClientHandler)
@@ -132,94 +137,75 @@ public partial class ArbitrageLiveMatchBackgroundService : BackgroundService
     }
 
     private async Task StreamMatchesToClientsAsync(List<Match> arbitrageMatches, List<Event> allEvents,
-        List<Match> allMatchesFromEvents, CancellationToken stoppingToken = default)
+    List<Match> allMatchesFromEvents, CancellationToken stoppingToken = default)
+{
+    if (!arbitrageMatches.Any() && !allMatchesFromEvents.Any()) return;
+
+    try
     {
-        if (!arbitrageMatches.Any() && !allMatchesFromEvents.Any()) return;
+        _logger.LogInformation($"Processing {allMatchesFromEvents.Count} matches for enrichment");
 
-        try
+        // Create batches of matches for parallel processing
+        var batches = allMatchesFromEvents.Chunk(5).ToList();
+        var batchTasks = new List<Task>();
+
+        // Process batches in parallel with delay between batch starts
+        foreach (var batch in batches)
         {
-            _logger.LogInformation($"Processing {allMatchesFromEvents.Count} matches for enrichment");
-
-            // Create batches of matches for parallel processing
-            var batches = allMatchesFromEvents.Chunk(5).ToList();
-            var batchTasks = new List<Task>();
-
-            // Process batches in parallel with delay between batch starts
-// In the StreamMatchesToClientsAsync method, use this version of Task.Run:
-            foreach (var batch in batches)
+            var batchTask = Task.Run(async () =>
             {
-                var batchTask = Task.Run(async () =>
+                foreach (var match in batch)
                 {
-                    foreach (var match in batch)
+                    if (stoppingToken.IsCancellationRequested) break;
+
+                    try
                     {
-                        if (stoppingToken.IsCancellationRequested) break;
-
-                        try
-                        {
-                            await FetchMatchDataAsync(match);
-                            await AddHumanLikeDelay(100, 200);
-                        }
-                        catch (Exception ex)
-                        {
-                            _logger.LogWarning(ex, "Error fetching data for match {MatchId}", match.Id);
-                            await AddHumanLikeDelay(300, 500);
-                        }
+                        await FetchMatchDataAsync(match);
+                        await AddHumanLikeDelay(100, 200);
                     }
-                }, stoppingToken);
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning(ex, "Error fetching data for match {MatchId}", match.Id);
+                        await AddHumanLikeDelay(300, 500);
+                    }
+                }
+            }, stoppingToken);
 
-                batchTasks.Add(batchTask);
-                await Task.Delay(150, stoppingToken);
-            }
-
-            // Wait for all batches to complete
-            await Task.WhenAll(batchTasks);
-
-            // Create client matches with enriched data for all matches (1X2 markets only)
-            var clientAllMatches = allMatchesFromEvents.Select(match =>
-            {
-                var clientMatch = CreateClientMatch(match);
-                // Ensure only 1X2 markets are included
-                clientMatch.Markets = clientMatch.Markets
-                    .Where(m => m.Description?.ToLower() == "match result" || m.Description?.ToLower() == "1x2")
-                    .ToList();
-                return clientMatch;
-            }).ToList();
-
-            // Update the static collection
-            UpdateStaticCollection(_lastSentAllMatches, clientAllMatches);
-
-            // Cache for new connections
-            _cache.Set(CACHE_KEY_ALL_MATCHES, clientAllMatches, TimeSpan.FromMinutes(5));
-
-            // Create client matches with enriched data for arbitrage matches
-            var clientArbitrageMatches = arbitrageMatches.Select(match =>
-            {
-                var clientMatch = CreateClientMatch(match);
-                return clientMatch;
-            }).Where(m => m.Markets.Any()).ToList();
-
-            // Update the static collection
-            UpdateStaticCollection(_lastSentArbitrageMatches, clientArbitrageMatches);
-
-            // Cache for new connections
-            _cache.Set(CACHE_KEY_ARBITRAGE_MATCHES, clientArbitrageMatches, TimeSpan.FromMinutes(5));
-
-            // Send both messages with enriched data
-            await _hubContext.Clients.All.SendAsync("ReceiveArbitrageLiveMatches", clientArbitrageMatches,
-                cancellationToken: stoppingToken);
-            await _hubContext.Clients.All.SendAsync("ReceiveAllLiveMatches", clientAllMatches,
-                cancellationToken: stoppingToken);
-
-            _logger.LogInformation(
-                "Streamed {ArbitrageMatchCount} arbitrage matches and {AllMatchCount} total matches with enriched data",
-                clientArbitrageMatches.Count,
-                clientAllMatches.Count);
+            batchTasks.Add(batchTask);
+            await Task.Delay(150, stoppingToken);
         }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Error streaming matches to clients");
-        }
+
+        // Wait for all batches to complete
+        await Task.WhenAll(batchTasks);
+
+        // NEW: Enrich matches with prediction data before sending to clients
+        var (enrichedArbitrageMatches, enrichedAllMatches) = await _predictionEnrichedMatchService
+            .EnrichMatchesWithPredictionDataAsync(arbitrageMatches, allMatchesFromEvents);
+
+        // Send both messages with enriched data
+        await _hubContext.Clients.All.SendAsync("ReceiveArbitrageLiveMatches", enrichedArbitrageMatches,
+            cancellationToken: stoppingToken);
+        await _hubContext.Clients.All.SendAsync("ReceiveAllLiveMatches", enrichedAllMatches,
+            cancellationToken: stoppingToken);
+
+        // Update the static collections with enriched data
+        UpdateStaticCollection(_lastSentArbitrageMatches, enrichedArbitrageMatches);
+        UpdateStaticCollection(_lastSentAllMatches, enrichedAllMatches);
+
+        // Cache for new connections
+        _cache.Set(CACHE_KEY_ARBITRAGE_MATCHES, enrichedArbitrageMatches, TimeSpan.FromMinutes(5));
+        _cache.Set(CACHE_KEY_ALL_MATCHES, enrichedAllMatches, TimeSpan.FromMinutes(5));
+
+        _logger.LogInformation(
+            "Streamed {ArbitrageMatchCount} arbitrage matches and {AllMatchCount} total matches with enriched data",
+            enrichedArbitrageMatches.Count,
+            enrichedAllMatches.Count);
     }
+    catch (Exception ex)
+    {
+        _logger.LogError(ex, "Error streaming matches to clients");
+    }
+}
 
     // Add this method for updating static collections
     private void UpdateStaticCollection<T>(ConcurrentBag<T> bag, List<T> newItems)
@@ -1102,6 +1088,7 @@ public class ClientMatch
     public DateTime LastUpdated { get; set; }
     public ClientMatchSituation MatchSituation { get; set; }
     public ClientMatchDetailsExtended MatchDetails { get; set; }
+    public ClientMatchPredictionData PredictionData { get; set; }
 }
 
 public class ClientTeams
