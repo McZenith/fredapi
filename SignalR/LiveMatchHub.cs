@@ -2,10 +2,12 @@ using fredapi.Model;
 using Microsoft.AspNetCore.SignalR;
 using Microsoft.Extensions.Caching.Memory;
 using fredapi.SportRadarService.Background.ArbitrageLiveMatchBackgroundService;
+using fredapi.SportRadarService.Background;
 using System.Threading.Tasks;
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using fredapi.Utils;
 
 namespace fredapi.SignalR;
 
@@ -16,6 +18,7 @@ public class LiveMatchHub : Hub
     private static readonly string _arbitrageMatchesCacheKey = "arbitrage_matches_cache";
     private static readonly string _allMatchesCacheKey = "all_matches_cache";
     private static readonly string _predictionDataCacheKey = "prediction_data";
+    private static readonly string _predictionResultsCacheKey = "prediction_results";
     
     // Keep track of connected clients for potential targeted updates
     private static readonly HashSet<string> _connectedClients = new HashSet<string>();
@@ -43,7 +46,7 @@ public class LiveMatchHub : Hub
             var tasks = new List<Task>();
 
             // Use cached data from memory cache instead of static service
-            if (_cache.TryGetValue(_arbitrageMatchesCacheKey, out List<EnrichedMatch> arbitrageMatches) && 
+            if (_cache.TryGetValue(_arbitrageMatchesCacheKey, out List<ClientMatch> arbitrageMatches) && 
                 arbitrageMatches?.Any() == true)
             {
                 tasks.Add(Clients.Caller.SendAsync("ReceiveArbitrageLiveMatches", arbitrageMatches));
@@ -62,7 +65,7 @@ public class LiveMatchHub : Hub
             }
 
             // Same for all matches
-            if (_cache.TryGetValue(_allMatchesCacheKey, out List<EnrichedMatch> allMatches) && 
+            if (_cache.TryGetValue(_allMatchesCacheKey, out List<ClientMatch> allMatches) && 
                 allMatches?.Any() == true)
             {
                 tasks.Add(Clients.Caller.SendAsync("ReceiveAllLiveMatches", allMatches));
@@ -82,6 +85,12 @@ public class LiveMatchHub : Hub
             if (_cache.TryGetValue(_predictionDataCacheKey, out var predictionData))
             {
                 tasks.Add(Clients.Caller.SendAsync("ReceivePredictionData", predictionData));
+            }
+            
+            // NEW: Send prediction results if available
+            if (_cache.TryGetValue(_predictionResultsCacheKey, out PredictionResultsResponse predictionResults))
+            {
+                tasks.Add(Clients.Caller.SendAsync("ReceivePredictionResults", predictionResults));
             }
 
             // Wait for all data to be sent concurrently
@@ -122,7 +131,7 @@ public class LiveMatchHub : Hub
         }
     }
 
-    public async Task SendMatches(List<EnrichedMatch> matches)
+    public async Task SendMatches(List<ClientMatch> matches)
     {
         if (matches?.Any() != true)
         {
@@ -166,6 +175,29 @@ public class LiveMatchHub : Hub
         {
             _logger.LogError(ex, "Error sending prediction data to client {ConnectionId}", Context.ConnectionId);
             await Clients.Caller.SendAsync("Error", "Failed to send prediction data");
+        }
+    }
+    
+    // NEW: Add method to request prediction results
+    public async Task RequestPredictionResults()
+    {
+        try
+        {
+            if (_cache.TryGetValue(_predictionResultsCacheKey, out PredictionResultsResponse predictionResults))
+            {
+                await Clients.Caller.SendAsync("ReceivePredictionResults", predictionResults);
+                _logger.LogDebug("Sent prediction results to client {ConnectionId}", Context.ConnectionId);
+            }
+            else
+            {
+                await Clients.Caller.SendAsync("Error", "Prediction results not available");
+                _logger.LogWarning("Prediction results requested but not available for client {ConnectionId}", Context.ConnectionId);
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error sending prediction results to client {ConnectionId}", Context.ConnectionId);
+            await Clients.Caller.SendAsync("Error", "Failed to send prediction results");
         }
     }
 
