@@ -1,10 +1,10 @@
 using fredapi.Database;
 using fredapi.Routes;
 using fredapi.SignalR;
-using fredapi.SportRadarService.Background;
 using fredapi.Utils;
 using Microsoft.AspNetCore.Http.Connections;
 using Microsoft.AspNetCore.ResponseCompression;
+using MessagePack;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -49,18 +49,23 @@ builder.Services.AddCors(options =>
 // Add Memory Cache
 builder.Services.AddMemoryCache();
 
-// SignalR configuration with MessagePack
+// SignalR configuration with MessagePack - optimized
 builder.Services.AddSignalR(options =>
 {
     options.EnableDetailedErrors = true;
-    options.KeepAliveInterval = TimeSpan.FromSeconds(15);
-    options.ClientTimeoutInterval = TimeSpan.FromSeconds(30);
-    options.HandshakeTimeout = TimeSpan.FromSeconds(15);
-    options.MaximumReceiveMessageSize = 102400;
-    options.StreamBufferCapacity = 10;
-    options.MaximumParallelInvocationsPerClient = 2;
-}).AddMessagePackProtocol();
-
+    options.KeepAliveInterval = TimeSpan.FromSeconds(10);       // Reduced from 15 to detect disconnections faster
+    options.ClientTimeoutInterval = TimeSpan.FromSeconds(30);    // Good value
+    options.HandshakeTimeout = TimeSpan.FromSeconds(15);         // Good value
+    options.MaximumReceiveMessageSize = 102400;                  // 100KB - reasonable
+    options.StreamBufferCapacity = 10;                           // Good value
+    options.MaximumParallelInvocationsPerClient = 4;             // Increased from 2 for more parallel operations
+})
+.AddMessagePackProtocol(options => {
+    // Add MessagePack optimizations - smaller payloads, faster serialization
+    options.SerializerOptions = MessagePackSerializerOptions
+        .Standard.WithCompression(MessagePackCompression.Lz4BlockArray)
+        .WithSecurity(MessagePackSecurity.UntrustedData);
+});
 
 // MongoDB configuration
 builder.Services.Configure<MongoDbSettings>(
@@ -108,19 +113,27 @@ app.UseRouting();
 app.UseCors(); // After UseRouting
 app.UseWebSockets();
 
-// SignalR endpoint
+// SignalR endpoint with optimized settings
 app.MapHub<LiveMatchHub>("/livematchhub", options =>
 {
     options.Transports = 
         HttpTransportType.WebSockets | 
         HttpTransportType.ServerSentEvents | 
         HttpTransportType.LongPolling;
-    options.WebSockets.CloseTimeout = TimeSpan.FromSeconds(5);
-    options.LongPolling.PollTimeout = TimeSpan.FromSeconds(90);
-    options.ApplicationMaxBufferSize = 100 * 1024; // 100KB
-    options.TransportMaxBufferSize = 100 * 1024;
+    options.WebSockets.CloseTimeout = TimeSpan.FromSeconds(10);  // Increased from 5 for more graceful closures
+    options.LongPolling.PollTimeout = TimeSpan.FromSeconds(60);  // Reduced from 90 to avoid server resource strain
+    options.ApplicationMaxBufferSize = 100 * 1024;               // Good value
+    options.TransportMaxBufferSize = 100 * 1024;                 // Good value
 });
 
+// Monitoring endpoint for SignalR connections
+app.MapGet("/admin/signalr-stats", () =>
+{
+    return Results.Ok(new { 
+        ConnectedClients = LiveMatchHub.GetConnectedClientCount(),
+        Time = DateTime.UtcNow 
+    });
+});
 
 // Health check endpoint
 app.MapGet("/health/database", async (MongoDbService mongoService) =>

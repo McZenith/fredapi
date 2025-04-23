@@ -11,11 +11,12 @@ public static class ServicesRegistration
     public static IServiceCollection AddSportRadarService(this IServiceCollection services)
     {
         services.AddHttpClient<SportRadarService.SportRadarService>();
+        services.AddScoped<SportMatchesPredictionTransformer>();
+
         services.AddScoped<ISportRadarTokenService, SportRadarTokenService>();
         //services.AddScoped<IRedisService, RedisService>();
         //services.AddSingleton<ISubscriberTracker, SubscriberTracker>();
         services.AddScoped<ITokenService, TokenService>();
-        services.AddHostedService<ApiPollingService>();
         //services.AddHostedService<UpcomingMatchBackgroundService>();
         //services.AddHostedService<EnrichedStatsBackgroundService>();
         //services.AddHostedService<LiveMatchBackgroundService>();
@@ -24,10 +25,7 @@ public static class ServicesRegistration
         services.AddHostedService<UpcomingMatchEnrichmentService>();
         services.AddHostedService<PredictionDataBackgroundService>();
         services.AddSingleton<MongoDbService>();
-
-        // Add SportMatchesPredictionTransformer
-        services.AddScoped<SportMatchesPredictionTransformer>();
-
+        
         return services;
     }
 }

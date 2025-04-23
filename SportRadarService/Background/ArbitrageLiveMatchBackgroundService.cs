@@ -1,10 +1,14 @@
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using System.Collections.Concurrent;
+using System.Net;
+using System.Net.Http.Headers;
 using fredapi.SignalR;
 using fredapi.Utils;
 using fredapi.Model.MatchSituationStats;
 using Microsoft.AspNetCore.Http.HttpResults;
 using Microsoft.AspNetCore.SignalR;
+using Microsoft.Extensions.Caching.Memory;
 
 namespace fredapi.SportRadarService.Background.ArbitrageLiveMatchBackgroundService;
 
@@ -15,28 +19,62 @@ public partial class ArbitrageLiveMatchBackgroundService : BackgroundService
     private readonly HttpClient _httpClient;
     private readonly MarketValidator _marketValidator;
     private readonly IServiceProvider _serviceProvider;
+    private readonly IMemoryCache _cache;
 
-    // Static properties to store the last messages sent to clients
-    private static List<ClientMatch> _lastSentArbitrageMatches = new List<ClientMatch>();
-    private static List<ClientMatch> _lastSentAllMatches = new List<ClientMatch>();
+    // Thread-safe collections for concurrent access
+    private static readonly ConcurrentBag<ClientMatch> _lastSentArbitrageMatches = new();
+    private static readonly ConcurrentBag<ClientMatch> _lastSentAllMatches = new();
 
-    private const int DelayMinutes = 1;
+    // Semaphore to limit concurrent API calls
+    private static readonly SemaphoreSlim _apiSemaphore = new(3); // Max 3 concurrent API calls
+
+    // Cache keys for consistent caching
+    private const string CACHE_KEY_ARBITRAGE_MATCHES = "arbitrage_matches_cache";
+    private const string CACHE_KEY_ALL_MATCHES = "all_matches_cache";
+    private const string CACHE_KEY_MATCH_PREFIX = "match_data_";
+    private const string CACHE_KEY_EVENT_PREFIX = "event_";
+
+    private const int DelaySeconds = 60; // Changed from minutes to seconds for clarity
     private const decimal MaxAcceptableMargin = 10.0m;
     private const decimal MinProfitThreshold = 0.05m;
+
+    // Static HttpClientHandler for connection pooling
+    private static readonly HttpClientHandler _httpClientHandler = new()
+    {
+        MaxConnectionsPerServer = 20,
+        AutomaticDecompression = DecompressionMethods.GZip | DecompressionMethods.Deflate
+    };
+
+    // JSON options for faster deserialization
+    private static readonly JsonSerializerOptions _jsonOptions = new()
+    {
+        PropertyNameCaseInsensitive = true,
+        DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
+        AllowTrailingCommas = true,
+        ReadCommentHandling = JsonCommentHandling.Skip
+    };
 
     public ArbitrageLiveMatchBackgroundService(
         ILogger<ArbitrageLiveMatchBackgroundService> logger,
         IHubContext<LiveMatchHub> hubContext,
-        IServiceProvider serviceProvider)
+        IServiceProvider serviceProvider,
+        IMemoryCache cache)
     {
         _logger = logger;
         _hubContext = hubContext;
         _marketValidator = new MarketValidator(logger);
         _serviceProvider = serviceProvider;
-        _httpClient = new HttpClient
+        _cache = cache;
+
+        // Configure HttpClient with optimized settings
+        _httpClient = new HttpClient(_httpClientHandler)
         {
             Timeout = TimeSpan.FromSeconds(15)
         };
+
+        _httpClient.DefaultRequestHeaders.AcceptEncoding.Add(new StringWithQualityHeaderValue("gzip"));
+        _httpClient.DefaultRequestHeaders.AcceptEncoding.Add(new StringWithQualityHeaderValue("deflate"));
+        _httpClient.DefaultRequestHeaders.UserAgent.Add(new ProductInfoHeaderValue("SportApp", "1.0"));
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -55,7 +93,7 @@ public partial class ArbitrageLiveMatchBackgroundService : BackgroundService
             {
                 try
                 {
-                    await Task.Delay(TimeSpan.FromSeconds(DelayMinutes), stoppingToken);
+                    await Task.Delay(TimeSpan.FromSeconds(DelaySeconds), stoppingToken);
                 }
                 catch (OperationCanceledException)
                 {
@@ -69,7 +107,7 @@ public partial class ArbitrageLiveMatchBackgroundService : BackgroundService
     {
         try
         {
-            var apiResponse = await FetchLiveMatchesAsync(stoppingToken);
+            var apiResponse = await FetchLiveMatchesWithRetryAsync(stoppingToken);
             if (apiResponse?.Data == null)
             {
                 _logger.LogWarning("No data received from API");
@@ -79,10 +117,13 @@ public partial class ArbitrageLiveMatchBackgroundService : BackgroundService
             var flattenedEvents = FlattenEvents(apiResponse);
             _logger.LogInformation($"Processing {flattenedEvents.Count} matches");
 
-            var matchEvents = ProcessEvents(flattenedEvents);
-            LogMatchStatistics(matchEvents, flattenedEvents.Count);
+            // Process in parallel for better performance 
+            var arbitrageMatches = await Task.Run(() => ProcessEvents(flattenedEvents), stoppingToken);
+            var allMatches = await Task.Run(() => ProcessAllEvents(flattenedEvents), stoppingToken);
 
-            await StreamMatchesToClientsAsync(matchEvents, flattenedEvents);
+            LogMatchStatistics(arbitrageMatches, flattenedEvents.Count);
+
+            await StreamMatchesToClientsAsync(arbitrageMatches, flattenedEvents, allMatches, stoppingToken);
         }
         catch (Exception ex)
         {
@@ -90,15 +131,390 @@ public partial class ArbitrageLiveMatchBackgroundService : BackgroundService
         }
     }
 
-    private async Task<ApiResponse> FetchLiveMatchesAsync(CancellationToken stoppingToken)
+    private async Task StreamMatchesToClientsAsync(List<Match> arbitrageMatches, List<Event> allEvents,
+        List<Match> allMatchesFromEvents, CancellationToken stoppingToken = default)
     {
-        var response = await _httpClient.GetAsync(
-            "https://www.sportybet.com/api/ng/factsCenter/liveOrPrematchEvents?sportId=sr%3Asport%3A1&_t=1736116770164",
-            stoppingToken);
-        response.EnsureSuccessStatusCode();
+        if (!arbitrageMatches.Any() && !allMatchesFromEvents.Any()) return;
 
-        var jsonString = await response.Content.ReadAsStringAsync(stoppingToken);
-        return JsonSerializer.Deserialize<ApiResponse>(jsonString);
+        try
+        {
+            _logger.LogInformation($"Processing {allMatchesFromEvents.Count} matches for enrichment");
+
+            // Create batches of matches for parallel processing
+            var batches = allMatchesFromEvents.Chunk(5).ToList();
+            var batchTasks = new List<Task>();
+
+            // Process batches in parallel with delay between batch starts
+// In the StreamMatchesToClientsAsync method, use this version of Task.Run:
+            foreach (var batch in batches)
+            {
+                var batchTask = Task.Run(async () =>
+                {
+                    foreach (var match in batch)
+                    {
+                        if (stoppingToken.IsCancellationRequested) break;
+
+                        try
+                        {
+                            await FetchMatchDataAsync(match);
+                            await AddHumanLikeDelay(100, 200);
+                        }
+                        catch (Exception ex)
+                        {
+                            _logger.LogWarning(ex, "Error fetching data for match {MatchId}", match.Id);
+                            await AddHumanLikeDelay(300, 500);
+                        }
+                    }
+                }, stoppingToken);
+
+                batchTasks.Add(batchTask);
+                await Task.Delay(150, stoppingToken);
+            }
+
+            // Wait for all batches to complete
+            await Task.WhenAll(batchTasks);
+
+            // Create client matches with enriched data for all matches (1X2 markets only)
+            var clientAllMatches = allMatchesFromEvents.Select(match =>
+            {
+                var clientMatch = CreateClientMatch(match);
+                // Ensure only 1X2 markets are included
+                clientMatch.Markets = clientMatch.Markets
+                    .Where(m => m.Description?.ToLower() == "match result" || m.Description?.ToLower() == "1x2")
+                    .ToList();
+                return clientMatch;
+            }).ToList();
+
+            // Update the static collection
+            UpdateStaticCollection(_lastSentAllMatches, clientAllMatches);
+
+            // Cache for new connections
+            _cache.Set(CACHE_KEY_ALL_MATCHES, clientAllMatches, TimeSpan.FromMinutes(5));
+
+            // Create client matches with enriched data for arbitrage matches
+            var clientArbitrageMatches = arbitrageMatches.Select(match =>
+            {
+                var clientMatch = CreateClientMatch(match);
+                return clientMatch;
+            }).Where(m => m.Markets.Any()).ToList();
+
+            // Update the static collection
+            UpdateStaticCollection(_lastSentArbitrageMatches, clientArbitrageMatches);
+
+            // Cache for new connections
+            _cache.Set(CACHE_KEY_ARBITRAGE_MATCHES, clientArbitrageMatches, TimeSpan.FromMinutes(5));
+
+            // Send both messages with enriched data
+            await _hubContext.Clients.All.SendAsync("ReceiveArbitrageLiveMatches", clientArbitrageMatches,
+                cancellationToken: stoppingToken);
+            await _hubContext.Clients.All.SendAsync("ReceiveAllLiveMatches", clientAllMatches,
+                cancellationToken: stoppingToken);
+
+            _logger.LogInformation(
+                "Streamed {ArbitrageMatchCount} arbitrage matches and {AllMatchCount} total matches with enriched data",
+                clientArbitrageMatches.Count,
+                clientAllMatches.Count);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error streaming matches to clients");
+        }
+    }
+
+    // Add this method for updating static collections
+    private void UpdateStaticCollection<T>(ConcurrentBag<T> bag, List<T> newItems)
+    {
+        // Empty the bag first
+        while (bag.TryTake(out _))
+        {
+        }
+
+        // Add new items
+        foreach (var item in newItems)
+        {
+            bag.Add(item);
+        }
+    }
+
+    
+    private void ProcessMatchSituation(Match match, JsonDocument document)
+{
+    try
+    {
+        var rawJson = document.RootElement.GetRawText();
+        
+        if (rawJson.Contains("\"event\":\"exception\""))
+        {
+            _logger.LogWarning("Received exception response for match {MatchId} in situation data", match.Id);
+            return;
+        }
+        
+        var response = JsonSerializer.Deserialize<fredapi.Model.Live.StatsMatchSituationResponse>(rawJson, _jsonOptions);
+
+        if (response?.Doc?.FirstOrDefault()?.Data != null)
+        {
+            var data = response.Doc[0].Data;
+            if (data.Data == null || !data.Data.Any())
+            {
+                _logger.LogWarning("No match situation data found for match {MatchId}", data.MatchId);
+                return;
+            }
+
+            var validData = data.Data.Where(d => d != null && d.Home != null && d.Away != null).ToList();
+            if (!validData.Any())
+            {
+                _logger.LogWarning("No valid match situation data entries found for match {MatchId}", data.MatchId);
+                return;
+            }
+
+            var situationData = new MatchSituationStats
+            {
+                MatchId = data.MatchId,
+                Data = validData.Select(d => new TimeSliceStats
+                {
+                    Time = d.Time,
+                    InjuryTime = d.InjuryTime,
+                    Home = new fredapi.Model.MatchSituationStats.TeamStats
+                    {
+                        Attack = (int)Math.Round((decimal)d.Home.Attack, 0),
+                        Dangerous = (int)Math.Round((decimal)d.Home.Dangerous, 0),
+                        Safe = (int)Math.Round((decimal)d.Home.Safe, 0),
+                        AttackCount = d.Home.AttackCount,
+                        DangerousCount = d.Home.DangerousCount,
+                        SafeCount = d.Home.SafeCount
+                    },
+                    Away = new fredapi.Model.MatchSituationStats.TeamStats
+                    {
+                        Attack = (int)Math.Round((decimal)d.Away.Attack, 0),
+                        Dangerous = (int)Math.Round((decimal)d.Away.Dangerous, 0),
+                        Safe = (int)Math.Round((decimal)d.Away.Safe, 0),
+                        AttackCount = d.Away.AttackCount,
+                        DangerousCount = d.Away.DangerousCount,
+                        SafeCount = d.Away.SafeCount
+                    }
+                }).ToList()
+            };
+
+            var analyzedStats = MatchSituationAnalyzer.AnalyzeMatchSituation(situationData);
+
+            match.MatchSituation = new ClientMatchSituation
+            {
+                TotalTime = analyzedStats.TotalTime,
+                DominantTeam = analyzedStats.DominantTeam,
+                MatchMomentum = analyzedStats.MatchMomentum,
+                Home = new ClientTeamSituation
+                {
+                    TotalAttacks = analyzedStats.Home.TotalAttacks,
+                    TotalDangerousAttacks = analyzedStats.Home.TotalDangerousAttacks,
+                    TotalSafeAttacks = analyzedStats.Home.TotalSafeAttacks,
+                    TotalAttackCount = analyzedStats.Home.TotalAttackCount,
+                    TotalDangerousCount = analyzedStats.Home.TotalDangerousCount,
+                    TotalSafeCount = analyzedStats.Home.TotalSafeCount,
+                    AttackPercentage = Math.Round(analyzedStats.Home.AttackPercentage),
+                    DangerousAttackPercentage = Math.Round(analyzedStats.Home.DangerousAttackPercentage),
+                    SafeAttackPercentage = Math.Round(analyzedStats.Home.SafeAttackPercentage)
+                },
+                Away = new ClientTeamSituation
+                {
+                    TotalAttacks = analyzedStats.Away.TotalAttacks,
+                    TotalDangerousAttacks = analyzedStats.Away.TotalDangerousAttacks,
+                    TotalSafeAttacks = analyzedStats.Away.TotalSafeAttacks,
+                    TotalAttackCount = analyzedStats.Away.TotalAttackCount,
+                    TotalDangerousCount = analyzedStats.Away.TotalDangerousCount,
+                    TotalSafeCount = analyzedStats.Away.TotalSafeCount,
+                    AttackPercentage = Math.Round(analyzedStats.Away.AttackPercentage),
+                    DangerousAttackPercentage = Math.Round(analyzedStats.Away.DangerousAttackPercentage),
+                    SafeAttackPercentage = Math.Round(analyzedStats.Away.SafeAttackPercentage)
+                }
+            };
+        }
+    }
+    catch (Exception ex)
+    {
+        _logger.LogError(ex, "Error processing match situation for match {MatchId}", match.Id);
+    }
+}
+
+private void ProcessMatchDetails(Match match, JsonDocument document)
+{
+    try
+    {
+        var rawJson = document.RootElement.GetRawText();
+        
+        if (rawJson.Contains("\"event\":\"exception\""))
+        {
+            _logger.LogWarning("Received exception response for match {MatchId} in details data", match.Id);
+            return;
+        }
+        
+        var options = new JsonSerializerOptions(_jsonOptions)
+        {
+            Converters = { 
+                new JsonDictionaryStringNumberConverter(),
+                new MatchDetailsDataConverter()
+            }
+        };
+
+        var detailsData = JsonSerializer.Deserialize<MatchDetailsExtendedResponse>(rawJson, options);
+
+        if (detailsData?.Doc?.FirstOrDefault()?.Data != null)
+        {
+            var data = detailsData.Doc[0].Data;
+            match.MatchDetails = new ClientMatchDetailsExtended
+            {
+                Types = data.Types,
+                Home = new ClientTeamStats
+                {
+                    YellowCards = ExtractIntValue(data.Values, "40", "home"),
+                    RedCards = ExtractIntValue(data.Values, "50", "home"),
+                    FreeKicks = ExtractIntValue(data.Values, "120", "home"),
+                    GoalKicks = ExtractIntValue(data.Values, "121", "home"),
+                    ThrowIns = ExtractIntValue(data.Values, "122", "home"),
+                    Offsides = ExtractIntValue(data.Values, "123", "home"),
+                    CornerKicks = ExtractIntValue(data.Values, "124", "home"),
+                    ShotsOnTarget = ExtractIntValue(data.Values, "125", "home"),
+                    ShotsOffTarget = ExtractIntValue(data.Values, "126", "home"),
+                    Saves = ExtractIntValue(data.Values, "127", "home"),
+                    Fouls = ExtractIntValue(data.Values, "129", "home"),
+                    Injuries = ExtractIntValue(data.Values, "158", "home"),
+                    DangerousAttacks = ExtractIntValue(data.Values, "1029", "home"),
+                    BallSafe = ExtractIntValue(data.Values, "1030", "home"),
+                    TotalAttacks = ExtractIntValue(data.Values, "1126", "home"),
+                    GoalAttempts = ExtractIntValue(data.Values, "goalattempts", "home"),
+                    BallSafePercentage = ExtractDoubleValue(data.Values, "ballsafepercentage", "home"),
+                    AttackPercentage = ExtractDoubleValue(data.Values, "attackpercentage", "home"),
+                    DangerousAttackPercentage = ExtractDoubleValue(data.Values, "dangerousattackpercentage", "home")
+                },
+                Away = new ClientTeamStats
+                {
+                    YellowCards = ExtractIntValue(data.Values, "40", "away"),
+                    RedCards = ExtractIntValue(data.Values, "50", "away"),
+                    FreeKicks = ExtractIntValue(data.Values, "120", "away"),
+                    GoalKicks = ExtractIntValue(data.Values, "121", "away"),
+                    ThrowIns = ExtractIntValue(data.Values, "122", "away"),
+                    Offsides = ExtractIntValue(data.Values, "123", "away"),
+                    CornerKicks = ExtractIntValue(data.Values, "124", "away"),
+                    ShotsOnTarget = ExtractIntValue(data.Values, "125", "away"),
+                    ShotsOffTarget = ExtractIntValue(data.Values, "126", "away"),
+                    Saves = ExtractIntValue(data.Values, "127", "away"),
+                    Fouls = ExtractIntValue(data.Values, "129", "away"),
+                    Injuries = ExtractIntValue(data.Values, "158", "away"),
+                    DangerousAttacks = ExtractIntValue(data.Values, "1029", "away"),
+                    BallSafe = ExtractIntValue(data.Values, "1030", "away"),
+                    TotalAttacks = ExtractIntValue(data.Values, "1126", "away"),
+                    GoalAttempts = ExtractIntValue(data.Values, "goalattempts", "away"),
+                    BallSafePercentage = ExtractDoubleValue(data.Values, "ballsafepercentage", "away"),
+                    AttackPercentage = ExtractDoubleValue(data.Values, "attackpercentage", "away"),
+                    DangerousAttackPercentage = ExtractDoubleValue(data.Values, "dangerousattackpercentage", "away")
+                }
+            };
+        }
+    }
+    catch (Exception ex)
+    {
+        _logger.LogError(ex, "Error processing match details for match {MatchId}", match.Id);
+    }
+}
+
+// Add this method for fetching match data
+    private async Task FetchMatchDataAsync(Match match)
+    {
+        // Check cache first
+        var cacheKey = $"{CACHE_KEY_MATCH_PREFIX}{match.Id}";
+        if (_cache.TryGetValue(cacheKey, out var cachedData))
+        {
+            var (situation, details) = ((ClientMatchSituation, ClientMatchDetailsExtended))cachedData;
+            match.MatchSituation = situation;
+            match.MatchDetails = details;
+            return;
+        }
+
+        using var scope = _serviceProvider.CreateScope();
+        var matchService = scope.ServiceProvider.GetService<SportRadarService>();
+        if (matchService == null)
+        {
+            _logger.LogWarning("SportRadarService not found in service provider");
+            return;
+        }
+
+        // Use semaphore to limit API calls
+        var acquiredSemaphore = await _apiSemaphore.WaitAsync(3000);
+        if (!acquiredSemaphore)
+        {
+            _logger.LogWarning("Timeout waiting for API semaphore for match {MatchId}", match.Id);
+            return;
+        }
+
+        try
+        {
+            // Execute both API calls in parallel
+            var situationTask = matchService.GetMatchSituationAsync(match.Id.ToString());
+            var detailsTask = matchService.GetMatchDetailsExtendedAsync(match.Id.ToString());
+
+            await Task.WhenAll(situationTask, detailsTask);
+
+            // Process situation data if available
+            if (situationTask.Result is Ok<JsonDocument> situationResult && situationResult.Value != null)
+            {
+                ProcessMatchSituation(match, situationResult.Value);
+            }
+
+            // Process details data if available
+            if (detailsTask.Result is Ok<JsonDocument> detailsResult && detailsResult.Value != null)
+            {
+                ProcessMatchDetails(match, detailsResult.Value);
+            }
+
+            // Cache the results for future usage
+            if (match.MatchSituation != null || match.MatchDetails != null)
+            {
+                _cache.Set(cacheKey, (match.MatchSituation, match.MatchDetails), TimeSpan.FromMinutes(2));
+            }
+        }
+        finally
+        {
+            _apiSemaphore.Release();
+        }
+    }
+
+    private async Task<ApiResponse> FetchLiveMatchesWithRetryAsync(CancellationToken stoppingToken)
+    {
+        // Implement retry pattern with exponential backoff
+        for (int attempt = 0; attempt < 3; attempt++)
+        {
+            try
+            {
+                await _apiSemaphore.WaitAsync(stoppingToken);
+
+                try
+                {
+                    // Add timestamp to prevent caching
+                    var url =
+                        $"https://www.sportybet.com/api/ng/factsCenter/liveOrPrematchEvents?sportId=sr%3Asport%3A1&_t={DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()}";
+
+                    var response = await _httpClient.GetAsync(url, stoppingToken);
+                    response.EnsureSuccessStatusCode();
+
+                    // Use stream for efficient memory usage
+                    await using var contentStream = await response.Content.ReadAsStreamAsync(stoppingToken);
+                    return await JsonSerializer.DeserializeAsync<ApiResponse>(contentStream, _jsonOptions,
+                        cancellationToken: stoppingToken);
+                }
+                finally
+                {
+                    _apiSemaphore.Release();
+                }
+            }
+            catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException or JsonException)
+            {
+                if (attempt == 2) throw; // Rethrow on final attempt
+
+                _logger.LogWarning(ex, "API request failed, retrying after delay (attempt {Attempt}/3)", attempt + 1);
+                await Task.Delay(TimeSpan.FromSeconds(Math.Pow(2, attempt)), stoppingToken); // Exponential backoff
+            }
+        }
+
+        throw new InvalidOperationException("Failed to fetch live matches after multiple attempts");
     }
 
     private List<Event> FlattenEvents(ApiResponse apiResponse)
@@ -114,24 +530,37 @@ public partial class ArbitrageLiveMatchBackgroundService : BackgroundService
 
     private List<Match> ProcessEvents(List<Event> events)
     {
+        // Use parallelism with controlled degree
         return events
+            .AsParallel()
+            .WithDegreeOfParallelism(Math.Min(Environment.ProcessorCount, 4))
             .Select(ProcessSingleEvent)
             .Where(m => m != null && m.Markets.Any()) // Only include matches with actual arbitrage opportunities
-            .Where(m => !m.Teams.Away.Name.ToUpper().Contains("SRL") || !m.Teams.Home.Name.ToUpper().Contains("SRL"))
+            .Where(m => !m.Teams.Away.Name.ToUpper().Contains("SRL") && !m.Teams.Home.Name.ToUpper().Contains("SRL"))
             .ToList();
     }
 
     private List<Match> ProcessAllEvents(List<Event> events)
     {
+        // Use parallelism with controlled degree
         return events
+            .AsParallel()
+            .WithDegreeOfParallelism(Math.Min(Environment.ProcessorCount, 4))
             .Select(CreateMatchFromEvent)
             .Where(m => m.Markets.Any())
-            .Where(m => !m.Teams.Away.Name.ToUpper().Contains("SRL") || !m.Teams.Home.Name.ToUpper().Contains("SRL"))
+            .Where(m => !m.Teams.Away.Name.ToUpper().Contains("SRL") && !m.Teams.Home.Name.ToUpper().Contains("SRL"))
             .ToList();
     }
 
     private Match ProcessSingleEvent(Event eventData)
     {
+        // Check cache first
+        var cacheKey = $"{CACHE_KEY_EVENT_PREFIX}{eventData.EventId}";
+        if (_cache.TryGetValue(cacheKey, out Match cachedMatch))
+        {
+            return cachedMatch;
+        }
+
         _logger.LogDebug($"Processing event {eventData.EventId}");
         var potentialMarkets = ProcessMarkets(eventData);
         var arbitrageMarkets = potentialMarkets
@@ -140,10 +569,6 @@ public partial class ArbitrageLiveMatchBackgroundService : BackgroundService
             .ToList();
 
         _logger.LogDebug($"Found {arbitrageMarkets.Count} arbitrage markets for event {eventData.EventId}");
-        foreach (var market in arbitrageMarkets)
-        {
-            _logger.LogDebug($"Arbitrage market {market.Id}: {market.Description}, Profit={market.ProfitPercentage:F2}%");
-        }
 
         // Only create a match if there are actual arbitrage opportunities
         if (!arbitrageMarkets.Any())
@@ -152,11 +577,23 @@ public partial class ArbitrageLiveMatchBackgroundService : BackgroundService
             return null;
         }
 
-        return CreateMatch(eventData, arbitrageMarkets);
+        var match = CreateMatch(eventData, arbitrageMarkets);
+
+        // Cache result with expiration
+        _cache.Set(cacheKey, match, TimeSpan.FromSeconds(30));
+
+        return match;
     }
 
     private Match CreateMatchFromEvent(Event eventData)
     {
+        // Try cache first
+        var cacheKey = $"{CACHE_KEY_EVENT_PREFIX}base_{eventData.EventId}";
+        if (_cache.TryGetValue(cacheKey, out Match cachedMatch))
+        {
+            return cachedMatch;
+        }
+
         var markets = eventData.Markets
             .Where(m => IsValidMarketStatus(m))
             .Where(m => m.Desc?.ToLower() == "match result" || m.Desc?.ToLower() == "1x2") // Only include 1X2 markets
@@ -171,13 +608,21 @@ public partial class ArbitrageLiveMatchBackgroundService : BackgroundService
             .Where(m => m.Outcomes.Any() && m.Outcomes.Count == 3) // Ensure we have exactly 3 outcomes (1X2)
             .ToList();
 
-        return CreateMatch(eventData, markets);
+        var match = CreateMatch(eventData, markets);
+
+        // Cache result
+        _cache.Set(cacheKey, match, TimeSpan.FromSeconds(30));
+
+        return match;
     }
 
     private List<(Market market, bool hasArbitrage)> ProcessMarkets(Event eventData)
     {
         _logger.LogDebug($"Processing markets for match {eventData.EventId}");
+
+        // Use parallel processing for markets
         var markets = eventData.Markets
+            .AsParallel()
             .Where(m => IsValidMarketStatus(m))
             .Where(m => _marketValidator.ValidateMarket(m))
             .Select(m => ProcessMarket(m, eventData.EventId))
@@ -185,10 +630,6 @@ public partial class ArbitrageLiveMatchBackgroundService : BackgroundService
             .ToList();
 
         _logger.LogDebug($"Found {markets.Count} valid markets for match {eventData.EventId}");
-        foreach (var (market, hasArbitrage) in markets)
-        {
-            _logger.LogDebug($"Market {market.Id} ({market.Description}): HasArbitrage={hasArbitrage}, Margin={market.Margin:F2}%, Profit={market.ProfitPercentage:F2}%");
-        }
 
         return markets;
     }
@@ -212,25 +653,20 @@ public partial class ArbitrageLiveMatchBackgroundService : BackgroundService
                 Favourite = marketData.Favourite,
             };
 
-            if (!market.Outcomes.Any() || 
+            if (!market.Outcomes.Any() ||
                 !_marketValidator.ValidateMarket(marketData, market.Outcomes.Count))
             {
                 _logger.LogDebug($"Market {marketData.Id} invalid: No outcomes or failed validation");
                 return (market, false);
             }
 
-            var (hasArbitrage, stakePercentages, profitPercentage) = 
+            var (hasArbitrage, stakePercentages, profitPercentage) =
                 CalculateArbitrageOpportunity(market);
 
             if (hasArbitrage)
             {
                 UpdateMarketWithArbitrageData(market, stakePercentages, profitPercentage);
                 LogArbitrageOpportunity(matchId, market);
-                _logger.LogDebug($"Found arbitrage in market {marketData.Id}: Profit={profitPercentage:F2}%, Margin={market.Margin:F2}%");
-            }
-            else
-            {
-                _logger.LogDebug($"No arbitrage in market {marketData.Id}: Profit={profitPercentage:F2}%, Margin={market.Margin:F2}%");
             }
 
             return (market, hasArbitrage);
@@ -270,6 +706,7 @@ public partial class ArbitrageLiveMatchBackgroundService : BackgroundService
         {
             market.Outcomes[i].StakePercentage = stakePercentages[i];
         }
+
         market.ProfitPercentage = profitPercentage;
     }
 
@@ -307,38 +744,32 @@ public partial class ArbitrageLiveMatchBackgroundService : BackgroundService
             Period = eventData.Period,
             MatchStatus = eventData.MatchStatus,
             PlayedTime = eventData.PlayedSeconds,
-            Markets = arbitrageMarkets
+            Markets = arbitrageMarkets,
+            LastUpdated = DateTime.UtcNow
         };
     }
 
-    private (bool hasArbitrage, List<decimal> stakePercentages, decimal profitPercentage) 
+    private (bool hasArbitrage, List<decimal> stakePercentages, decimal profitPercentage)
         CalculateArbitrageOpportunity(Market market)
     {
         if (!market.Outcomes.Any())
         {
-            _logger.LogDebug($"No outcomes in market {market.Id}");
             return (false, new List<decimal>(), 0m);
         }
 
         var margin = CalculateMarginPercentage(market.Outcomes);
         market.Margin = margin;
 
-        _logger.LogDebug($"Market {market.Id} margin: {margin:F2}%");
-
         if (margin > MaxAcceptableMargin)
         {
-            _logger.LogDebug($"Market {market.Id} margin {margin:F2}% exceeds max {MaxAcceptableMargin}%");
             return (false, new List<decimal>(), 0m);
         }
 
         var totalInverse = market.Outcomes.Sum(o => 1m / o.Odds);
         var profitPercentage = ((1 / totalInverse) - 1) * 100;
 
-        _logger.LogDebug($"Market {market.Id} profit: {profitPercentage:F2}%");
-
         if (profitPercentage <= 0)
         {
-            _logger.LogDebug($"Market {market.Id} profit {profitPercentage:F2}% is not positive");
             return (false, new List<decimal>(), 0m);
         }
 
@@ -369,312 +800,30 @@ public partial class ArbitrageLiveMatchBackgroundService : BackgroundService
         _logger.LogInformation($"Arbitrage opportunity rate: {(decimal)matches.Count / totalEvents:P2}");
     }
 
-    // SignalR Streaming Methods
-    private async Task StreamMatchesToClientsAsync(List<Match> arbitrageMatches, List<Event> allEvents)
+    private ClientTeamStats CreateTeamStats(Dictionary<string, StatValue> values, string team)
     {
-        if (!arbitrageMatches.Any() && !allEvents.Any()) return;
-
-        try
+        return new ClientTeamStats
         {
-            // Process all matches first to get enriched data
-            var allMatches = ProcessAllEvents(allEvents);
-            _logger.LogInformation($"Processing {allMatches.Count} matches for enrichment");
-
-            // Process matches in smaller batches to avoid overwhelming the API
-            foreach (var matchBatch in allMatches.Chunk(5))
-            {
-                // Add a random delay before processing each batch (1-2 seconds)
-                foreach (var match in matchBatch)
-                {
-                    try
-                    {
-                        // Fetch match situation and details data
-                        await FetchMatchSituationAndDetails(match);
-                        // Add a random delay between matches (800ms-1.2s)
-                    }
-                    catch (Exception ex)
-                    {
-                        _logger.LogWarning(ex, "Error fetching match data for match {MatchId}", match.Id);
-                        // Add a longer delay after an error (2-3 seconds)
-                        await AddHumanLikeDelay(2000, 3000);
-                    }
-                }
-                // Add delay between batches (2-3 seconds)
-            }
-
-            // Create client matches with enriched data for all matches (1X2 markets only)
-            var clientAllMatches = allMatches.Select(match =>
-            {
-                var clientMatch = CreateClientMatch(match);
-                // Ensure only 1X2 markets are included
-                clientMatch.Markets = clientMatch.Markets
-                    .Where(m => m.Description?.ToLower() == "match result" || m.Description?.ToLower() == "1x2")
-                    .ToList();
-                _logger.LogDebug($"Created client match {match.Id} with situation: {match.MatchSituation != null}, details: {match.MatchDetails != null}");
-                return clientMatch;
-            }).ToList();
-            _lastSentAllMatches = clientAllMatches;
-
-            // Create client matches with enriched data for arbitrage matches
-            var clientArbitrageMatches = arbitrageMatches.Select(match =>
-            {
-                var enrichedMatch = allEvents.FirstOrDefault(e => e.EventId == match.Id.ToString());
-                var clientMatch = CreateClientMatch(match);
-
-                // Log all markets before filtering
-                _logger.LogDebug($"Match {match.Id} has {clientMatch.Markets.Count} markets before filtering");
-                foreach (var market in clientMatch.Markets)
-                {
-                    _logger.LogDebug($"Market {market.Id} ({market.Description}): Profit={market.ProfitPercentage:F2}%");
-                }
-
-                // No additional filtering needed here since we already filtered in ProcessSingleEvent
-                _logger.LogDebug($"Match {match.Id} has {clientMatch.Markets.Count} markets after filtering");
-
-                return clientMatch;
-            }).Where(m => m.Markets.Any()).ToList(); // Only include matches that have valid arbitrage markets
-            _lastSentArbitrageMatches = clientArbitrageMatches;
-
-            // Send both messages with enriched data
-            await _hubContext.Clients.All.SendAsync("ReceiveArbitrageLiveMatches", clientArbitrageMatches);
-            await _hubContext.Clients.All.SendAsync("ReceiveAllLiveMatches", clientAllMatches);
-
-            _logger.LogInformation(
-                "Streamed {ArbitrageMatchCount} arbitrage matches and {AllMatchCount} total matches with enriched data",
-                clientArbitrageMatches.Count,
-                clientAllMatches.Count);
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Error streaming matches to clients");
-        }
-    }
-
-    private async Task FetchMatchSituationAndDetails(Match match)
-    {
-        using var scope = _serviceProvider.CreateScope();
-        var matchService = scope.ServiceProvider.GetService<SportRadarService>();
-
-        var tasks = new Dictionary<string, Task<IResult>>
-        {
-            { "MatchSituation", matchService.GetMatchSituationAsync(match.Id.ToString()) },
-            { "MatchDetailsExtended", matchService.GetMatchDetailsExtendedAsync(match.Id.ToString()) }
+            YellowCards = ExtractIntValue(values, "40", team),
+            RedCards = ExtractIntValue(values, "50", team),
+            FreeKicks = ExtractIntValue(values, "120", team),
+            GoalKicks = ExtractIntValue(values, "121", team),
+            ThrowIns = ExtractIntValue(values, "122", team),
+            Offsides = ExtractIntValue(values, "123", team),
+            CornerKicks = ExtractIntValue(values, "124", team),
+            ShotsOnTarget = ExtractIntValue(values, "125", team),
+            ShotsOffTarget = ExtractIntValue(values, "126", team),
+            Saves = ExtractIntValue(values, "127", team),
+            Fouls = ExtractIntValue(values, "129", team),
+            Injuries = ExtractIntValue(values, "158", team),
+            DangerousAttacks = ExtractIntValue(values, "1029", team),
+            BallSafe = ExtractIntValue(values, "1030", team),
+            TotalAttacks = ExtractIntValue(values, "1126", team),
+            GoalAttempts = ExtractIntValue(values, "goalattempts", team),
+            BallSafePercentage = ExtractDoubleValue(values, "ballsafepercentage", team),
+            AttackPercentage = ExtractDoubleValue(values, "attackpercentage", team),
+            DangerousAttackPercentage = ExtractDoubleValue(values, "dangerousattackpercentage", team)
         };
-
-        foreach (var task in tasks.OrderBy(_ => Random.Shared.Next()))
-        {
-            try
-            {
-                var result = await task.Value;
-                await AddHumanLikeDelay(300, 500);
-                if (result is Ok<JsonDocument> okResult && okResult.Value != null)
-                {
-                    var rawJson = okResult.Value.RootElement.GetRawText();
-
-                    if (rawJson.Contains("\"event\":\"exception\""))
-                    {
-                        _logger.LogWarning("Received exception response for match {MatchId} in {ResponseType}", match.Id, task.Key);
-                        continue;
-                    }
-
-                    var doc = okResult.Value.RootElement.GetProperty("doc");
-                    if (doc.GetArrayLength() == 0)
-                    {
-                        _logger.LogWarning("Empty doc array for match {MatchId} in {ResponseType}", match.Id, task.Key);
-                        continue;
-                    }
-
-                    var firstDoc = doc[0];
-                    if (!firstDoc.TryGetProperty("data", out var dataElement))
-                    {
-                        _logger.LogWarning("No data property found for match {MatchId} in {ResponseType}", match.Id, task.Key);
-                        continue;
-                    }
-
-                    if (task.Key == "MatchSituation")
-                    {
-                        try
-                        {
-                            var response = JsonSerializer.Deserialize<fredapi.Model.Live.StatsMatchSituationResponse>(rawJson);
-
-                            if (response?.Doc?.FirstOrDefault()?.Data != null)
-                            {
-                                var data = response.Doc[0].Data;
-                                if (data.Data == null || !data.Data.Any())
-                                {
-                                    _logger.LogWarning("No match situation data found for match {MatchId}", data.MatchId);
-                                    return;
-                                }
-
-                                var validData = data.Data.Where(d => d != null && d.Home != null && d.Away != null).ToList();
-                                if (!validData.Any())
-                                {
-                                    _logger.LogWarning("No valid match situation data entries found for match {MatchId}", data.MatchId);
-                                    return;
-                                }
-
-                                var situationData = new MatchSituationStats
-                                {
-                                    MatchId = data.MatchId,
-                                    Data = validData.Select(d => new TimeSliceStats
-                                    {
-                                        Time = d.Time,
-                                        InjuryTime = d.InjuryTime,
-                                        Home = new fredapi.Model.MatchSituationStats.TeamStats
-                                        {
-                                            Attack = (int)Math.Round((decimal)d.Home.Attack, 0),
-                                            Dangerous = (int)Math.Round((decimal)d.Home.Dangerous, 0),
-                                            Safe = (int)Math.Round((decimal)d.Home.Safe, 0),
-                                            AttackCount = d.Home.AttackCount,
-                                            DangerousCount = d.Home.DangerousCount,
-                                            SafeCount = d.Home.SafeCount
-                                        },
-                                        Away = new fredapi.Model.MatchSituationStats.TeamStats
-                                        {
-                                            Attack = (int)Math.Round((decimal)d.Away.Attack, 0),
-                                            Dangerous = (int)Math.Round((decimal)d.Away.Dangerous, 0),
-                                            Safe = (int)Math.Round((decimal)d.Away.Safe, 0),
-                                            AttackCount = d.Away.AttackCount,
-                                            DangerousCount = d.Away.DangerousCount,
-                                            SafeCount = d.Away.SafeCount
-                                        }
-                                    }).ToList()
-                                };
-
-                                var analyzedStats = MatchSituationAnalyzer.AnalyzeMatchSituation(situationData);
-
-                                match.MatchSituation = new ClientMatchSituation
-                                {
-                                    TotalTime = analyzedStats.TotalTime,
-                                    DominantTeam = analyzedStats.DominantTeam,
-                                    MatchMomentum = analyzedStats.MatchMomentum,
-                                    Home = new ClientTeamSituation
-                                    {
-                                        TotalAttacks = analyzedStats.Home.TotalAttacks,
-                                        TotalDangerousAttacks = analyzedStats.Home.TotalDangerousAttacks,
-                                        TotalSafeAttacks = analyzedStats.Home.TotalSafeAttacks,
-                                        TotalAttackCount = analyzedStats.Home.TotalAttackCount,
-                                        TotalDangerousCount = analyzedStats.Home.TotalDangerousCount,
-                                        TotalSafeCount = analyzedStats.Home.TotalSafeCount,
-                                        AttackPercentage = Math.Round(analyzedStats.Home.AttackPercentage),
-                                        DangerousAttackPercentage = Math.Round(analyzedStats.Home.DangerousAttackPercentage),
-                                        SafeAttackPercentage = Math.Round(analyzedStats.Home.SafeAttackPercentage)
-                                    },
-                                    Away = new ClientTeamSituation
-                                    {
-                                        TotalAttacks = analyzedStats.Away.TotalAttacks,
-                                        TotalDangerousAttacks = analyzedStats.Away.TotalDangerousAttacks,
-                                        TotalSafeAttacks = analyzedStats.Away.TotalSafeAttacks,
-                                        TotalAttackCount = analyzedStats.Away.TotalAttackCount,
-                                        TotalDangerousCount = analyzedStats.Away.TotalDangerousCount,
-                                        TotalSafeCount = analyzedStats.Away.TotalSafeCount,
-                                        AttackPercentage = Math.Round(analyzedStats.Away.AttackPercentage),
-                                        DangerousAttackPercentage = Math.Round(analyzedStats.Away.DangerousAttackPercentage),
-                                        SafeAttackPercentage = Math.Round(analyzedStats.Away.SafeAttackPercentage)
-                                    }
-                                };
-                            }
-                        }
-                        catch (Exception ex)
-                        {
-                            _logger.LogError(ex, "Error processing match situation for match {MatchId}", match.Id);
-                        }
-                    }
-                    else if (task.Key == "MatchDetailsExtended")
-                    {
-                        try
-                        {
-                            if (firstDoc.TryGetProperty("event", out var eventProperty))
-                            {
-                                var eventValue = eventProperty.GetString();
-                                if (eventValue == "exception")
-                                {
-                                    _logger.LogWarning("Received exception event for match {MatchId} in {ResponseType}", match.Id, task.Key);
-                                    continue;
-                                }
-                            }
-
-                            var options = new JsonSerializerOptions
-                            {
-                                PropertyNameCaseInsensitive = true,
-                                AllowTrailingCommas = true,
-                                ReadCommentHandling = JsonCommentHandling.Skip,
-                                DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
-                                Converters =
-                                {
-                                    new JsonDictionaryStringNumberConverter(),
-                                    new MatchDetailsDataConverter()
-                                }
-                            };
-
-                            var detailsData = JsonSerializer.Deserialize<MatchDetailsExtendedResponse>(rawJson, options);
-
-                            if (detailsData?.Doc?.FirstOrDefault()?.Data != null)
-                            {
-                                var data = detailsData.Doc[0].Data;
-                                match.MatchDetails = new ClientMatchDetailsExtended
-                                {
-                                    Types = data.Types,
-                                    Home = new ClientTeamStats
-                                    {
-                                        YellowCards = ExtractIntValue(data.Values, "40", "home"),
-                                        RedCards = ExtractIntValue(data.Values, "50", "home"),
-                                        FreeKicks = ExtractIntValue(data.Values, "120", "home"),
-                                        GoalKicks = ExtractIntValue(data.Values, "121", "home"),
-                                        ThrowIns = ExtractIntValue(data.Values, "122", "home"),
-                                        Offsides = ExtractIntValue(data.Values, "123", "home"),
-                                        CornerKicks = ExtractIntValue(data.Values, "124", "home"),
-                                        ShotsOnTarget = ExtractIntValue(data.Values, "125", "home"),
-                                        ShotsOffTarget = ExtractIntValue(data.Values, "126", "home"),
-                                        Saves = ExtractIntValue(data.Values, "127", "home"),
-                                        Fouls = ExtractIntValue(data.Values, "129", "home"),
-                                        Injuries = ExtractIntValue(data.Values, "158", "home"),
-                                        DangerousAttacks = ExtractIntValue(data.Values, "1029", "home"),
-                                        BallSafe = ExtractIntValue(data.Values, "1030", "home"),
-                                        TotalAttacks = ExtractIntValue(data.Values, "1126", "home"),
-                                        GoalAttempts = ExtractIntValue(data.Values, "goalattempts", "home"),
-                                        BallSafePercentage = ExtractDoubleValue(data.Values, "ballsafepercentage", "home"),
-                                        AttackPercentage = ExtractDoubleValue(data.Values, "attackpercentage", "home"),
-                                        DangerousAttackPercentage = ExtractDoubleValue(data.Values, "dangerousattackpercentage", "home")
-                                    },
-                                    Away = new ClientTeamStats
-                                    {
-                                        YellowCards = ExtractIntValue(data.Values, "40", "away"),
-                                        RedCards = ExtractIntValue(data.Values, "50", "away"),
-                                        FreeKicks = ExtractIntValue(data.Values, "120", "away"),
-                                        GoalKicks = ExtractIntValue(data.Values, "121", "away"),
-                                        ThrowIns = ExtractIntValue(data.Values, "122", "away"),
-                                        Offsides = ExtractIntValue(data.Values, "123", "away"),
-                                        CornerKicks = ExtractIntValue(data.Values, "124", "away"),
-                                        ShotsOnTarget = ExtractIntValue(data.Values, "125", "away"),
-                                        ShotsOffTarget = ExtractIntValue(data.Values, "126", "away"),
-                                        Saves = ExtractIntValue(data.Values, "127", "away"),
-                                        Fouls = ExtractIntValue(data.Values, "129", "away"),
-                                        Injuries = ExtractIntValue(data.Values, "158", "away"),
-                                        DangerousAttacks = ExtractIntValue(data.Values, "1029", "away"),
-                                        BallSafe = ExtractIntValue(data.Values, "1030", "away"),
-                                        TotalAttacks = ExtractIntValue(data.Values, "1126", "away"),
-                                        GoalAttempts = ExtractIntValue(data.Values, "goalattempts", "away"),
-                                        BallSafePercentage = ExtractDoubleValue(data.Values, "ballsafepercentage", "away"),
-                                        AttackPercentage = ExtractDoubleValue(data.Values, "attackpercentage", "away"),
-                                        DangerousAttackPercentage = ExtractDoubleValue(data.Values, "dangerousattackpercentage", "away")
-                                    }
-                                };
-                            }
-                        }
-                        catch (Exception ex)
-                        {
-                            _logger.LogError(ex, "Error processing match details for match {MatchId}", match.Id);
-                        }
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, $"Error fetching match data for match {match.Id}");
-                await AddHumanLikeDelay(1000, 2000);
-            }
-        }
     }
 
     private static async Task AddHumanLikeDelay(int minMs, int maxMs)
@@ -721,9 +870,9 @@ public partial class ArbitrageLiveMatchBackgroundService : BackgroundService
         };
     }
 
-    // Methods to get the last sent matches (can be called by hub methods)
-    public static List<ClientMatch> GetLastSentArbitrageMatches() => _lastSentArbitrageMatches;
-    public static List<ClientMatch> GetLastSentAllMatches() => _lastSentAllMatches;
+    // Optimized methods to get the last sent matches (using threadsafe collection)
+    public static List<ClientMatch> GetLastSentArbitrageMatches() => _lastSentArbitrageMatches.ToList();
+    public static List<ClientMatch> GetLastSentAllMatches() => _lastSentAllMatches.ToList();
 
     private int ExtractIntValue(Dictionary<string, StatValue> values, string key, string team)
     {
@@ -772,170 +921,122 @@ public partial class ArbitrageLiveMatchBackgroundService : BackgroundService
 
 public class ApiResponse
 {
-    [JsonPropertyName("bizCode")]
-    public int BizCode { get; set; }
+    [JsonPropertyName("bizCode")] public int BizCode { get; set; }
 
-    [JsonPropertyName("message")]
-    public string Message { get; set; }
+    [JsonPropertyName("message")] public string Message { get; set; }
 
-    [JsonPropertyName("data")]
-    public List<TournamentData> Data { get; set; }
+    [JsonPropertyName("data")] public List<TournamentData> Data { get; set; }
 }
 
 public class TournamentData
 {
-    [JsonPropertyName("id")]
-    public string Id { get; set; }
+    [JsonPropertyName("id")] public string Id { get; set; }
 
-    [JsonPropertyName("name")]
-    public string Name { get; set; }
+    [JsonPropertyName("name")] public string Name { get; set; }
 
-    [JsonPropertyName("events")]
-    public List<Event> Events { get; set; }
+    [JsonPropertyName("events")] public List<Event> Events { get; set; }
 }
 
 public class Event
 {
-    [JsonPropertyName("eventId")]
-    public string EventId { get; set; }
+    [JsonPropertyName("eventId")] public string EventId { get; set; }
 
-    [JsonPropertyName("gameId")]
-    public string GameId { get; set; }
+    [JsonPropertyName("gameId")] public string GameId { get; set; }
 
-    [JsonPropertyName("homeTeamId")]
-    public string HomeTeamId { get; set; }
+    [JsonPropertyName("homeTeamId")] public string HomeTeamId { get; set; }
 
-    [JsonPropertyName("homeTeamName")]
-    public string HomeTeamName { get; set; }
+    [JsonPropertyName("homeTeamName")] public string HomeTeamName { get; set; }
 
-    [JsonPropertyName("awayTeamId")]
-    public string AwayTeamId { get; set; }
+    [JsonPropertyName("awayTeamId")] public string AwayTeamId { get; set; }
 
-    [JsonPropertyName("awayTeamName")]
-    public string AwayTeamName { get; set; }
+    [JsonPropertyName("awayTeamName")] public string AwayTeamName { get; set; }
 
-    [JsonPropertyName("startTime")]
-    public string StartTime { get; set; }
+    [JsonPropertyName("startTime")] public string StartTime { get; set; }
 
-    [JsonPropertyName("status")]
-    public int Status { get; set; }
+    [JsonPropertyName("status")] public int Status { get; set; }
 
-    [JsonPropertyName("setScore")]
-    public string SetScore { get; set; }
+    [JsonPropertyName("setScore")] public string SetScore { get; set; }
 
-    [JsonPropertyName("period")]
-    public string Period { get; set; }
+    [JsonPropertyName("period")] public string Period { get; set; }
 
-    [JsonPropertyName("matchStatus")]
-    public string MatchStatus { get; set; }
+    [JsonPropertyName("matchStatus")] public string MatchStatus { get; set; }
 
-    [JsonPropertyName("playedSeconds")]
-    public string PlayedSeconds { get; set; }
+    [JsonPropertyName("playedSeconds")] public string PlayedSeconds { get; set; }
 
-    [JsonPropertyName("markets")]
-    public List<MarketData> Markets { get; set; }
+    [JsonPropertyName("markets")] public List<MarketData> Markets { get; set; }
 
-    [JsonPropertyName("sport")]
-    public Sport Sport { get; set; }
+    [JsonPropertyName("sport")] public Sport Sport { get; set; }
 }
 
 public class Sport
 {
-    [JsonPropertyName("id")]
-    public string Id { get; set; }
+    [JsonPropertyName("id")] public string Id { get; set; }
 
-    [JsonPropertyName("name")]
-    public string Name { get; set; }
+    [JsonPropertyName("name")] public string Name { get; set; }
 
-    [JsonPropertyName("category")]
-    public Category Category { get; set; }
+    [JsonPropertyName("category")] public Category Category { get; set; }
 }
 
 public class Category
 {
-    [JsonPropertyName("id")]
-    public string Id { get; set; }
+    [JsonPropertyName("id")] public string Id { get; set; }
 
-    [JsonPropertyName("name")]
-    public string Name { get; set; }
+    [JsonPropertyName("name")] public string Name { get; set; }
 
-    [JsonPropertyName("tournament")]
-    public Tournament Tournament { get; set; }
+    [JsonPropertyName("tournament")] public Tournament Tournament { get; set; }
 }
 
 public class Tournament
 {
-    [JsonPropertyName("id")]
-    public string Id { get; set; }
+    [JsonPropertyName("id")] public string Id { get; set; }
 
-    [JsonPropertyName("name")]
-    public string Name { get; set; }
+    [JsonPropertyName("name")] public string Name { get; set; }
 }
 
 public class MarketData
 {
-    [JsonPropertyName("id")]
-    public string Id { get; set; }
+    [JsonPropertyName("id")] public string Id { get; set; }
 
-    [JsonPropertyName("desc")]
-    public string Desc { get; set; }
+    [JsonPropertyName("desc")] public string Desc { get; set; }
 
-    [JsonPropertyName("specifier")]
-    public string Specifier { get; set; }
+    [JsonPropertyName("specifier")] public string Specifier { get; set; }
 
-    [JsonPropertyName("status")]
-    public int Status { get; set; }
+    [JsonPropertyName("status")] public int Status { get; set; }
 
-    [JsonPropertyName("group")]
-    public string Group { get; set; }
+    [JsonPropertyName("group")] public string Group { get; set; }
 
-    [JsonPropertyName("groupId")]
-    public string GroupId { get; set; }
+    [JsonPropertyName("groupId")] public string GroupId { get; set; }
 
-    [JsonPropertyName("marketGuide")]
-    public string MarketGuide { get; set; }
+    [JsonPropertyName("marketGuide")] public string MarketGuide { get; set; }
 
-    [JsonPropertyName("title")]
-    public string Title { get; set; }
+    [JsonPropertyName("title")] public string Title { get; set; }
 
-    [JsonPropertyName("name")]
-    public string Name { get; set; }
+    [JsonPropertyName("name")] public string Name { get; set; }
 
-    [JsonPropertyName("favourite")]
-    public int Favourite { get; set; }
+    [JsonPropertyName("favourite")] public int Favourite { get; set; }
 
-    [JsonPropertyName("outcomes")]
-    public List<OutcomeData> Outcomes { get; set; }
+    [JsonPropertyName("outcomes")] public List<OutcomeData> Outcomes { get; set; }
 
-    [JsonPropertyName("farNearOdds")]
-    public int FarNearOdds { get; set; }
+    [JsonPropertyName("farNearOdds")] public int FarNearOdds { get; set; }
 
-    [JsonPropertyName("sourceType")]
-    public string SourceType { get; set; }
+    [JsonPropertyName("sourceType")] public string SourceType { get; set; }
 
-    [JsonPropertyName("availableScore")]
-    public string AvailableScore { get; set; }
+    [JsonPropertyName("availableScore")] public string AvailableScore { get; set; }
 
-    [JsonPropertyName("banned")]
-    public bool Banned { get; set; }
+    [JsonPropertyName("banned")] public bool Banned { get; set; }
 }
 
 public class OutcomeData
 {
-    [JsonPropertyName("id")]
-    public string Id { get; set; }
+    [JsonPropertyName("id")] public string Id { get; set; }
 
-    [JsonPropertyName("desc")]
-    public string Desc { get; set; }
+    [JsonPropertyName("desc")] public string Desc { get; set; }
 
-    [JsonPropertyName("odds")]
-    public string Odds { get; set; }
+    [JsonPropertyName("odds")] public string Odds { get; set; }
 
-    [JsonPropertyName("probability")]
-    public string Probability { get; set; }
+    [JsonPropertyName("probability")] public string Probability { get; set; }
 
-    [JsonPropertyName("isActive")]
-    public int IsActive { get; set; }
+    [JsonPropertyName("isActive")] public int IsActive { get; set; }
 }
 
 public class Match
@@ -1088,47 +1189,35 @@ public class ClientTeamStats
 
 public class MatchDetailsExtendedResponse
 {
-    [JsonPropertyName("queryUrl")]
-    public string QueryUrl { get; set; }
+    [JsonPropertyName("queryUrl")] public string QueryUrl { get; set; }
 
-    [JsonPropertyName("doc")]
-    public List<MatchDetailsDoc> Doc { get; set; }
+    [JsonPropertyName("doc")] public List<MatchDetailsDoc> Doc { get; set; }
 }
 
 public class MatchDetailsDoc
 {
-    [JsonPropertyName("event")]
-    public string Event { get; set; }
+    [JsonPropertyName("event")] public string Event { get; set; }
 
-    [JsonPropertyName("_dob")]
-    public long Dob { get; set; }
+    [JsonPropertyName("_dob")] public long Dob { get; set; }
 
-    [JsonPropertyName("_maxage")]
-    public int MaxAge { get; set; }
+    [JsonPropertyName("_maxage")] public int MaxAge { get; set; }
 
-    [JsonPropertyName("data")]
-    public MatchDetailsData Data { get; set; }
+    [JsonPropertyName("data")] public MatchDetailsData Data { get; set; }
 }
 
 public class MatchDetailsData
 {
-    [JsonPropertyName("_doc")]
-    public string Doc { get; set; }
+    [JsonPropertyName("_doc")] public string Doc { get; set; }
 
-    [JsonPropertyName("_matchid")]
-    public long MatchId { get; set; }
+    [JsonPropertyName("_matchid")] public long MatchId { get; set; }
 
-    [JsonPropertyName("teams")]
-    public Teams Teams { get; set; }
+    [JsonPropertyName("teams")] public Teams Teams { get; set; }
 
-    [JsonPropertyName("index")]
-    public List<object> Index { get; set; }
+    [JsonPropertyName("index")] public List<object> Index { get; set; }
 
-    [JsonPropertyName("values")]
-    public Dictionary<string, StatValue> Values { get; set; }
+    [JsonPropertyName("values")] public Dictionary<string, StatValue> Values { get; set; }
 
-    [JsonPropertyName("types")]
-    public Dictionary<string, string> Types { get; set; }
+    [JsonPropertyName("types")] public Dictionary<string, string> Types { get; set; }
 }
 
 public class TeamsConverter : JsonConverter<Teams>
@@ -1172,6 +1261,7 @@ public class TeamsConverter : JsonConverter<Teams>
                         {
                             reader.Skip();
                         }
+
                         break;
                     case "away":
                         if (reader.TokenType == JsonTokenType.StartObject)
@@ -1182,6 +1272,7 @@ public class TeamsConverter : JsonConverter<Teams>
                         {
                             reader.Skip();
                         }
+
                         break;
                     default:
                         reader.Skip();
@@ -1260,6 +1351,7 @@ public class TeamConverter : JsonConverter<Team>
                         {
                             reader.Skip();
                         }
+
                         break;
                     case "name":
                         if (reader.TokenType == JsonTokenType.String)
@@ -1270,6 +1362,7 @@ public class TeamConverter : JsonConverter<Team>
                         {
                             reader.Skip();
                         }
+
                         break;
                     default:
                         reader.Skip();
@@ -1338,6 +1431,7 @@ public class MatchDetailsDataConverter : JsonConverter<MatchDetailsData>
                         {
                             reader.Skip();
                         }
+
                         break;
                     case "_matchid":
                         if (reader.TokenType == JsonTokenType.Number)
@@ -1359,6 +1453,7 @@ public class MatchDetailsDataConverter : JsonConverter<MatchDetailsData>
                         {
                             reader.Skip();
                         }
+
                         break;
                     case "teams":
                         data.Teams = _teamsConverter.Read(ref reader, typeof(Teams), options);
@@ -1372,16 +1467,19 @@ public class MatchDetailsDataConverter : JsonConverter<MatchDetailsData>
                         {
                             reader.Skip();
                         }
+
                         break;
                     case "values":
                         if (reader.TokenType == JsonTokenType.StartObject)
                         {
-                            data.Values = JsonSerializer.Deserialize<Dictionary<string, StatValue>>(ref reader, options);
+                            data.Values =
+                                JsonSerializer.Deserialize<Dictionary<string, StatValue>>(ref reader, options);
                         }
                         else
                         {
                             reader.Skip();
                         }
+
                         break;
                     case "types":
                         if (reader.TokenType == JsonTokenType.StartObject)
@@ -1392,6 +1490,7 @@ public class MatchDetailsDataConverter : JsonConverter<MatchDetailsData>
                         {
                             reader.Skip();
                         }
+
                         break;
                     default:
                         reader.Skip();
@@ -1426,7 +1525,8 @@ public class MatchDetailsDataConverter : JsonConverter<MatchDetailsData>
 
 public class JsonDictionaryStringNumberConverter : JsonConverter<Dictionary<string, object>>
 {
-    public override Dictionary<string, object> Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
+    public override Dictionary<string, object> Read(ref Utf8JsonReader reader, Type typeToConvert,
+        JsonSerializerOptions options)
     {
         var result = new Dictionary<string, object>();
 
@@ -1503,15 +1603,14 @@ public class JsonDictionaryStringNumberConverter : JsonConverter<Dictionary<stri
             else
                 JsonSerializer.Serialize(writer, kvp.Value, options);
         }
+
         writer.WriteEndObject();
     }
 }
 
 public class StatValue
 {
-    [JsonPropertyName("name")]
-    public string Name { get; set; }
+    [JsonPropertyName("name")] public string Name { get; set; }
 
-    [JsonPropertyName("value")]
-    public Dictionary<string, object> Value { get; set; }
+    [JsonPropertyName("value")] public Dictionary<string, object> Value { get; set; }
 }
