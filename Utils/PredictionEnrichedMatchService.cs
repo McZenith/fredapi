@@ -485,6 +485,9 @@ public class PredictionEnrichedMatchService
     /// <summary>
     /// Exports match data to CSV for machine learning
     /// </summary>
+/// <summary>
+    /// Exports match data to CSV for machine learning with 9 timeline snapshots
+    /// </summary>
     public async Task<string> ExportMatchDataToCsvAsync(int matchId)
     {
         var snapshots = await GetMatchSnapshotsAsync(matchId);
@@ -496,37 +499,58 @@ public class PredictionEnrichedMatchService
         
         // Create CSV header
         var sb = new System.Text.StringBuilder();
-        sb.AppendLine("timestamp,match_id,score,period,match_status,played_time," +
-                     "home_dangerous_attacks,away_dangerous_attacks," +
-                     "home_safe_attacks,away_safe_attacks," +
-                     "home_corner_kicks,away_corner_kicks," +
-                     "home_shots_on_target,away_shots_on_target," +
-                     "home_ball_safe_percentage,away_ball_safe_percentage," +
-                     "prediction_favorite,prediction_confidence,prediction_expected_goals," +
-                     "home_team_form,away_team_form," +
-                     "home_team_win_pct,away_team_win_pct," +
-                     "home_team_avg_goals,away_team_avg_goals");
         
-        // Add data rows
-        foreach (var snapshot in snapshots)
+        // Basic match info
+        sb.Append("timestamp,match_id,time_segment,");
+        
+        // Match state
+        sb.Append("score,period,match_status,played_time,");
+        
+        // Match statistics
+        sb.Append("home_dangerous_attacks,away_dangerous_attacks,");
+        sb.Append("home_safe_attacks,away_safe_attacks,");
+        sb.Append("home_corner_kicks,away_corner_kicks,");
+        sb.Append("home_shots_on_target,away_shots_on_target,");
+        sb.Append("home_ball_safe_percentage,away_ball_safe_percentage,");
+        
+        // Prediction data
+        sb.Append("prediction_favorite,prediction_confidence,prediction_expected_goals,");
+        sb.Append("home_team_form,away_team_form,");
+        sb.Append("home_team_win_pct,away_team_win_pct,");
+        sb.Append("home_team_avg_goals,away_team_avg_goals");
+        
+        sb.AppendLine();
+        
+        // Get 9 snapshots across the match timeline
+        var timelineSnapshots = GetTimelineSnapshots(snapshots);
+        
+        // Process each timeline snapshot
+        for (int i = 0; i < timelineSnapshots.Count; i++)
         {
-            sb.Append(snapshot.Timestamp.ToString("yyyy-MM-dd HH:mm:ss"));
-            sb.Append($",{snapshot.MatchId}");
-            sb.Append($",{snapshot.Score}");
-            sb.Append($",{snapshot.Period}");
-            sb.Append($",{snapshot.MatchStatus}");
-            sb.Append($",{snapshot.PlayedTime}");
+            var snapshot = timelineSnapshots[i];
+            var timeSegment = $"{i * 10}-{(i + 1) * 10}"; // e.g., "0-10", "10-20", etc.
             
-            // Match situation data
+            // Basic match info
+            sb.Append($"{snapshot.Timestamp:yyyy-MM-dd HH:mm:ss},");
+            sb.Append($"{snapshot.MatchId},");
+            sb.Append($"{timeSegment},");
+            
+            // Match state
+            sb.Append($"{snapshot.Score},");
+            sb.Append($"{snapshot.Period},");
+            sb.Append($"{snapshot.MatchStatus},");
+            sb.Append($"{snapshot.PlayedTime},");
+            
+            // Match statistics
             var homeDangerousAttacks = snapshot.MatchSituation?.Home?.TotalDangerousAttacks ?? 0;
             var awayDangerousAttacks = snapshot.MatchSituation?.Away?.TotalDangerousAttacks ?? 0;
             var homeSafeAttacks = snapshot.MatchSituation?.Home?.TotalSafeAttacks ?? 0;
             var awaySafeAttacks = snapshot.MatchSituation?.Away?.TotalSafeAttacks ?? 0;
             
-            sb.Append($",{homeDangerousAttacks}");
-            sb.Append($",{awayDangerousAttacks}");
-            sb.Append($",{homeSafeAttacks}");
-            sb.Append($",{awaySafeAttacks}");
+            sb.Append($"{homeDangerousAttacks},");
+            sb.Append($"{awayDangerousAttacks},");
+            sb.Append($"{homeSafeAttacks},");
+            sb.Append($"{awaySafeAttacks},");
             
             // Match details
             var homeCornerKicks = snapshot.MatchDetails?.Home?.CornerKicks ?? 0;
@@ -536,21 +560,21 @@ public class PredictionEnrichedMatchService
             var homeBallSafePercentage = snapshot.MatchDetails?.Home?.BallSafePercentage ?? 0;
             var awayBallSafePercentage = snapshot.MatchDetails?.Away?.BallSafePercentage ?? 0;
             
-            sb.Append($",{homeCornerKicks}");
-            sb.Append($",{awayCornerKicks}");
-            sb.Append($",{homeShotsOnTarget}");
-            sb.Append($",{awayShotsOnTarget}");
-            sb.Append($",{homeBallSafePercentage}");
-            sb.Append($",{awayBallSafePercentage}");
+            sb.Append($"{homeCornerKicks},");
+            sb.Append($"{awayCornerKicks},");
+            sb.Append($"{homeShotsOnTarget},");
+            sb.Append($"{awayShotsOnTarget},");
+            sb.Append($"{homeBallSafePercentage},");
+            sb.Append($"{awayBallSafePercentage},");
             
             // Prediction data
             var favorite = snapshot.PredictionData?.Favorite ?? "unknown";
             var confidence = snapshot.PredictionData?.ConfidenceScore ?? 0;
             var expectedGoals = snapshot.PredictionData?.ExpectedGoals ?? 0;
             
-            sb.Append($",{favorite}");
-            sb.Append($",{confidence}");
-            sb.Append($",{expectedGoals}");
+            sb.Append($"{favorite},");
+            sb.Append($"{confidence},");
+            sb.Append($"{expectedGoals},");
             
             // Team data
             var homeTeamForm = snapshot.PredictionData?.HomeTeamData?.Form ?? "";
@@ -560,19 +584,18 @@ public class PredictionEnrichedMatchService
             var homeTeamAvgGoals = snapshot.PredictionData?.HomeTeamData?.AvgTotalGoals ?? 0;
             var awayTeamAvgGoals = snapshot.PredictionData?.AwayTeamData?.AvgTotalGoals ?? 0;
             
-            sb.Append($",{homeTeamForm}");
-            sb.Append($",{awayTeamForm}");
-            sb.Append($",{homeTeamWinPct}");
-            sb.Append($",{awayTeamWinPct}");
-            sb.Append($",{homeTeamAvgGoals}");
-            sb.Append($",{awayTeamAvgGoals}");
+            sb.Append($"{homeTeamForm},");
+            sb.Append($"{awayTeamForm},");
+            sb.Append($"{homeTeamWinPct},");
+            sb.Append($"{awayTeamWinPct},");
+            sb.Append($"{homeTeamAvgGoals},");
+            sb.Append($"{awayTeamAvgGoals}");
             
             sb.AppendLine();
         }
         
         return sb.ToString();
-    }
-    
+    }    
     /// <summary>
     /// Exports a single match as a combined dataset for machine learning
     /// </summary>
@@ -701,7 +724,7 @@ public class PredictionEnrichedMatchService
     }
     
     /// <summary>
-    /// Exports all match data to a single consolidated ML dataset
+    /// Exports all match data to a single consolidated ML dataset using 9-snapshot timeline
     /// </summary>
     public async Task<string> ExportAllMatchesDatasetAsync()
     {
@@ -718,29 +741,36 @@ public class PredictionEnrichedMatchService
                 return "No data available";
             }
             
-            // Create CSV header
+            // Create CSV header with columns for all 9 time segments
             var sb = new System.Text.StringBuilder();
-            sb.AppendLine("match_id," +
-                        // Pre-match data (prediction)
-                        "pre_favorite,pre_confidence,pre_expected_goals," +
-                        "pre_home_team_form,pre_away_team_form," +
-                        "pre_home_team_win_pct,pre_away_team_win_pct," +
-                        "pre_home_team_avg_goals,pre_away_team_avg_goals," +
-                        "pre_home_corner_avg,pre_away_corner_avg," +
-                        
-                        // Mid-game data points (we'll use intervals)
-                        "mid_time_elapsed," +
-                        "mid_score," +
-                        "mid_home_dangerous_attacks,mid_away_dangerous_attacks," +
-                        "mid_home_corner_kicks,mid_away_corner_kicks," +
-                        "mid_home_shots_on_target,mid_away_shots_on_target," +
-                        "mid_home_ball_safe_percentage,mid_away_ball_safe_percentage," +
-                        
-                        // Final result data
-                        "final_score," +
-                        "final_home_dangerous_attacks,final_away_dangerous_attacks," +
-                        "final_home_corner_kicks,final_away_corner_kicks," +
-                        "final_home_shots_on_target,final_away_shots_on_target");
+            
+            // Match identification
+            sb.Append("match_id,home_team,away_team,status,match_date,");
+            
+            // Pre-match prediction data
+            sb.Append("pre_favorite,pre_confidence,pre_expected_goals,");
+            sb.Append("pre_home_team_form,pre_away_team_form,");
+            sb.Append("pre_home_win_pct,pre_away_win_pct,");
+            
+            // For each of the 9 time segments
+            for (int i = 0; i < 9; i++)
+            {
+                string segment = $"{i * 10}-{(i + 1) * 10}";
+                
+                sb.Append($"t{i+1}_played_time,");
+                sb.Append($"t{i+1}_score,");
+                sb.Append($"t{i+1}_home_dangerous_attacks,");
+                sb.Append($"t{i+1}_away_dangerous_attacks,");
+                sb.Append($"t{i+1}_home_shots_on_target,");
+                sb.Append($"t{i+1}_away_shots_on_target,");
+                sb.Append($"t{i+1}_home_corners,");
+                sb.Append($"t{i+1}_away_corners,");
+            }
+            
+            // Final outcome
+            sb.Append("final_score,final_result,prediction_correct");
+            
+            sb.AppendLine();
             
             // Process each match
             foreach (var group in matchGroups)
@@ -748,97 +778,82 @@ public class PredictionEnrichedMatchService
                 var matchId = group.Key;
                 var snapshots = group.OrderBy(s => s.Timestamp).ToList();
                 
-                // Only include matches with at least 3 snapshots and that have finished
+                // Only include matches with at least 3 snapshots
                 if (snapshots.Count < 3)
                 {
                     continue;
                 }
                 
-                // Get the first and last snapshots
+                // Get first snapshot for pre-match data
                 var firstSnapshot = snapshots.First();
+                
+                // Get 9 snapshots across the match timeline
+                var timelineSnapshots = GetTimelineSnapshots(snapshots);
+                
+                // Get final snapshot for outcome
                 var lastSnapshot = snapshots.Last();
                 
-                // Find a good mid-point snapshot (around 45-60 minutes if available)
-                var midSnapshot = snapshots
-                    .Where(s => ParsePlayedTime(s.PlayedTime) >= 45 && ParsePlayedTime(s.PlayedTime) <= 60)
-                    .OrderBy(s => Math.Abs(ParsePlayedTime(s.PlayedTime) - 45))
-                    .FirstOrDefault();
-                    
-                // If no mid-snapshot in desired range, take middle snapshot
-                if (midSnapshot == null && snapshots.Count > 2)
+                // Only include completed matches
+                if (!(lastSnapshot.PlayedTime.Contains("90:", StringComparison.OrdinalIgnoreCase) || 
+                    lastSnapshot.MatchStatus.Contains("Ended", StringComparison.OrdinalIgnoreCase) ||
+                    lastSnapshot.MatchStatus.Contains("finish", StringComparison.OrdinalIgnoreCase)))
                 {
-                    midSnapshot = snapshots[snapshots.Count / 2];
+                    continue;
                 }
-                // If still no mid-snapshot, use the first snapshot (less than ideal)
-                midSnapshot ??= firstSnapshot;
                 
-                // Build row with all data points
-                sb.Append(matchId);
+                // Match identification
+                sb.Append($"{matchId},");
+                sb.Append($"\"{firstSnapshot.PredictionData?.HomeTeamData?.Name ?? "Home Team"}\",");
+                sb.Append($"\"{firstSnapshot.PredictionData?.AwayTeamData?.Name ?? "Away Team"}\",");
+                sb.Append($"\"{firstSnapshot.MatchStatus ?? ""}\",");
+                sb.Append($"{firstSnapshot.Timestamp:yyyy-MM-dd},");
                 
                 // Pre-match prediction data
-                var preFavorite = firstSnapshot.PredictionData?.Favorite ?? "unknown";
-                var preConfidence = firstSnapshot.PredictionData?.ConfidenceScore ?? 0;
-                var preExpectedGoals = firstSnapshot.PredictionData?.ExpectedGoals ?? 0;
-                var preHomeTeamForm = firstSnapshot.PredictionData?.HomeTeamData?.Form ?? "";
-                var preAwayTeamForm = firstSnapshot.PredictionData?.AwayTeamData?.Form ?? "";
-                var preHomeTeamWinPct = firstSnapshot.PredictionData?.HomeTeamData?.WinPercentage ?? 0;
-                var preAwayTeamWinPct = firstSnapshot.PredictionData?.AwayTeamData?.WinPercentage ?? 0;
-                var preHomeTeamAvgGoals = firstSnapshot.PredictionData?.HomeTeamData?.AvgTotalGoals ?? 0;
-                var preAwayTeamAvgGoals = firstSnapshot.PredictionData?.AwayTeamData?.AvgTotalGoals ?? 0;
-                var preHomeCornerAvg = firstSnapshot.PredictionData?.CornerStats?.HomeAvg ?? 0;
-                var preAwayCornerAvg = firstSnapshot.PredictionData?.CornerStats?.AwayAvg ?? 0;
+                sb.Append($"{firstSnapshot.PredictionData?.Favorite ?? "unknown"},");
+                sb.Append($"{firstSnapshot.PredictionData?.ConfidenceScore ?? 0},");
+                sb.Append($"{firstSnapshot.PredictionData?.ExpectedGoals ?? 0},");
+                sb.Append($"{firstSnapshot.PredictionData?.HomeTeamData?.Form ?? ""},");
+                sb.Append($"{firstSnapshot.PredictionData?.AwayTeamData?.Form ?? ""},");
+                sb.Append($"{firstSnapshot.PredictionData?.HomeTeamData?.WinPercentage ?? 0},");
+                sb.Append($"{firstSnapshot.PredictionData?.AwayTeamData?.WinPercentage ?? 0},");
                 
-                sb.Append($",{preFavorite}");
-                sb.Append($",{preConfidence}");
-                sb.Append($",{preExpectedGoals}");
-                sb.Append($",{preHomeTeamForm}");
-                sb.Append($",{preAwayTeamForm}");
-                sb.Append($",{preHomeTeamWinPct}");
-                sb.Append($",{preAwayTeamWinPct}");
-                sb.Append($",{preHomeTeamAvgGoals}");
-                sb.Append($",{preAwayTeamAvgGoals}");
-                sb.Append($",{preHomeCornerAvg}");
-                sb.Append($",{preAwayCornerAvg}");
+                // For each of the 9 time segments
+                for (int i = 0; i < 9; i++)
+                {
+                    var snapshot = i < timelineSnapshots.Count ? timelineSnapshots[i] : lastSnapshot;
+                    
+                    sb.Append($"{snapshot.PlayedTime},");
+                    sb.Append($"{snapshot.Score},");
+                    sb.Append($"{snapshot.MatchSituation?.Home?.TotalDangerousAttacks ?? 0},");
+                    sb.Append($"{snapshot.MatchSituation?.Away?.TotalDangerousAttacks ?? 0},");
+                    sb.Append($"{snapshot.MatchDetails?.Home?.ShotsOnTarget ?? 0},");
+                    sb.Append($"{snapshot.MatchDetails?.Away?.ShotsOnTarget ?? 0},");
+                    sb.Append($"{snapshot.MatchDetails?.Home?.CornerKicks ?? 0},");
+                    sb.Append($"{snapshot.MatchDetails?.Away?.CornerKicks ?? 0},");
+                }
                 
-                // Mid-game data
-                var midTimeElapsed = midSnapshot.PlayedTime;
-                var midScore = midSnapshot.Score;
-                var midHomeDangerousAttacks = midSnapshot.MatchSituation?.Home?.TotalDangerousAttacks ?? 0;
-                var midAwayDangerousAttacks = midSnapshot.MatchSituation?.Away?.TotalDangerousAttacks ?? 0;
-                var midHomeCornerKicks = midSnapshot.MatchDetails?.Home?.CornerKicks ?? 0;
-                var midAwayCornerKicks = midSnapshot.MatchDetails?.Away?.CornerKicks ?? 0;
-                var midHomeShotsOnTarget = midSnapshot.MatchDetails?.Home?.ShotsOnTarget ?? 0;
-                var midAwayShotsOnTarget = midSnapshot.MatchDetails?.Away?.ShotsOnTarget ?? 0;
-                var midHomeBallSafePercentage = midSnapshot.MatchDetails?.Home?.BallSafePercentage ?? 0;
-                var midAwayBallSafePercentage = midSnapshot.MatchDetails?.Away?.BallSafePercentage ?? 0;
+                // Final outcome
+                sb.Append($"{lastSnapshot.Score},");
                 
-                sb.Append($",{midTimeElapsed}");
-                sb.Append($",{midScore}");
-                sb.Append($",{midHomeDangerousAttacks}");
-                sb.Append($",{midAwayDangerousAttacks}");
-                sb.Append($",{midHomeCornerKicks}");
-                sb.Append($",{midAwayCornerKicks}");
-                sb.Append($",{midHomeShotsOnTarget}");
-                sb.Append($",{midAwayShotsOnTarget}");
-                sb.Append($",{midHomeBallSafePercentage}");
-                sb.Append($",{midAwayBallSafePercentage}");
+                // Determine actual match outcome
+                string actualOutcome = "unknown";
+                var finalScore = ParseScore(lastSnapshot.Score);
+                if (finalScore.HasValue)
+                {
+                    var (homeGoals, awayGoals) = finalScore.Value;
+                    if (homeGoals > awayGoals)
+                        actualOutcome = "home";
+                    else if (homeGoals < awayGoals)
+                        actualOutcome = "away";
+                    else
+                        actualOutcome = "draw";
+                }
                 
-                // Final result data
-                var finalScore = lastSnapshot.Score;
-                var finalHomeDangerousAttacks = lastSnapshot.MatchSituation?.Home?.TotalDangerousAttacks ?? 0;
-                var finalAwayDangerousAttacks = lastSnapshot.MatchSituation?.Away?.TotalDangerousAttacks ?? 0;
-                var finalHomeCornerKicks = lastSnapshot.MatchDetails?.Home?.CornerKicks ?? 0;
-                var finalAwayCornerKicks = lastSnapshot.MatchDetails?.Away?.CornerKicks ?? 0;
-                var finalHomeShotsOnTarget = lastSnapshot.MatchDetails?.Home?.ShotsOnTarget ?? 0;
-                var finalAwayShotsOnTarget = lastSnapshot.MatchDetails?.Away?.ShotsOnTarget ?? 0;
+                sb.Append($"{actualOutcome},");
                 
-                sb.Append($",{finalScore}");
-                sb.Append($",{finalHomeDangerousAttacks}");
-                sb.Append($",{finalAwayDangerousAttacks}");
-                sb.Append($",{finalHomeCornerKicks}");
-                sb.Append($",{finalAwayCornerKicks}");
-                sb.Append($",{finalHomeShotsOnTarget}");
-                sb.Append($",{finalAwayShotsOnTarget}");
+                // Was prediction correct?
+                bool isPredictionCorrect = firstSnapshot.PredictionData?.Favorite == actualOutcome;
+                sb.Append(isPredictionCorrect ? "true" : "false");
                 
                 sb.AppendLine();
             }
@@ -850,6 +865,94 @@ public class PredictionEnrichedMatchService
             _logger.LogError(ex, "Error exporting all matches dataset");
             return $"Error exporting dataset: {ex.Message}";
         }
+    }
+    
+    /// <summary>
+    /// Gets 9 snapshots across the match timeline (0-10, 10-20, ..., 80-90)
+    /// </summary>
+    private List<MatchSnapshot> GetTimelineSnapshots(List<MatchSnapshot> allSnapshots)
+    {
+        var result = new List<MatchSnapshot>();
+        
+        // Define 9 time ranges (0-10, 10-20, ..., 80-90)
+        var timeRanges = new List<(int Start, int End)>
+        {
+            (0, 10),
+            (10, 20),
+            (20, 30),
+            (30, 40),
+            (40, 50), // Includes halftime
+            (50, 60),
+            (60, 70),
+            (70, 80),
+            (80, 90)  // Plus any added time
+        };
+        
+        // Find best snapshot for each time range
+        foreach (var (start, end) in timeRanges)
+        {
+            // First try to find snapshots within this exact range
+            var rangeSnapshots = allSnapshots
+                .Where(s => {
+                    var minutes = ParsePlayedTime(s.PlayedTime);
+                    return minutes >= start && minutes < end;
+                })
+                .ToList();
+                
+            // If we have snapshots in this range, pick the one closest to the middle of the range
+            if (rangeSnapshots.Any())
+            {
+                var middleTime = start + (end - start) / 2;
+                var bestSnapshot = rangeSnapshots
+                    .OrderBy(s => Math.Abs(ParsePlayedTime(s.PlayedTime) - middleTime))
+                    .First();
+                    
+                result.Add(bestSnapshot);
+            }
+            else
+            {
+                // If no snapshots in this exact range, find closest one
+                var middleTime = start + (end - start) / 2;
+                var bestSnapshot = allSnapshots
+                    .OrderBy(s => Math.Abs(ParsePlayedTime(s.PlayedTime) - middleTime))
+                    .First();
+                    
+                result.Add(bestSnapshot);
+            }
+        }
+        
+        // Ensure we have exactly 9 snapshots
+        while (result.Count < 9)
+        {
+            // If we don't have enough snapshots, duplicate the last one
+            result.Add(result.LastOrDefault() ?? allSnapshots.LastOrDefault());
+        }
+        
+        // If we somehow got more than 9, trim the excess
+        if (result.Count > 9)
+        {
+            result = result.Take(9).ToList();
+        }
+        
+        return result;
+    }
+    
+    /// <summary>
+    /// Helper method to parse score string (e.g., "2-1")
+    /// </summary>
+    private (int Home, int Away)? ParseScore(string scoreStr)
+    {
+        if (string.IsNullOrEmpty(scoreStr))
+            return null;
+            
+        var parts = scoreStr.Split(':');
+        if (parts.Length != 2)
+            return null;
+            
+        if (!int.TryParse(parts[0], out int homeGoals) || !int.TryParse(parts[1], out int awayGoals))
+            return null;
+            
+        return (homeGoals, awayGoals);
     }
     
     /// <summary>
