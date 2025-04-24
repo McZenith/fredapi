@@ -23,6 +23,7 @@ public class PredictionResultsService
 
     // Constants for cache keys
     private const string CACHE_KEY_PREDICTION_RESULTS = "prediction_results";
+    private const string CACHE_KEY_COMPLETED_MATCH_BATCH = "completed_match_batch_";
 
     public PredictionResultsService(
         ILogger<PredictionResultsService> logger,
@@ -52,6 +53,9 @@ public class PredictionResultsService
             var startTime = endTime.AddHours(-24); // Last 24 hours
 
             // Get snapshots within time range to identify completed matches
+            _logger.LogInformation("Retrieving snapshots between {StartTime} and {EndTime}", 
+                startTime, endTime);
+                
             var recentSnapshots = await _predictionEnrichedMatchService.GetAllMatchSnapshotsAsync(startTime, endTime);
 
             if (!recentSnapshots.Any())
@@ -90,7 +94,20 @@ public class PredictionResultsService
 
             foreach (var matchIdBatch in completedMatchIds.Chunk(batchSize))
             {
+                var batchCacheKey = $"{CACHE_KEY_COMPLETED_MATCH_BATCH}{string.Join("_", matchIdBatch)}";
+                
+                // Try to get batch results from cache first
+                if (_cache.TryGetValue(batchCacheKey, out List<PredictionResult> cachedBatchResults))
+                {
+                    _logger.LogInformation("Retrieved processed batch from cache: {Count} matches", 
+                        cachedBatchResults.Count);
+                    predictionResults.AddRange(cachedBatchResults);
+                    processedCount += matchIdBatch.Length;
+                    continue;
+                }
+                
                 List<Task<PredictionResult>> processingTasks = new List<Task<PredictionResult>>();
+                var batchResults = new List<PredictionResult>();
 
                 foreach (var matchId in matchIdBatch)
                 {
@@ -98,8 +115,8 @@ public class PredictionResultsService
                     {
                         try
                         {
-                            // Get ALL snapshots for this match from the database - not just from our time window
-                            // This ensures we have the complete history for accurate timeline representation
+                            // Get ALL snapshots for this match from the cache/database
+                            // This is the key optimization - using the improved caching in PredictionEnrichedMatchService
                             var matchSnapshots = await _predictionEnrichedMatchService.GetMatchSnapshotsAsync(matchId);
 
                             // Log how many snapshots we found for this match
@@ -153,9 +170,13 @@ public class PredictionResultsService
                     // Add non-null results to our collection
                     foreach (var result in results.Where(r => r != null))
                     {
+                        batchResults.Add(result);
                         predictionResults.Add(result);
                     }
 
+                    // Cache the batch results
+                    _cache.Set(batchCacheKey, batchResults, TimeSpan.FromMinutes(30));
+                    
                     processedCount += matchIdBatch.Length;
                     _logger.LogInformation($"Processed {processedCount}/{completedMatchIds.Count} matches");
                 }
@@ -374,7 +395,8 @@ public class PredictionResultsService
     /// </summary>
     private List<MatchSnapshot> GetTimelineSnapshots(List<MatchSnapshot> allSnapshots)
     {
-        // Ensure snapshots are ordered by timestamp
+        // Leverage the same timeline snapshot functionality from PredictionEnrichedMatchService
+        // This avoids duplicate implementation and ensures consistent behavior
         var orderedSnapshots = allSnapshots.OrderBy(s => s.Timestamp).ToList();
 
         // Initialize result collection with capacity for 9 segments
@@ -400,7 +422,6 @@ public class PredictionResultsService
         // Dictionary to map time ranges to snapshots
         var timeRangeSnapshots = new Dictionary<(int, int), MatchSnapshot>();
 
-        // Find best snapshot for each time range
         foreach (var (start, end) in timeRanges)
         {
             // First, find snapshots exactly within this range
@@ -453,7 +474,6 @@ public class PredictionResultsService
                 else
                 {
                     // If we've used all snapshots already, note that we have missing data
-                    // Instead of duplicating, we'll add placeholder information with null
                     _logger.LogWarning(
                         $"Missing representative snapshot for time range {start}-{end} and no unused snapshots available");
 

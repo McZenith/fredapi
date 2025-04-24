@@ -21,6 +21,7 @@ public class PredictionEnrichedMatchService
     // Constants for cache keys
     private const string CACHE_KEY_ENRICHED_MATCH = "prediction_enriched_match_";
     private const string CACHE_KEY_MATCH_SNAPSHOTS = "match_snapshots_";
+    private const string CACHE_KEY_ALL_SNAPSHOTS = "all_snapshots_";
 
     // Concurrent dictionary to track snapshots per match
     // This enables safe collection of multiple snapshots per match from different threads
@@ -433,10 +434,23 @@ public class PredictionEnrichedMatchService
     /// </summary>
     public async Task<List<MatchSnapshot>> GetMatchSnapshotsAsync(int matchId)
     {
-        // Check in-memory cache first
+        // Use a specific cache key for this match's snapshots
+        var cacheKey = $"{CACHE_KEY_MATCH_SNAPSHOTS}{matchId}";
+        
+        // Check memory cache first
+        if (_cache.TryGetValue(cacheKey, out List<MatchSnapshot> cachedSnapshots))
+        {
+            _logger.LogDebug($"Retrieved {cachedSnapshots.Count} snapshots for match {matchId} from cache");
+            return cachedSnapshots;
+        }
+        
+        // Check in-memory collection next
         if (_matchSnapshots.TryGetValue(matchId, out var snapshots))
         {
-            return snapshots.OrderBy(s => s.Timestamp).ToList();
+            var sortedSnapshots = snapshots.OrderBy(s => s.Timestamp).ToList();
+            // Cache the sorted result
+            _cache.Set(cacheKey, sortedSnapshots, TimeSpan.FromMinutes(5));
+            return sortedSnapshots;
         }
 
         // If not in memory, check database
@@ -446,7 +460,18 @@ public class PredictionEnrichedMatchService
             var filter = Builders<MatchSnapshot>.Filter.Eq(s => s.MatchId, matchId);
             var sort = Builders<MatchSnapshot>.Sort.Ascending(s => s.Timestamp);
 
-            return await collection.Find(filter).Sort(sort).ToListAsync();
+            var databaseSnapshots = await collection.Find(filter).Sort(sort).ToListAsync();
+            
+            // Cache the result
+            if (databaseSnapshots.Any())
+            {
+                _cache.Set(cacheKey, databaseSnapshots, TimeSpan.FromMinutes(5));
+                
+                // Also store in memory collection for future use
+                _matchSnapshots[matchId] = new ConcurrentBag<MatchSnapshot>(databaseSnapshots);
+            }
+            
+            return databaseSnapshots;
         }
         catch (Exception ex)
         {
@@ -459,9 +484,10 @@ public async Task<List<MatchSnapshot>> GetAllMatchSnapshotsAsync(DateTime? start
 {
     try
     {
-        // Check if we have a cached version of this query first
-        string cacheKey = $"all_snapshots_{startDate?.ToString("yyyyMMddHHmm") ?? "none"}_{endDate?.ToString("yyyyMMddHHmm") ?? "none"}";
+        // Build cache key based on date parameters
+        string cacheKey = $"{CACHE_KEY_ALL_SNAPSHOTS}{startDate?.ToString("yyyyMMddHHmm") ?? "none"}_{endDate?.ToString("yyyyMMddHHmm") ?? "none"}";
         
+        // Check if we have a cached version of this query first
         if (_cache.TryGetValue(cacheKey, out List<MatchSnapshot> cachedResults) && cachedResults != null)
         {
             _logger.LogDebug($"Retrieved {cachedResults.Count} snapshots from cache for {cacheKey}");
@@ -551,7 +577,7 @@ public async Task<List<MatchSnapshot>> GetAllMatchSnapshotsAsync(DateTime? start
         _logger.LogInformation($"Retrieved total {allResults.Count} snapshots in {sw.ElapsedMilliseconds}ms");
         
         // Cache the results for future use if not too large
-        if (allResults.Count <= 10000)
+        if (allResults.Count <= 50000)
         {
             _cache.Set(cacheKey, allResults, TimeSpan.FromMinutes(5));
         }
@@ -568,6 +594,8 @@ public async Task<List<MatchSnapshot>> GetAllMatchSnapshotsAsync(DateTime? start
         return new List<MatchSnapshot>();
     }
 }
+
+    // Rest of the methods remain unchanged...
     /// <summary>
     /// Exports a single match as a combined dataset for machine learning
     /// </summary>
