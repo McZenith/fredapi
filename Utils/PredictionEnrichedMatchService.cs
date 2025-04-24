@@ -17,15 +17,15 @@ public class PredictionEnrichedMatchService
     private readonly ILogger<PredictionEnrichedMatchService> _logger;
     private readonly MongoDbService _mongoDbService;
     private readonly IMemoryCache _cache;
-    
+
     // Constants for cache keys
     private const string CACHE_KEY_ENRICHED_MATCH = "prediction_enriched_match_";
     private const string CACHE_KEY_MATCH_SNAPSHOTS = "match_snapshots_";
-    
+
     // Concurrent dictionary to track snapshots per match
     // This enables safe collection of multiple snapshots per match from different threads
     private readonly ConcurrentDictionary<int, ConcurrentBag<MatchSnapshot>> _matchSnapshots = new();
-    
+
     // Semaphore for controlling DB access
     private static readonly SemaphoreSlim _dbSemaphore = new(1, 1);
 
@@ -41,7 +41,7 @@ public class PredictionEnrichedMatchService
         // Initialize collections if needed
         InitializeCollections().GetAwaiter().GetResult();
     }
-    
+
     /// <summary>
     /// Create necessary collections if they don't exist
     /// </summary>
@@ -52,34 +52,35 @@ public class PredictionEnrichedMatchService
             // Create time-to-live index on snapshots collection
             var snapshotsCollection = _mongoDbService.GetCollection<MatchSnapshot>("MatchSnapshots");
             var indexKeys = Builders<MatchSnapshot>.IndexKeys.Ascending(x => x.Timestamp);
-            var indexOptions = new CreateIndexOptions 
-            { 
-                ExpireAfter = TimeSpan.FromDays(30), 
-                Name = "TTL_Timestamp" 
+            var indexOptions = new CreateIndexOptions
+            {
+                ExpireAfter = TimeSpan.FromDays(30),
+                Name = "TTL_Timestamp"
             };
-            
+
             await snapshotsCollection.Indexes.CreateOneAsync(
                 new CreateIndexModel<MatchSnapshot>(indexKeys, indexOptions));
-            
+
             // Create index on match ID for efficient querying
             var matchIdIndex = Builders<MatchSnapshot>.IndexKeys.Ascending(x => x.MatchId);
             await snapshotsCollection.Indexes.CreateOneAsync(
                 new CreateIndexModel<MatchSnapshot>(matchIdIndex, new CreateIndexOptions { Name = "IX_MatchId" }));
-            
-            _logger.LogInformation("Successfully initialized collections and indexes for prediction-enriched match service");
+
+            _logger.LogInformation(
+                "Successfully initialized collections and indexes for prediction-enriched match service");
         }
         catch (Exception ex)
         {
             _logger.LogError(ex, "Error initializing collections for prediction-enriched match service");
         }
     }
-    
+
     /// <summary>
     /// Enriches live matches with prediction data for both arbitrage opportunities and all matches
     /// </summary>
-    public async Task<(List<ClientMatch> enrichedArbitrageMatches, List<ClientMatch> enrichedAllMatches)> 
+    public async Task<(List<ClientMatch> enrichedArbitrageMatches, List<ClientMatch> enrichedAllMatches)>
         EnrichMatchesWithPredictionDataAsync(
-            List<Match> arbitrageMatches, 
+            List<Match> arbitrageMatches,
             List<Match> allMatches)
     {
         try
@@ -94,21 +95,21 @@ public class PredictionEnrichedMatchService
                     allMatches.Select(m => ConvertToClientMatch(m)).ToList()
                 );
             }
-            
+
             _logger.LogInformation($"Enriching {allMatches.Count} matches with prediction data");
-            
+
             // Create enriched versions of all matches
             var enrichedAllMatches = await EnrichMatchesAsync(allMatches, predictionData);
-            
+
             // Create enriched versions of arbitrage matches
             var arbitrageMatchIds = arbitrageMatches.Select(m => m.Id).ToHashSet();
             var enrichedArbitrageMatches = enrichedAllMatches
                 .Where(m => arbitrageMatchIds.Contains(m.Id))
                 .ToList();
-            
+
             // Take a snapshot of all matches for ML purposes
             await TakeMatchSnapshotsAsync(enrichedAllMatches);
-            
+
             return (enrichedArbitrageMatches, enrichedAllMatches);
         }
         catch (Exception ex)
@@ -121,13 +122,13 @@ public class PredictionEnrichedMatchService
             );
         }
     }
-    
+
     private async Task<List<ClientMatch>> EnrichMatchesAsync(
-        List<Match> matches, 
+        List<Match> matches,
         PredictionDataResponse predictionData)
     {
         var enrichedMatches = new List<ClientMatch>(matches.Count);
-        
+
         foreach (var match in matches)
         {
             try
@@ -141,10 +142,10 @@ public class PredictionEnrichedMatchService
                     enrichedMatches.Add(cachedMatch);
                     continue;
                 }
-                
+
                 // Convert to client match
                 var clientMatch = ConvertToClientMatch(match);
-                
+
                 // Find corresponding prediction data if available
                 var matchPrediction = FindMatchPrediction(match, predictionData);
                 if (matchPrediction != null)
@@ -167,7 +168,7 @@ public class PredictionEnrichedMatchService
                         {
                             HomeFirstGoalRate = matchPrediction.ScoringPatterns?.HomeFirstGoalRate ?? 0,
                             AwayFirstGoalRate = matchPrediction.ScoringPatterns?.AwayFirstGoalRate ?? 0,
-                            HomeLateGoalRate = matchPrediction.ScoringPatterns?.HomeLateGoalRate ?? 0, 
+                            HomeLateGoalRate = matchPrediction.ScoringPatterns?.HomeLateGoalRate ?? 0,
                             AwayLateGoalRate = matchPrediction.ScoringPatterns?.AwayLateGoalRate ?? 0
                         },
                         ReasonsForPrediction = matchPrediction.ReasonsForPrediction?.ToList() ?? new List<string>(),
@@ -190,11 +191,11 @@ public class PredictionEnrichedMatchService
                         HomeTeamData = ConvertTeamData(matchPrediction.HomeTeam),
                         AwayTeamData = ConvertTeamData(matchPrediction.AwayTeam)
                     };
-                    
+
                     // Cache the enriched match for 5 minutes
                     _cache.Set(cacheKey, clientMatch, TimeSpan.FromMinutes(5));
                 }
-                
+
                 enrichedMatches.Add(clientMatch);
             }
             catch (Exception ex)
@@ -204,7 +205,7 @@ public class PredictionEnrichedMatchService
                 enrichedMatches.Add(ConvertToClientMatch(match));
             }
         }
-        
+
         return enrichedMatches;
     }
 
@@ -215,43 +216,45 @@ public class PredictionEnrichedMatchService
     {
         if (predictionData?.Data?.UpcomingMatches == null || !predictionData.Data.UpcomingMatches.Any())
             return null;
-            
+
         // Clean team names for better matching
         string cleanHomeTeam = CleanTeamName(match.Teams.Home.Name);
         string cleanAwayTeam = CleanTeamName(match.Teams.Away.Name);
-        
+
         // Try to find by team names (exact match)
-        var prediction = predictionData.Data.UpcomingMatches.FirstOrDefault(p => 
-            CleanTeamName(p.HomeTeam.Name) == cleanHomeTeam && 
+        var prediction = predictionData.Data.UpcomingMatches.FirstOrDefault(p =>
+            CleanTeamName(p.HomeTeam.Name) == cleanHomeTeam &&
             CleanTeamName(p.AwayTeam.Name) == cleanAwayTeam);
-            
+
         if (prediction != null)
             return prediction;
-            
+
         // Try more lenient matching (contains)
-        prediction = predictionData.Data.UpcomingMatches.FirstOrDefault(p => 
-            (CleanTeamName(p.HomeTeam.Name).Contains(cleanHomeTeam) || cleanHomeTeam.Contains(CleanTeamName(p.HomeTeam.Name))) && 
-            (CleanTeamName(p.AwayTeam.Name).Contains(cleanAwayTeam) || cleanAwayTeam.Contains(CleanTeamName(p.AwayTeam.Name))));
-            
+        prediction = predictionData.Data.UpcomingMatches.FirstOrDefault(p =>
+            (CleanTeamName(p.HomeTeam.Name).Contains(cleanHomeTeam) ||
+             cleanHomeTeam.Contains(CleanTeamName(p.HomeTeam.Name))) &&
+            (CleanTeamName(p.AwayTeam.Name).Contains(cleanAwayTeam) ||
+             cleanAwayTeam.Contains(CleanTeamName(p.AwayTeam.Name))));
+
         return prediction;
     }
-    
+
     private string CleanTeamName(string name)
     {
         if (string.IsNullOrEmpty(name))
             return string.Empty;
-            
+
         // Remove suffixes like FC, United, etc.
         var cleanName = name.Replace("FC", "").Replace("United", "").Replace("City", "");
         // Remove non-alphanumeric characters and trim
         return new string(cleanName.Where(c => char.IsLetterOrDigit(c) || char.IsWhiteSpace(c)).ToArray()).Trim();
     }
-    
+
     private ClientTeamData ConvertTeamData(TeamData teamData)
     {
         if (teamData == null)
             return null;
-            
+
         return new ClientTeamData
         {
             Name = teamData.Name,
@@ -273,7 +276,7 @@ public class PredictionEnrichedMatchService
             AwayWinPercentage = teamData.AwayWinPercentage
         };
     }
-    
+
     private void UpdateLiveData(ClientMatch cachedMatch, Match liveMatch)
     {
         // Update live data fields
@@ -282,12 +285,12 @@ public class PredictionEnrichedMatchService
         cachedMatch.MatchStatus = liveMatch.MatchStatus;
         cachedMatch.PlayedTime = liveMatch.PlayedTime;
         cachedMatch.LastUpdated = DateTime.UtcNow;
-        
+
         // Update match situation and details
         cachedMatch.MatchSituation = liveMatch.MatchSituation;
         cachedMatch.MatchDetails = liveMatch.MatchDetails;
     }
-    
+
     private ClientMatch ConvertToClientMatch(Match match)
     {
         return new ClientMatch
@@ -325,7 +328,7 @@ public class PredictionEnrichedMatchService
             MatchDetails = match.MatchDetails
         };
     }
-    
+
     /// <summary>
     /// Takes snapshots of all matches for ML purposes
     /// </summary>
@@ -336,10 +339,9 @@ public class PredictionEnrichedMatchService
             // Group snapshots by match ID
             var newSnapshots = new List<MatchSnapshot>();
             var timestamp = DateTime.UtcNow;
-            
+
             foreach (var match in matches)
             {
-               
                 // Create snapshot
                 var snapshot = new MatchSnapshot
                 {
@@ -354,18 +356,18 @@ public class PredictionEnrichedMatchService
                     MatchDetails = match.MatchDetails,
                     PredictionData = match.PredictionData
                 };
-                
+
                 // Add to collection
                 if (!_matchSnapshots.TryGetValue(match.Id, out var snapshots))
                 {
                     snapshots = new ConcurrentBag<MatchSnapshot>();
                     _matchSnapshots[match.Id] = snapshots;
                 }
-                
+
                 snapshots.Add(snapshot);
                 newSnapshots.Add(snapshot);
             }
-            
+
             // Only save to DB if we have snapshots
             if (newSnapshots.Count > 0)
             {
@@ -388,7 +390,7 @@ public class PredictionEnrichedMatchService
             _logger.LogError(ex, "Error taking match snapshots");
         }
     }
-    
+
     /// <summary>
     /// Saves snapshots to database
     /// </summary>
@@ -397,10 +399,10 @@ public class PredictionEnrichedMatchService
         try
         {
             await _dbSemaphore.WaitAsync();
-            
+
             // Get collection
             var collection = _mongoDbService.GetCollection<MatchSnapshot>("MatchSnapshots");
-            
+
             // Batch by 100 snapshots for efficient writes
             foreach (var batch in snapshots.Chunk(100))
             {
@@ -413,7 +415,7 @@ public class PredictionEnrichedMatchService
                     _logger.LogError(ex, $"Error saving batch of {batch.Length} snapshots");
                 }
             }
-            
+
             _logger.LogInformation($"Saved {snapshots.Count} match snapshots to database");
         }
         catch (Exception ex)
@@ -425,7 +427,7 @@ public class PredictionEnrichedMatchService
             _dbSemaphore.Release();
         }
     }
-    
+
     /// <summary>
     /// Gets all snapshots for a specific match
     /// </summary>
@@ -436,14 +438,14 @@ public class PredictionEnrichedMatchService
         {
             return snapshots.OrderBy(s => s.Timestamp).ToList();
         }
-        
+
         // If not in memory, check database
         try
         {
             var collection = _mongoDbService.GetCollection<MatchSnapshot>("MatchSnapshots");
             var filter = Builders<MatchSnapshot>.Filter.Eq(s => s.MatchId, matchId);
             var sort = Builders<MatchSnapshot>.Sort.Ascending(s => s.Timestamp);
-            
+
             return await collection.Find(filter).Sort(sort).ToListAsync();
         }
         catch (Exception ex)
@@ -452,106 +454,318 @@ public class PredictionEnrichedMatchService
             return new List<MatchSnapshot>();
         }
     }
-    
-    /// <summary>
-    /// Gets all available snapshots for all matches
-    /// </summary>
-    public async Task<List<MatchSnapshot>> GetAllMatchSnapshotsAsync(DateTime? startDate = null, DateTime? endDate = null)
+
+public async Task<List<MatchSnapshot>> GetAllMatchSnapshotsAsync(DateTime? startDate = null, DateTime? endDate = null)
+{
+    try
     {
-        try
+        // Check if we have a cached version of this query first
+        string cacheKey = $"all_snapshots_{startDate?.ToString("yyyyMMddHHmm") ?? "none"}_{endDate?.ToString("yyyyMMddHHmm") ?? "none"}";
+        
+        if (_cache.TryGetValue(cacheKey, out List<MatchSnapshot> cachedResults) && cachedResults != null)
         {
-            var collection = _mongoDbService.GetCollection<MatchSnapshot>("MatchSnapshots");
-            var filter = Builders<MatchSnapshot>.Filter.Empty;
+            _logger.LogDebug($"Retrieved {cachedResults.Count} snapshots from cache for {cacheKey}");
+            return cachedResults;
+        }
+        
+        // Start timer for performance logging
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        
+        // Get collection with proper MongoDB typing
+        var collection = _mongoDbService.GetCollection<MatchSnapshot>("MatchSnapshots");
+        
+        // Create filter builder once to reuse
+        var filterBuilder = Builders<MatchSnapshot>.Filter;
+        
+        // Start with an empty filter or optimize for null parameters
+        var filter = filterBuilder.Empty;
+        
+        // Store all results from chunks
+        var allResults = new List<MatchSnapshot>();
+        
+        // Determine our chunking strategy based on date range
+        TimeSpan chunkSize = TimeSpan.FromDays(1); // Default to 1-day chunks
+        DateTime chunkStart, chunkEnd;
+        
+        if (startDate.HasValue && endDate.HasValue)
+        {
+            // Calculate total timespan
+            var totalTimeSpan = endDate.Value - startDate.Value;
             
-            if (startDate.HasValue)
+            // If date range is small enough, just use it directly with no chunking
+            if (totalTimeSpan <= TimeSpan.FromDays(1))
             {
-                filter = Builders<MatchSnapshot>.Filter.Gte(s => s.Timestamp, startDate.Value);
+                chunkStart = startDate.Value;
+                chunkEnd = endDate.Value;
+                
+                var chunkFilter = filterBuilder.And(
+                    filterBuilder.Gte(s => s.Timestamp, chunkStart),
+                    filterBuilder.Lte(s => s.Timestamp, chunkEnd)
+                );
+                
+                var sort = Builders<MatchSnapshot>.Sort.Ascending(s => s.Timestamp);
+                
+                try
+                {
+                    // Use smaller limit to prevent timeouts
+                    var chunkResults = await collection.Find(chunkFilter)
+                        .Sort(sort)
+                        .Limit(500)
+                        .ToListAsync();
+                        
+                    allResults.AddRange(chunkResults);
+                    _logger.LogInformation($"Retrieved {chunkResults.Count} snapshots for time range {chunkStart} to {chunkEnd}");
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, $"Error retrieving chunk {chunkStart} to {chunkEnd}");
+                }
+                
+                sw.Stop();
+                _logger.LogInformation($"Retrieved total {allResults.Count} snapshots in {sw.ElapsedMilliseconds}ms");
+                
+                // Cache the results
+                _cache.Set(cacheKey, allResults, TimeSpan.FromMinutes(5));
+                
+                return allResults;
             }
             
-            if (endDate.HasValue)
+            // For larger date ranges, determine appropriate chunk size
+            if (totalTimeSpan > TimeSpan.FromDays(30))
             {
-                filter = filter & Builders<MatchSnapshot>.Filter.Lte(s => s.Timestamp, endDate.Value);
+                chunkSize = TimeSpan.FromDays(7); // Use 1-week chunks for long ranges
+            }
+            else if (totalTimeSpan > TimeSpan.FromDays(7))
+            {
+                chunkSize = TimeSpan.FromDays(2); // Use 2-day chunks for medium ranges
             }
             
-            return await collection.Find(filter).ToListAsync();
+            // Initialize our chunk start/end
+            chunkStart = startDate.Value;
+            chunkEnd = chunkStart.Add(chunkSize);
+            
+            // Cap the last chunk to the requested end date
+            if (chunkEnd > endDate.Value)
+            {
+                chunkEnd = endDate.Value;
+            }
         }
-        catch (Exception ex)
+        else if (startDate.HasValue)
         {
-            _logger.LogError(ex, "Error getting all match snapshots");
-            return new List<MatchSnapshot>();
+            // If only start date, use a single chunk with limit
+            var chunkFilter = filterBuilder.Gte(s => s.Timestamp, startDate.Value);
+            var sort = Builders<MatchSnapshot>.Sort.Ascending(s => s.Timestamp);
+            
+            try
+            {
+                var chunkResults = await collection.Find(chunkFilter)
+                    .Sort(sort)
+                    .Limit(500) // Limit to avoid timeouts
+                    .ToListAsync();
+                    
+                allResults.AddRange(chunkResults);
+                _logger.LogInformation($"Retrieved {chunkResults.Count} snapshots from {startDate.Value} (with limit)");
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, $"Error retrieving from {startDate.Value}");
+            }
+            
+            sw.Stop();
+            _logger.LogInformation($"Retrieved total {allResults.Count} snapshots in {sw.ElapsedMilliseconds}ms");
+            
+            // Cache the results
+            _cache.Set(cacheKey, allResults, TimeSpan.FromMinutes(5));
+            
+            return allResults;
         }
+        else if (endDate.HasValue)
+        {
+            // If only end date, use a single chunk with limit
+            var chunkFilter = filterBuilder.Lte(s => s.Timestamp, endDate.Value);
+            var sort = Builders<MatchSnapshot>.Sort.Descending(s => s.Timestamp);
+            
+            try
+            {
+                var chunkResults = await collection.Find(chunkFilter)
+                    .Sort(sort)
+                    .Limit(500) // Limit to avoid timeouts
+                    .ToListAsync();
+                    
+                allResults.AddRange(chunkResults);
+                _logger.LogInformation($"Retrieved {chunkResults.Count} snapshots up to {endDate.Value} (with limit)");
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, $"Error retrieving up to {endDate.Value}");
+            }
+            
+            sw.Stop();
+            _logger.LogInformation($"Retrieved total {allResults.Count} snapshots in {sw.ElapsedMilliseconds}ms");
+            
+            // Cache the results
+            _cache.Set(cacheKey, allResults, TimeSpan.FromMinutes(5));
+            
+            return allResults;
+        }
+        else
+        {
+            // If no dates specified, just get most recent with limit
+            var sort = Builders<MatchSnapshot>.Sort.Descending(s => s.Timestamp);
+            
+            try
+            {
+                var chunkResults = await collection.Find(filterBuilder.Empty)
+                    .Sort(sort)
+                    .Limit(100) // More restrictive limit for unrestricted queries
+                    .ToListAsync();
+                    
+                allResults.AddRange(chunkResults);
+                _logger.LogInformation($"Retrieved {chunkResults.Count} most recent snapshots (with limit)");
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error retrieving recent snapshots");
+            }
+            
+            sw.Stop();
+            _logger.LogInformation($"Retrieved total {allResults.Count} snapshots in {sw.ElapsedMilliseconds}ms");
+            
+            // Cache the results
+            _cache.Set(cacheKey, allResults, TimeSpan.FromMinutes(5));
+            
+            return allResults;
+        }
+        
+        // Process chunks for date range queries
+        if (startDate.HasValue && endDate.HasValue)
+        {
+            // Process each chunk until we've covered the entire date range
+            while (chunkStart < endDate.Value)
+            {
+                var chunkFilter = filterBuilder.And(
+                    filterBuilder.Gte(s => s.Timestamp, chunkStart),
+                    filterBuilder.Lt(s => s.Timestamp, chunkEnd)
+                );
+                
+                var sort = Builders<MatchSnapshot>.Sort.Ascending(s => s.Timestamp);
+                
+                try
+                {
+                    _logger.LogDebug($"Retrieving chunk from {chunkStart} to {chunkEnd}");
+                    
+                    var chunkResults = await collection.Find(chunkFilter)
+                        .Sort(sort)
+                        .ToListAsync();
+                        
+                    allResults.AddRange(chunkResults);
+                    _logger.LogInformation($"Retrieved {chunkResults.Count} snapshots for time range {chunkStart} to {chunkEnd}");
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, $"Error retrieving chunk {chunkStart} to {chunkEnd}");
+                }
+                
+                // Move to next chunk
+                chunkStart = chunkEnd;
+                chunkEnd = chunkStart.Add(chunkSize);
+                
+                // Cap the last chunk to the requested end date
+                if (chunkEnd > endDate.Value)
+                {
+                    chunkEnd = endDate.Value;
+                }
+            }
+        }
+        
+        sw.Stop();
+        _logger.LogInformation($"Retrieved total {allResults.Count} snapshots in {sw.ElapsedMilliseconds}ms");
+        
+        // Sort the final results, since we may have retrieved out of order
+        allResults = allResults.OrderBy(s => s.Timestamp).ToList();
+        
+        // Cache the results for future use
+        _cache.Set(cacheKey, allResults, TimeSpan.FromMinutes(5));
+        
+        return allResults;
     }
-    
+    catch (Exception ex)
+    {
+        _logger.LogError(ex, "Error getting all match snapshots");
+        return new List<MatchSnapshot>();
+    }
+}
+
     /// <summary>
     /// Exports match data to CSV for machine learning
     /// </summary>
-/// <summary>
+    /// <summary>
     /// Exports match data to CSV for machine learning with 9 timeline snapshots
     /// </summary>
     public async Task<string> ExportMatchDataToCsvAsync(int matchId)
     {
         var snapshots = await GetMatchSnapshotsAsync(matchId);
-        
+
         if (!snapshots.Any())
         {
             return "No data available for this match";
         }
-        
+
         // Create CSV header
         var sb = new System.Text.StringBuilder();
-        
+
         // Basic match info
         sb.Append("timestamp,match_id,time_segment,");
-        
+
         // Match state
         sb.Append("score,period,match_status,played_time,");
-        
+
         // Match statistics
         sb.Append("home_dangerous_attacks,away_dangerous_attacks,");
         sb.Append("home_safe_attacks,away_safe_attacks,");
         sb.Append("home_corner_kicks,away_corner_kicks,");
         sb.Append("home_shots_on_target,away_shots_on_target,");
         sb.Append("home_ball_safe_percentage,away_ball_safe_percentage,");
-        
+
         // Prediction data
         sb.Append("prediction_favorite,prediction_confidence,prediction_expected_goals,");
         sb.Append("home_team_form,away_team_form,");
         sb.Append("home_team_win_pct,away_team_win_pct,");
         sb.Append("home_team_avg_goals,away_team_avg_goals");
-        
+
         sb.AppendLine();
-        
+
         // Get 9 snapshots across the match timeline
         var timelineSnapshots = GetTimelineSnapshots(snapshots);
-        
+
         // Process each timeline snapshot
         for (int i = 0; i < timelineSnapshots.Count; i++)
         {
             var snapshot = timelineSnapshots[i];
             var timeSegment = $"{i * 10}-{(i + 1) * 10}"; // e.g., "0-10", "10-20", etc.
-            
+
             // Basic match info
             sb.Append($"{snapshot.Timestamp:yyyy-MM-dd HH:mm:ss},");
             sb.Append($"{snapshot.MatchId},");
             sb.Append($"{timeSegment},");
-            
+
             // Match state
             sb.Append($"{snapshot.Score},");
             sb.Append($"{snapshot.Period},");
             sb.Append($"{snapshot.MatchStatus},");
             sb.Append($"{snapshot.PlayedTime},");
-            
+
             // Match statistics
             var homeDangerousAttacks = snapshot.MatchSituation?.Home?.TotalDangerousAttacks ?? 0;
             var awayDangerousAttacks = snapshot.MatchSituation?.Away?.TotalDangerousAttacks ?? 0;
             var homeSafeAttacks = snapshot.MatchSituation?.Home?.TotalSafeAttacks ?? 0;
             var awaySafeAttacks = snapshot.MatchSituation?.Away?.TotalSafeAttacks ?? 0;
-            
+
             sb.Append($"{homeDangerousAttacks},");
             sb.Append($"{awayDangerousAttacks},");
             sb.Append($"{homeSafeAttacks},");
             sb.Append($"{awaySafeAttacks},");
-            
+
             // Match details
             var homeCornerKicks = snapshot.MatchDetails?.Home?.CornerKicks ?? 0;
             var awayCornerKicks = snapshot.MatchDetails?.Away?.CornerKicks ?? 0;
@@ -559,23 +773,23 @@ public class PredictionEnrichedMatchService
             var awayShotsOnTarget = snapshot.MatchDetails?.Away?.ShotsOnTarget ?? 0;
             var homeBallSafePercentage = snapshot.MatchDetails?.Home?.BallSafePercentage ?? 0;
             var awayBallSafePercentage = snapshot.MatchDetails?.Away?.BallSafePercentage ?? 0;
-            
+
             sb.Append($"{homeCornerKicks},");
             sb.Append($"{awayCornerKicks},");
             sb.Append($"{homeShotsOnTarget},");
             sb.Append($"{awayShotsOnTarget},");
             sb.Append($"{homeBallSafePercentage},");
             sb.Append($"{awayBallSafePercentage},");
-            
+
             // Prediction data
             var favorite = snapshot.PredictionData?.Favorite ?? "unknown";
             var confidence = snapshot.PredictionData?.ConfidenceScore ?? 0;
             var expectedGoals = snapshot.PredictionData?.ExpectedGoals ?? 0;
-            
+
             sb.Append($"{favorite},");
             sb.Append($"{confidence},");
             sb.Append($"{expectedGoals},");
-            
+
             // Team data
             var homeTeamForm = snapshot.PredictionData?.HomeTeamData?.Form ?? "";
             var awayTeamForm = snapshot.PredictionData?.AwayTeamData?.Form ?? "";
@@ -583,76 +797,78 @@ public class PredictionEnrichedMatchService
             var awayTeamWinPct = snapshot.PredictionData?.AwayTeamData?.WinPercentage ?? 0;
             var homeTeamAvgGoals = snapshot.PredictionData?.HomeTeamData?.AvgTotalGoals ?? 0;
             var awayTeamAvgGoals = snapshot.PredictionData?.AwayTeamData?.AvgTotalGoals ?? 0;
-            
+
             sb.Append($"{homeTeamForm},");
             sb.Append($"{awayTeamForm},");
             sb.Append($"{homeTeamWinPct},");
             sb.Append($"{awayTeamWinPct},");
             sb.Append($"{homeTeamAvgGoals},");
             sb.Append($"{awayTeamAvgGoals}");
-            
+
             sb.AppendLine();
         }
-        
+
         return sb.ToString();
-    }    
+    }
+
     /// <summary>
     /// Exports a single match as a combined dataset for machine learning
     /// </summary>
     public async Task<string> ExportCombinedDatasetForMatchAsync(int matchId)
     {
         var snapshots = await GetMatchSnapshotsAsync(matchId);
-        
+
         if (!snapshots.Any())
         {
             return "No data available for this match";
         }
-        
+
         // Get the first and last snapshots
         var firstSnapshot = snapshots.OrderBy(s => s.Timestamp).First();
         var lastSnapshot = snapshots.OrderByDescending(s => s.Timestamp).First();
-        
+
         // Create CSV header
         var sb = new System.Text.StringBuilder();
         sb.AppendLine("match_id," +
-                    // Pre-match data (prediction)
-                    "pre_favorite,pre_confidence,pre_expected_goals," +
-                    "pre_home_team_form,pre_away_team_form," +
-                    "pre_home_team_win_pct,pre_away_team_win_pct," +
-                    "pre_home_team_avg_goals,pre_away_team_avg_goals," +
-                    "pre_home_corner_avg,pre_away_corner_avg," +
-                    
-                    // Mid-game data points (we'll use intervals)
-                    "mid_time_elapsed," +
-                    "mid_score," +
-                    "mid_home_dangerous_attacks,mid_away_dangerous_attacks," +
-                    "mid_home_corner_kicks,mid_away_corner_kicks," +
-                    "mid_home_shots_on_target,mid_away_shots_on_target," +
-                    "mid_home_ball_safe_percentage,mid_away_ball_safe_percentage," +
-                    
-                    // Final result data
-                    "final_score," +
-                    "final_home_dangerous_attacks,final_away_dangerous_attacks," +
-                    "final_home_corner_kicks,final_away_corner_kicks," +
-                    "final_home_shots_on_target,final_away_shots_on_target");
-        
+                      // Pre-match data (prediction)
+                      "pre_favorite,pre_confidence,pre_expected_goals," +
+                      "pre_home_team_form,pre_away_team_form," +
+                      "pre_home_team_win_pct,pre_away_team_win_pct," +
+                      "pre_home_team_avg_goals,pre_away_team_avg_goals," +
+                      "pre_home_corner_avg,pre_away_corner_avg," +
+
+                      // Mid-game data points (we'll use intervals)
+                      "mid_time_elapsed," +
+                      "mid_score," +
+                      "mid_home_dangerous_attacks,mid_away_dangerous_attacks," +
+                      "mid_home_corner_kicks,mid_away_corner_kicks," +
+                      "mid_home_shots_on_target,mid_away_shots_on_target," +
+                      "mid_home_ball_safe_percentage,mid_away_ball_safe_percentage," +
+
+                      // Final result data
+                      "final_score," +
+                      "final_home_dangerous_attacks,final_away_dangerous_attacks," +
+                      "final_home_corner_kicks,final_away_corner_kicks," +
+                      "final_home_shots_on_target,final_away_shots_on_target");
+
         // Find a good mid-point snapshot (around 45-60 minutes if available)
         var midSnapshot = snapshots
             .Where(s => ParsePlayedTime(s.PlayedTime) >= 45 && ParsePlayedTime(s.PlayedTime) <= 60)
             .OrderBy(s => Math.Abs(ParsePlayedTime(s.PlayedTime) - 45))
             .FirstOrDefault();
-            
+
         // If no mid-snapshot in desired range, take middle snapshot
         if (midSnapshot == null && snapshots.Count > 2)
         {
             midSnapshot = snapshots.OrderBy(s => s.Timestamp).Skip(snapshots.Count / 2).First();
         }
+
         // If still no mid-snapshot, use the first snapshot (less than ideal)
         midSnapshot ??= firstSnapshot;
-        
+
         // Build row with all data points
         sb.Append(matchId);
-        
+
         // Pre-match prediction data
         var preFavorite = firstSnapshot.PredictionData?.Favorite ?? "unknown";
         var preConfidence = firstSnapshot.PredictionData?.ConfidenceScore ?? 0;
@@ -665,7 +881,7 @@ public class PredictionEnrichedMatchService
         var preAwayTeamAvgGoals = firstSnapshot.PredictionData?.AwayTeamData?.AvgTotalGoals ?? 0;
         var preHomeCornerAvg = firstSnapshot.PredictionData?.CornerStats?.HomeAvg ?? 0;
         var preAwayCornerAvg = firstSnapshot.PredictionData?.CornerStats?.AwayAvg ?? 0;
-        
+
         sb.Append($",{preFavorite}");
         sb.Append($",{preConfidence}");
         sb.Append($",{preExpectedGoals}");
@@ -677,7 +893,7 @@ public class PredictionEnrichedMatchService
         sb.Append($",{preAwayTeamAvgGoals}");
         sb.Append($",{preHomeCornerAvg}");
         sb.Append($",{preAwayCornerAvg}");
-        
+
         // Mid-game data
         var midTimeElapsed = midSnapshot.PlayedTime;
         var midScore = midSnapshot.Score;
@@ -689,7 +905,7 @@ public class PredictionEnrichedMatchService
         var midAwayShotsOnTarget = midSnapshot.MatchDetails?.Away?.ShotsOnTarget ?? 0;
         var midHomeBallSafePercentage = midSnapshot.MatchDetails?.Home?.BallSafePercentage ?? 0;
         var midAwayBallSafePercentage = midSnapshot.MatchDetails?.Away?.BallSafePercentage ?? 0;
-        
+
         sb.Append($",{midTimeElapsed}");
         sb.Append($",{midScore}");
         sb.Append($",{midHomeDangerousAttacks}");
@@ -700,7 +916,7 @@ public class PredictionEnrichedMatchService
         sb.Append($",{midAwayShotsOnTarget}");
         sb.Append($",{midHomeBallSafePercentage}");
         sb.Append($",{midAwayBallSafePercentage}");
-        
+
         // Final result data
         var finalScore = lastSnapshot.Score;
         var finalHomeDangerousAttacks = lastSnapshot.MatchSituation?.Home?.TotalDangerousAttacks ?? 0;
@@ -709,7 +925,7 @@ public class PredictionEnrichedMatchService
         var finalAwayCornerKicks = lastSnapshot.MatchDetails?.Away?.CornerKicks ?? 0;
         var finalHomeShotsOnTarget = lastSnapshot.MatchDetails?.Home?.ShotsOnTarget ?? 0;
         var finalAwayShotsOnTarget = lastSnapshot.MatchDetails?.Away?.ShotsOnTarget ?? 0;
-        
+
         sb.Append($",{finalScore}");
         sb.Append($",{finalHomeDangerousAttacks}");
         sb.Append($",{finalAwayDangerousAttacks}");
@@ -717,12 +933,12 @@ public class PredictionEnrichedMatchService
         sb.Append($",{finalAwayCornerKicks}");
         sb.Append($",{finalHomeShotsOnTarget}");
         sb.Append($",{finalAwayShotsOnTarget}");
-        
+
         sb.AppendLine();
-        
+
         return sb.ToString();
     }
-    
+
     /// <summary>
     /// Exports all match data to a single consolidated ML dataset using 9-snapshot timeline
     /// </summary>
@@ -732,71 +948,68 @@ public class PredictionEnrichedMatchService
         {
             // Get all match snapshots
             var allSnapshots = await GetAllMatchSnapshotsAsync();
-            
+
             // Group by match ID
             var matchGroups = allSnapshots.GroupBy(s => s.MatchId).ToList();
-            
+
             if (!matchGroups.Any())
             {
                 return "No data available";
             }
-            
+
             // Create CSV header with columns for all 9 time segments
             var sb = new System.Text.StringBuilder();
-            
+
             // Match identification
             sb.Append("match_id,home_team,away_team,status,match_date,");
-            
+
             // Pre-match prediction data
             sb.Append("pre_favorite,pre_confidence,pre_expected_goals,");
             sb.Append("pre_home_team_form,pre_away_team_form,");
             sb.Append("pre_home_win_pct,pre_away_win_pct,");
-            
+
             // For each of the 9 time segments
             for (int i = 0; i < 9; i++)
             {
                 string segment = $"{i * 10}-{(i + 1) * 10}";
-                
-                sb.Append($"t{i+1}_played_time,");
-                sb.Append($"t{i+1}_score,");
-                sb.Append($"t{i+1}_home_dangerous_attacks,");
-                sb.Append($"t{i+1}_away_dangerous_attacks,");
-                sb.Append($"t{i+1}_home_shots_on_target,");
-                sb.Append($"t{i+1}_away_shots_on_target,");
-                sb.Append($"t{i+1}_home_corners,");
-                sb.Append($"t{i+1}_away_corners,");
+
+                sb.Append($"t{i + 1}_played_time,");
+                sb.Append($"t{i + 1}_score,");
+                sb.Append($"t{i + 1}_home_dangerous_attacks,");
+                sb.Append($"t{i + 1}_away_dangerous_attacks,");
+                sb.Append($"t{i + 1}_home_shots_on_target,");
+                sb.Append($"t{i + 1}_away_shots_on_target,");
+                sb.Append($"t{i + 1}_home_corners,");
+                sb.Append($"t{i + 1}_away_corners,");
             }
-            
+
             // Final outcome
             sb.Append("final_score,final_result,prediction_correct");
-            
+
             sb.AppendLine();
-            
+
             // Process each match
             foreach (var group in matchGroups)
             {
                 var matchId = group.Key;
                 var snapshots = group.OrderBy(s => s.Timestamp).ToList();
-                
+
                 // Only include matches with at least 3 snapshots
                 if (snapshots.Count < 3)
                 {
                     continue;
                 }
-                
+
                 // Get first snapshot for pre-match data
                 var firstSnapshot = snapshots.First();
-                
+
                 // Get 9 snapshots across the match timeline
                 var timelineSnapshots = GetTimelineSnapshots(snapshots);
-                
+
                 // Get final snapshot for outcome
                 var lastSnapshot = snapshots.Last();
-                
-                // Only include completed matches
-                if (!(lastSnapshot.PlayedTime.Contains("90:", StringComparison.OrdinalIgnoreCase) || 
-                    lastSnapshot.MatchStatus.Contains("Ended", StringComparison.OrdinalIgnoreCase) ||
-                    lastSnapshot.MatchStatus.Contains("finish", StringComparison.OrdinalIgnoreCase)))
+
+                if(!PredictionResultsService.IsMatchCompleted(lastSnapshot))
                 {
                     continue;
                 }
@@ -807,7 +1020,7 @@ public class PredictionEnrichedMatchService
                 sb.Append($"\"{firstSnapshot.PredictionData?.AwayTeamData?.Name ?? "Away Team"}\",");
                 sb.Append($"\"{firstSnapshot.MatchStatus ?? ""}\",");
                 sb.Append($"{firstSnapshot.Timestamp:yyyy-MM-dd},");
-                
+
                 // Pre-match prediction data
                 sb.Append($"{firstSnapshot.PredictionData?.Favorite ?? "unknown"},");
                 sb.Append($"{firstSnapshot.PredictionData?.ConfidenceScore ?? 0},");
@@ -816,12 +1029,12 @@ public class PredictionEnrichedMatchService
                 sb.Append($"{firstSnapshot.PredictionData?.AwayTeamData?.Form ?? ""},");
                 sb.Append($"{firstSnapshot.PredictionData?.HomeTeamData?.WinPercentage ?? 0},");
                 sb.Append($"{firstSnapshot.PredictionData?.AwayTeamData?.WinPercentage ?? 0},");
-                
+
                 // For each of the 9 time segments
                 for (int i = 0; i < 9; i++)
                 {
                     var snapshot = i < timelineSnapshots.Count ? timelineSnapshots[i] : lastSnapshot;
-                    
+
                     sb.Append($"{snapshot.PlayedTime},");
                     sb.Append($"{snapshot.Score},");
                     sb.Append($"{snapshot.MatchSituation?.Home?.TotalDangerousAttacks ?? 0},");
@@ -831,10 +1044,10 @@ public class PredictionEnrichedMatchService
                     sb.Append($"{snapshot.MatchDetails?.Home?.CornerKicks ?? 0},");
                     sb.Append($"{snapshot.MatchDetails?.Away?.CornerKicks ?? 0},");
                 }
-                
+
                 // Final outcome
                 sb.Append($"{lastSnapshot.Score},");
-                
+
                 // Determine actual match outcome
                 string actualOutcome = "unknown";
                 var finalScore = ParseScore(lastSnapshot.Score);
@@ -848,16 +1061,16 @@ public class PredictionEnrichedMatchService
                     else
                         actualOutcome = "draw";
                 }
-                
+
                 sb.Append($"{actualOutcome},");
-                
+
                 // Was prediction correct?
                 bool isPredictionCorrect = firstSnapshot.PredictionData?.Favorite == actualOutcome;
                 sb.Append(isPredictionCorrect ? "true" : "false");
-                
+
                 sb.AppendLine();
             }
-            
+
             return sb.ToString();
         }
         catch (Exception ex)
@@ -866,14 +1079,14 @@ public class PredictionEnrichedMatchService
             return $"Error exporting dataset: {ex.Message}";
         }
     }
-    
+
     /// <summary>
     /// Gets 9 snapshots across the match timeline (0-10, 10-20, ..., 80-90)
     /// </summary>
     private List<MatchSnapshot> GetTimelineSnapshots(List<MatchSnapshot> allSnapshots)
     {
         var result = new List<MatchSnapshot>();
-        
+
         // Define 9 time ranges (0-10, 10-20, ..., 80-90)
         var timeRanges = new List<(int Start, int End)>
         {
@@ -885,20 +1098,21 @@ public class PredictionEnrichedMatchService
             (50, 60),
             (60, 70),
             (70, 80),
-            (80, 90)  // Plus any added time
+            (80, 90) // Plus any added time
         };
-        
+
         // Find best snapshot for each time range
         foreach (var (start, end) in timeRanges)
         {
             // First try to find snapshots within this exact range
             var rangeSnapshots = allSnapshots
-                .Where(s => {
+                .Where(s =>
+                {
                     var minutes = ParsePlayedTime(s.PlayedTime);
                     return minutes >= start && minutes < end;
                 })
                 .ToList();
-                
+
             // If we have snapshots in this range, pick the one closest to the middle of the range
             if (rangeSnapshots.Any())
             {
@@ -906,7 +1120,7 @@ public class PredictionEnrichedMatchService
                 var bestSnapshot = rangeSnapshots
                     .OrderBy(s => Math.Abs(ParsePlayedTime(s.PlayedTime) - middleTime))
                     .First();
-                    
+
                 result.Add(bestSnapshot);
             }
             else
@@ -916,27 +1130,27 @@ public class PredictionEnrichedMatchService
                 var bestSnapshot = allSnapshots
                     .OrderBy(s => Math.Abs(ParsePlayedTime(s.PlayedTime) - middleTime))
                     .First();
-                    
+
                 result.Add(bestSnapshot);
             }
         }
-        
+
         // Ensure we have exactly 9 snapshots
         while (result.Count < 9)
         {
             // If we don't have enough snapshots, duplicate the last one
             result.Add(result.LastOrDefault() ?? allSnapshots.LastOrDefault());
         }
-        
+
         // If we somehow got more than 9, trim the excess
         if (result.Count > 9)
         {
             result = result.Take(9).ToList();
         }
-        
+
         return result;
     }
-    
+
     /// <summary>
     /// Helper method to parse score string (e.g., "2-1")
     /// </summary>
@@ -944,17 +1158,17 @@ public class PredictionEnrichedMatchService
     {
         if (string.IsNullOrEmpty(scoreStr))
             return null;
-            
+
         var parts = scoreStr.Split(':');
         if (parts.Length != 2)
             return null;
-            
+
         if (!int.TryParse(parts[0], out int homeGoals) || !int.TryParse(parts[1], out int awayGoals))
             return null;
-            
+
         return (homeGoals, awayGoals);
     }
-    
+
     /// <summary>
     /// Parses the played time string to get minutes
     /// </summary>
@@ -962,10 +1176,10 @@ public class PredictionEnrichedMatchService
     {
         if (string.IsNullOrEmpty(playedTime))
             return 0;
-            
+
         // Format like "45:00" or "90+2:30"
         string minutesPart = playedTime.Split(':')[0];
-        
+
         // Handle added time (e.g., "90+2")
         if (minutesPart.Contains('+'))
         {
@@ -975,13 +1189,13 @@ public class PredictionEnrichedMatchService
                 return minutes + added;
             }
         }
-        
+
         // Simple case
         if (int.TryParse(minutesPart, out int result))
         {
             return result;
         }
-        
+
         return 0;
     }
 }
@@ -991,25 +1205,24 @@ public class PredictionEnrichedMatchService
 /// </summary>
 public class MatchSnapshot
 {
-    [BsonId]
-    public ObjectId Id { get; set; }
-    
+    [BsonId] public ObjectId Id { get; set; }
+
     public int MatchId { get; set; }
-    
+
     public DateTime Timestamp { get; set; }
-    
+
     public string Score { get; set; }
-    
+
     public string Period { get; set; }
-    
+
     public string MatchStatus { get; set; }
-    
+
     public string PlayedTime { get; set; }
-    
+
     public ClientMatchSituation MatchSituation { get; set; }
-    
+
     public ClientMatchDetailsExtended MatchDetails { get; set; }
-    
+
     public ClientMatchPredictionData PredictionData { get; set; }
 }
 
@@ -1019,105 +1232,105 @@ public class MatchSnapshot
 public class ClientMatchPredictionData
 {
     public string Favorite { get; set; }
-    
+
     public int ConfidenceScore { get; set; }
-    
+
     public double AverageGoals { get; set; }
-    
+
     public double ExpectedGoals { get; set; }
-    
+
     public double DefensiveStrength { get; set; }
-    
+
     public ClientCornerStats CornerStats { get; set; }
-    
+
     public ClientScoringPatterns ScoringPatterns { get; set; }
-    
+
     public List<string> ReasonsForPrediction { get; set; }
-    
+
     public ClientHeadToHeadData HeadToHead { get; set; }
-    
+
     public ClientTeamData HomeTeamData { get; set; }
-    
+
     public ClientTeamData AwayTeamData { get; set; }
 }
 
 public class ClientCornerStats
 {
     public double HomeAvg { get; set; }
-    
+
     public double AwayAvg { get; set; }
-    
+
     public double TotalAvg { get; set; }
 }
 
 public class ClientScoringPatterns
 {
     public double HomeFirstGoalRate { get; set; }
-    
+
     public double AwayFirstGoalRate { get; set; }
-    
+
     public double HomeLateGoalRate { get; set; }
-    
+
     public double AwayLateGoalRate { get; set; }
 }
 
 public class ClientHeadToHeadData
 {
     public int Matches { get; set; }
-    
+
     public int Wins { get; set; }
-    
+
     public int Draws { get; set; }
-    
+
     public int Losses { get; set; }
-    
+
     public int GoalsScored { get; set; }
-    
+
     public int GoalsConceded { get; set; }
-    
+
     public List<ClientRecentMatchResult> RecentMatches { get; set; }
 }
 
 public class ClientRecentMatchResult
 {
     public string Date { get; set; }
-    
+
     public string Result { get; set; }
 }
 
 public class ClientTeamData
 {
     public string Name { get; set; }
-    
+
     public int Position { get; set; }
-    
+
     public string Form { get; set; }
-    
+
     public string HomeForm { get; set; }
-    
+
     public string AwayForm { get; set; }
-    
+
     public double AvgHomeGoals { get; set; }
-    
+
     public double AvgAwayGoals { get; set; }
-    
+
     public double AvgTotalGoals { get; set; }
-    
+
     public double AverageGoalsScored { get; set; }
-    
+
     public double AverageGoalsConceded { get; set; }
-    
+
     public int CleanSheets { get; set; }
-    
+
     public int HomeCleanSheets { get; set; }
-    
+
     public int AwayCleanSheets { get; set; }
-    
+
     public double ScoringFirstWinRate { get; set; }
-    
+
     public double WinPercentage { get; set; }
-    
+
     public double HomeWinPercentage { get; set; }
-    
+
     public double AwayWinPercentage { get; set; }
 }

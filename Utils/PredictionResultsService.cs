@@ -39,59 +39,124 @@ public class PredictionResultsService
     /// <summary>
     /// Processes completed matches from the last 24 hours and generates prediction results
     /// </summary>
-    public async Task ProcessCompletedMatchesAsync(CancellationToken stoppingToken = default)
+public async Task ProcessCompletedMatchesAsync(CancellationToken stoppingToken = default)
+{
+    try
     {
-        try
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        _logger.LogInformation("Processing completed matches for prediction results");
+        
+        // Use optimized date range for snapshot lookup
+        var endTime = DateTime.UtcNow;
+        var startTime = endTime.AddHours(-24); // Last 24 hours
+        
+        // Get snapshots with optimized retrieval that won't time out
+        var allSnapshots = await _predictionEnrichedMatchService.GetAllMatchSnapshotsAsync(startTime, endTime);
+        
+        if (!allSnapshots.Any())
         {
-            _logger.LogInformation("Processing completed matches for prediction results");
-            
-            // Get all match snapshots from the last 24 hours
-            var endTime = DateTime.UtcNow;
-            var startTime = endTime.AddHours(-24);
-            
-            var allSnapshots = await _predictionEnrichedMatchService.GetAllMatchSnapshotsAsync(startTime, endTime);
-            
-            // Filter snapshots to find completed matches
-            var completedMatchGroups = allSnapshots
-                .Where(s => s.PlayedTime.Contains("90:", StringComparison.OrdinalIgnoreCase) || 
-                           s.MatchStatus.Contains("Ended", StringComparison.OrdinalIgnoreCase))
-                .GroupBy(s => s.MatchId)
-                .ToList();
-                
-            // Process each completed match
-            var predictionResults = new List<PredictionResult>();
-            
-            foreach (var matchGroup in completedMatchGroups)
+            _logger.LogInformation("No snapshots found in the specified time range");
+            return;
+        }
+        
+        _logger.LogInformation($"Retrieved {allSnapshots.Count} total snapshots, filtering for completed matches");
+        
+        // Filter for completed matches more efficiently
+        var completedMatchIds = new HashSet<int>();
+        
+        // First check for matches where we know they're completed
+        foreach (var snapshot in allSnapshots)
+        {
+            if (IsMatchCompleted(snapshot) && !completedMatchIds.Contains(snapshot.MatchId))
             {
-                try
+                completedMatchIds.Add(snapshot.MatchId);
+            }
+        }
+        
+        _logger.LogInformation($"Found {completedMatchIds.Count} completed matches to process");
+        
+        if (!completedMatchIds.Any())
+        {
+            _logger.LogInformation("No completed matches found in the time range");
+            return;
+        }
+        
+        // Process matches in batches to avoid memory pressure
+        var predictionResults = new List<PredictionResult>();
+        int processedCount = 0;
+        int batchSize = 5; // Process in small batches
+        
+        foreach (var matchIdBatch in completedMatchIds.Chunk(batchSize))
+        {
+            List<Task<PredictionResult>> processingTasks = new List<Task<PredictionResult>>();
+            
+            foreach (var matchId in matchIdBatch)
+            {
+                processingTasks.Add(Task.Run(async () => 
                 {
-                    var matchId = matchGroup.Key;
-                    var matchSnapshots = await _predictionEnrichedMatchService.GetMatchSnapshotsAsync(matchId);
-                    var snapshots = matchSnapshots.OrderBy(s => s.Timestamp).ToList();
-                    
-                    // Need at least 2 snapshots (pre-match and final)
-                    if (snapshots.Count < 9)
-                        continue;
-                    
-                    // Calculate prediction accuracy
-                    var predictionResult = CalculatePredictionResultWithTimelineSnapshots(snapshots);
-                    if (predictionResult != null)
+                    try
                     {
-                        predictionResults.Add(predictionResult);
+                        // Get all snapshots for this match
+                        var matchSnapshots = allSnapshots.Where(s => s.MatchId == matchId).ToList();
+                        
+                        // Need at least 2 snapshots (pre-match and final)
+                        if (matchSnapshots.Count < 2)
+                            return null;
+                        
+                        // Calculate prediction accuracy
+                        var result = CalculatePredictionResultWithTimelineSnapshots(matchSnapshots);
+                        
+                        if (result != null)
+                        {
+                            _logger.LogDebug($"Successfully processed match {matchId}");
+                            return result;
+                        }
+                        
+                        return null;
                     }
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogError(ex, $"Error processing match {matchGroup.Key} for prediction results");
-                }
+                    catch (Exception ex)
+                    {
+                        _logger.LogError(ex, $"Error processing match {matchId} for prediction results");
+                        return null;
+                    }
+                }, stoppingToken));
             }
             
-            if (predictionResults.Any())
+            try
             {
-                // Cache the results
-                _cache.Set(CACHE_KEY_PREDICTION_RESULTS, predictionResults, TimeSpan.FromHours(24));
+                // Wait for all tasks in this batch to complete
+                var results = await Task.WhenAll(processingTasks);
                 
-                // Send prediction results to clients
+                // Add non-null results to our collection
+                foreach (var result in results.Where(r => r != null))
+                {
+                    predictionResults.Add(result);
+                }
+                
+                processedCount += matchIdBatch.Length;
+                _logger.LogInformation($"Processed {processedCount}/{completedMatchIds.Count} matches");
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, $"Error processing batch of matches");
+            }
+            
+            // Check for cancellation between batches
+            if (stoppingToken.IsCancellationRequested)
+            {
+                _logger.LogWarning("Processing canceled before completion");
+                break;
+            }
+        }
+        
+        if (predictionResults.Any())
+        {
+            // Cache the results
+            _cache.Set(CACHE_KEY_PREDICTION_RESULTS, predictionResults, TimeSpan.FromHours(1));
+            
+            // Send prediction results to clients
+            try
+            {
                 await _hubContext.Clients.All.SendAsync("ReceivePredictionResults", 
                     new PredictionResultsResponse 
                     {
@@ -102,17 +167,62 @@ public class PredictionResultsService
                     
                 _logger.LogInformation($"Sent {predictionResults.Count} prediction results to clients");
             }
-            else
+            catch (Exception ex)
             {
-                _logger.LogInformation("No completed matches with predictions found in the last 24 hours");
+                _logger.LogError(ex, "Error sending prediction results to clients via SignalR");
             }
         }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Error processing completed matches for prediction results");
-        }
+        
+        sw.Stop();
+        _logger.LogInformation($"Completed match processing in {sw.ElapsedMilliseconds}ms");
     }
+    catch (Exception ex)
+    {
+        _logger.LogError(ex, "Error processing completed matches for prediction results");
+    }
+}
+
+    /// <summary>
+    /// Determines if a match is completed based on played time and match status
+    /// </summary>
+    public static bool IsMatchCompleted(MatchSnapshot snapshot)
+    {
+        // Check for null values first
+        if (snapshot.PlayedTime == null || snapshot.MatchStatus == null)
+            return false;
     
+        // Check played time - parse first part before colon to get minutes
+        if (snapshot.PlayedTime.Contains(':'))
+        {
+            string minutesPart = snapshot.PlayedTime.Split(':')[0];
+        
+            // Handle added time format (e.g., "90+3")
+            if (minutesPart.Contains('+'))
+            {
+                minutesPart = minutesPart.Split('+')[0];
+            }
+        
+            // Try to parse the minutes as integer
+            if (int.TryParse(minutesPart, out int minutes) && minutes >= 90)
+            {
+                return true;
+            }
+        }
+    
+        // Check match status for "ended" text
+        if (snapshot.MatchStatus.ToLower().Contains("ended"))
+        {
+            return true;
+        }
+    
+        // Additional check for "finished" text
+        if (snapshot.MatchStatus.ToLower().Contains("finish"))
+        {
+            return true;
+        }
+    
+        return false;
+    }  
     /// <summary>
     /// Calculates prediction accuracy for a match with 9 timeline snapshots
     /// </summary>
@@ -333,7 +443,7 @@ public class PredictionResultsService
         if (string.IsNullOrEmpty(scoreStr))
             return null;
             
-        var parts = scoreStr.Split('-');
+        var parts = scoreStr.Split(':');
         if (parts.Length != 2)
             return null;
             
