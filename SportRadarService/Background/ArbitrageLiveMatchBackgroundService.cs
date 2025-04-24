@@ -6,6 +6,7 @@ using System.Net.Http.Headers;
 using fredapi.SignalR;
 using fredapi.Utils;
 using fredapi.Model.MatchSituationStats;
+using fredapi.SportRadarService.TokenService;
 using fredapi.SportRadarService.Transformers;
 using Microsoft.AspNetCore.Http.HttpResults;
 using Microsoft.AspNetCore.SignalR;
@@ -70,7 +71,6 @@ public partial class ArbitrageLiveMatchBackgroundService : BackgroundService
         _cache = cache;
 
         _predictionEnrichedMatchService = serviceProvider.GetRequiredService<PredictionEnrichedMatchService>();
-
         // Configure HttpClient with optimized settings
         _httpClient = new HttpClient(_httpClientHandler)
         {
@@ -88,6 +88,14 @@ public partial class ArbitrageLiveMatchBackgroundService : BackgroundService
         {
             try
             {
+                var isInitialFetch = string.IsNullOrWhiteSpace(TokenService.TokenService.ApiToken);
+                using var scope = _serviceProvider.CreateScope();
+
+                if (isInitialFetch)
+                {
+                    var tokenService = scope.ServiceProvider.GetRequiredService<ITokenService>();
+                    await tokenService.GetSportRadarToken();
+                }
                 await ProcessMatchesAsync(stoppingToken);
             }
             catch (Exception ex)
@@ -136,7 +144,169 @@ public partial class ArbitrageLiveMatchBackgroundService : BackgroundService
         }
     }
 
-    private async Task StreamMatchesToClientsAsync(List<Match> arbitrageMatches, List<Event> allEvents,
+    // Modify the ProcessSingleEvent method to filter for NextGoal markets only
+    private Match ProcessSingleEvent(Event eventData)
+    {
+        // Check cache first
+        var cacheKey = $"{CACHE_KEY_EVENT_PREFIX}{eventData.EventId}";
+        if (_cache.TryGetValue(cacheKey, out Match cachedMatch))
+        {
+            return cachedMatch;
+        }
+
+        _logger.LogDebug($"Processing event {eventData.EventId}: {eventData.HomeTeamName} vs {eventData.AwayTeamName}");
+
+        // Process ALL markets for arbitrage, not just NextGoal markets - this is the main issue
+        var potentialMarkets = ProcessMarkets(eventData);
+    
+        // Fix #1: Log all market types being processed for debugging
+        var marketTypes = potentialMarkets
+            .Select(m => m.market.Description)
+            .GroupBy(d => d)
+            .Select(g => $"{g.Key}: {g.Count()}")
+            .ToList();
+    
+        _logger.LogDebug($"Processing market types: {string.Join(", ", marketTypes)}");
+
+        var arbitrageMarkets = potentialMarkets
+            .Where(m => m.hasArbitrage && m.market.ProfitPercentage > MinProfitThreshold)
+            .Select(m => m.market)
+            .ToList();
+
+        _logger.LogDebug($"Found {arbitrageMarkets.Count} arbitrage markets for event {eventData.EventId}");
+
+        // Only create a match if there are actual arbitrage opportunities
+        if (!arbitrageMarkets.Any())
+        {
+            _logger.LogDebug($"No arbitrage opportunities found for event {eventData.EventId}");
+            return null;
+        }
+
+        var match = CreateMatch(eventData, arbitrageMarkets);
+
+        // Cache result with expiration
+        _cache.Set(cacheKey, match, TimeSpan.FromSeconds(30));
+
+        return match;
+    }
+
+
+// This is the critical issue - your process is only looking for NextGoal markets for arbitrage
+// We need to remove this restriction to find all arbitrage opportunities
+    private List<(Market market, bool hasArbitrage)> ProcessMarketsForArbitrage(Event eventData)
+    {
+        _logger.LogDebug($"Processing ALL markets for arbitrage in match {eventData.EventId}");
+
+        // Use parallel processing for markets, WITHOUT filtering for NextGoal markets only
+        var markets = eventData.Markets
+            .AsParallel()
+            .Where(IsValidMarketStatus)
+            .Where(m => _marketValidator.ValidateMarket(m))
+            // REMOVED: Filter for markets that are NextGoal markets
+            // This was restricting you to only finding arbitrage in NextGoal markets
+            .Select(m => ProcessMarket(m, eventData.EventId))
+            .Where(m => m.market.Outcomes.Any())
+            .ToList();
+
+        // Log all market types for debugging
+        var marketTypes = markets
+            .Select(m => m.market.Description)
+            .GroupBy(d => d)
+            .Select(g => $"{g.Key}: {g.Count()}")
+            .ToList();
+    
+        _logger.LogDebug($"Market types considered for arbitrage: {string.Join(", ", marketTypes)}");
+        _logger.LogDebug($"Found {markets.Count} valid markets to check for arbitrage in match {eventData.EventId}");
+
+        return markets;
+    }
+
+
+// This will be used by other parts of your code
+    private List<(Market market, bool hasArbitrage)> ProcessMarkets(Event eventData)
+    {
+        _logger.LogDebug($"Processing markets for match {eventData.EventId}");
+
+        // Use parallel processing for markets
+        var markets = eventData.Markets
+            .AsParallel()
+            .Where(IsValidMarketStatus)
+            .Where(m => _marketValidator.ValidateMarket(m))
+            .Select(m => ProcessMarket(m, eventData.EventId))
+            .Where(m => m.market.Outcomes.Any())
+            .ToList();
+
+        _logger.LogDebug($"Found {markets.Count} valid markets for match {eventData.EventId}");
+
+        return markets;
+    }
+
+// Update the ProcessEvents method to use all markets for arbitrage detection
+    private List<Match> ProcessEvents(List<Event> events)
+    {
+        // Use parallelism with controlled degree
+        var matches = events
+            .AsParallel()
+            .WithDegreeOfParallelism(Math.Min(Environment.ProcessorCount, 4))
+            .Select(ProcessSingleEvent)
+            .Where(m => m != null && m.Markets.Any()) // Only include matches with actual arbitrage opportunities
+            .Where(m => !m.Teams.Away.Name.ToUpper().Contains("SRL") && !m.Teams.Home.Name.ToUpper().Contains("SRL"))
+            // REMOVED: Additional check to ensure we only have NextGoal markets
+            // This was filtering out matches with other types of arbitrage opportunities
+            .ToList();
+        
+        // Log the types of arbitrage markets found
+        var arbitrageTypes = matches
+            .SelectMany(m => m.Markets)
+            .GroupBy(m => m.Description)
+            .Select(g => $"{g.Key}: {g.Count()}")
+            .ToList();
+        
+        _logger.LogInformation($"Found arbitrage in market types: {string.Join(", ", arbitrageTypes)}");
+    
+        return matches;
+    }
+
+// Update the CreateMatchFromEvent method to ensure we consistently use 1X2 markets
+    private Match CreateMatchFromEvent(Event eventData)
+    {
+        // Try cache first
+        var cacheKey = $"{CACHE_KEY_EVENT_PREFIX}base_{eventData.EventId}";
+        if (_cache.TryGetValue(cacheKey, out Match cachedMatch))
+        {
+            return cachedMatch;
+        }
+
+        // Explicitly filter for 1X2 markets only - make this clearer and more consistent
+        var markets = eventData.Markets
+            .Where(m => IsValidMarketStatus(m))
+            .Where(m =>
+                // Match on 1X2 markets explicitly
+                m.Desc?.ToLower() == "match result" ||
+                m.Desc?.ToLower() == "1x2" ||
+                (bool)m.Desc?.ToLower().Contains("1x2")
+            )
+            .Select(m => new Market
+            {
+                Id = m.Id,
+                Description = m.Desc,
+                Specifier = m.Specifier,
+                Outcomes = ProcessOutcomes(m.Outcomes),
+                Favourite = m.Favourite,
+            })
+            .Where(m => m.Outcomes.Any() && m.Outcomes.Count == 3) // Ensure we have exactly 3 outcomes (1X2)
+            .ToList();
+
+        var match = CreateMatch(eventData, markets);
+
+        // Cache result
+        _cache.Set(cacheKey, match, TimeSpan.FromSeconds(30));
+
+        return match;
+    }
+
+// Fixed StreamMatchesToClientsAsync to properly handle all arbitrage types
+private async Task StreamMatchesToClientsAsync(List<Match> arbitrageMatches, List<Event> allEvents,
     List<Match> allMatchesFromEvents, CancellationToken stoppingToken = default)
 {
     if (!arbitrageMatches.Any() && !allMatchesFromEvents.Any()) return;
@@ -145,8 +315,53 @@ public partial class ArbitrageLiveMatchBackgroundService : BackgroundService
     {
         _logger.LogInformation($"Processing {allMatchesFromEvents.Count} matches for enrichment");
 
+        // Debug: Log all arbitrage matches and their markets
+        foreach (var match in arbitrageMatches)
+        {
+            _logger.LogInformation($"Arbitrage match: {match.Id} - {match.Teams.Home.Name} vs {match.Teams.Away.Name}");
+            foreach (var market in match.Markets)
+            {
+                _logger.LogInformation($"  Market: {market.Description}, Profit: {market.ProfitPercentage}%, " +
+                                      $"Outcomes: {string.Join(", ", market.Outcomes.Select(o => $"{o.Description}: {o.Odds}"))}");
+            }
+        }
+
+        // Log market types for debugging
+        var arbitrageMarketTypes = arbitrageMatches
+            .SelectMany(m => m.Markets)
+            .GroupBy(m => m.Description)
+            .Select(g => $"{g.Key}: {g.Count()}")
+            .ToList();
+        
+        var allMatchesMarketTypes = allMatchesFromEvents
+            .SelectMany(m => m.Markets)
+            .GroupBy(m => m.Description)
+            .Select(g => $"{g.Key}: {g.Count()}")
+            .ToList();
+        
+        _logger.LogInformation($"Arbitrage market types: {string.Join(", ", arbitrageMarketTypes)}");
+        _logger.LogInformation($"All matches market types: {string.Join(", ", allMatchesMarketTypes)}");
+
+        // Combine both match lists ensuring no duplicates
+        var allMatchesToProcess = new List<Match>();
+        
+        // Add all regular matches
+        allMatchesToProcess.AddRange(allMatchesFromEvents);
+        
+        // Add arbitrage matches that aren't already in the list
+        foreach (var match in arbitrageMatches)
+        {
+            if (!allMatchesToProcess.Any(m => m.Id == match.Id))
+            {
+                allMatchesToProcess.Add(match);
+            }
+        }
+        
+        _logger.LogInformation($"Processing a total of {allMatchesToProcess.Count} matches for details/situation data");
+        
         // Create batches of matches for parallel processing
-        var batches = allMatchesFromEvents.Chunk(5).ToList();
+        var batches = allMatchesToProcess.Chunk(5).ToList();
+            
         var batchTasks = new List<Task>();
 
         // Process batches in parallel with delay between batch starts
@@ -178,28 +393,60 @@ public partial class ArbitrageLiveMatchBackgroundService : BackgroundService
         // Wait for all batches to complete
         await Task.WhenAll(batchTasks);
 
-        // NEW: Enrich matches with prediction data before sending to clients
+        // Enrich matches with prediction data before sending to clients
         var (enrichedArbitrageMatches, enrichedAllMatches) = await _predictionEnrichedMatchService
             .EnrichMatchesWithPredictionDataAsync(arbitrageMatches, allMatchesFromEvents);
 
-        // Send both messages with enriched data
-        await _hubContext.Clients.All.SendAsync("ReceiveArbitrageLiveMatches", enrichedArbitrageMatches,
+        // IMPORTANT: Don't filter arbitrage matches by market type anymore
+        // Just send all arbitrage matches to the arbitrage channel
+        var validatedArbitrageMatches = enrichedArbitrageMatches.ToList();
+            
+        // Get all matches with 1X2 markets for the regular channel
+        var oneXTwoMatchesLookup = enrichedAllMatches
+            .Where(m => m.Markets.Any(market =>
+                market.Description?.ToLower() == "match result" ||
+                market.Description?.ToLower() == "1x2" ||
+                (market.Description?.ToLower().Contains("1x2") == true)))
+            .ToDictionary(m => m.Id);
+
+        // Get all matches while preserving their details and situations
+        var validatedAllMatches = enrichedAllMatches
+            .Where(m => oneXTwoMatchesLookup.ContainsKey(m.Id))
+            .ToList();
+
+        // Send both messages with enriched and validated data
+        await _hubContext.Clients.All.SendAsync("ReceiveArbitrageLiveMatches", validatedArbitrageMatches,
             cancellationToken: stoppingToken);
-        await _hubContext.Clients.All.SendAsync("ReceiveAllLiveMatches", enrichedAllMatches,
+        await _hubContext.Clients.All.SendAsync("ReceiveAllLiveMatches", validatedAllMatches,
             cancellationToken: stoppingToken);
 
-        // Update the static collections with enriched data
-        UpdateStaticCollection(_lastSentArbitrageMatches, enrichedArbitrageMatches);
-        UpdateStaticCollection(_lastSentAllMatches, enrichedAllMatches);
+        // Update the static collections with validated data
+        UpdateStaticCollection(_lastSentArbitrageMatches, validatedArbitrageMatches);
+        UpdateStaticCollection(_lastSentAllMatches, validatedAllMatches);
 
         // Cache for new connections
-        _cache.Set(CACHE_KEY_ARBITRAGE_MATCHES, enrichedArbitrageMatches, TimeSpan.FromMinutes(5));
-        _cache.Set(CACHE_KEY_ALL_MATCHES, enrichedAllMatches, TimeSpan.FromMinutes(5));
+        _cache.Set(CACHE_KEY_ARBITRAGE_MATCHES, validatedArbitrageMatches, TimeSpan.FromMinutes(5));
+        _cache.Set(CACHE_KEY_ALL_MATCHES, validatedAllMatches, TimeSpan.FromMinutes(5));
 
         _logger.LogInformation(
-            "Streamed {ArbitrageMatchCount} arbitrage matches and {AllMatchCount} total matches with enriched data",
-            enrichedArbitrageMatches.Count,
-            enrichedAllMatches.Count);
+            "Streamed {ArbitrageMatchCount} arbitrage matches and {AllMatchCount} total 1X2 matches with enriched data",
+            validatedArbitrageMatches.Count,
+            validatedAllMatches.Count);
+
+        // Log match detail status for debugging
+        var arbitrageDetailsCount = validatedArbitrageMatches.Count(m => m.MatchDetails != null);
+        var arbitrageSituationCount = validatedArbitrageMatches.Count(m => m.MatchSituation != null);
+        var allDetailsCount = validatedAllMatches.Count(m => m.MatchDetails != null);
+        var allSituationCount = validatedAllMatches.Count(m => m.MatchSituation != null);
+
+        _logger.LogInformation(
+            "Arbitrage matches with details: {DetailsCount}/{TotalCount}, with situation: {SituationCount}/{TotalCount}",
+            arbitrageDetailsCount, validatedArbitrageMatches.Count, arbitrageSituationCount,
+            validatedArbitrageMatches.Count);
+
+        _logger.LogInformation(
+            "All matches with details: {DetailsCount}/{TotalCount}, with situation: {SituationCount}/{TotalCount}",
+            allDetailsCount, validatedAllMatches.Count, allSituationCount, validatedAllMatches.Count);
     }
     catch (Exception ex)
     {
@@ -222,185 +469,187 @@ public partial class ArbitrageLiveMatchBackgroundService : BackgroundService
         }
     }
 
-    
+
     private void ProcessMatchSituation(Match match, JsonDocument document)
-{
-    try
     {
-        var rawJson = document.RootElement.GetRawText();
-        
-        if (rawJson.Contains("\"event\":\"exception\""))
+        try
         {
-            _logger.LogWarning("Received exception response for match {MatchId} in situation data", match.Id);
-            return;
-        }
-        
-        var response = JsonSerializer.Deserialize<fredapi.Model.Live.StatsMatchSituationResponse>(rawJson, _jsonOptions);
+            var rawJson = document.RootElement.GetRawText();
 
-        if (response?.Doc?.FirstOrDefault()?.Data != null)
-        {
-            var data = response.Doc[0].Data;
-            if (data.Data == null || !data.Data.Any())
+            if (rawJson.Contains("\"event\":\"exception\""))
             {
-                _logger.LogWarning("No match situation data found for match {MatchId}", data.MatchId);
+                _logger.LogWarning("Received exception response for match {MatchId} in situation data", match.Id);
                 return;
             }
 
-            var validData = data.Data.Where(d => d != null && d.Home != null && d.Away != null).ToList();
-            if (!validData.Any())
-            {
-                _logger.LogWarning("No valid match situation data entries found for match {MatchId}", data.MatchId);
-                return;
-            }
+            var response =
+                JsonSerializer.Deserialize<fredapi.Model.Live.StatsMatchSituationResponse>(rawJson, _jsonOptions);
 
-            var situationData = new MatchSituationStats
+            if (response?.Doc?.FirstOrDefault()?.Data != null)
             {
-                MatchId = data.MatchId,
-                Data = validData.Select(d => new TimeSliceStats
+                var data = response.Doc[0].Data;
+                if (data.Data == null || !data.Data.Any())
                 {
-                    Time = d.Time,
-                    InjuryTime = d.InjuryTime,
-                    Home = new fredapi.Model.MatchSituationStats.TeamStats
+                    _logger.LogWarning("No match situation data found for match {MatchId}", data.MatchId);
+                    return;
+                }
+
+                var validData = data.Data.Where(d => d != null && d.Home != null && d.Away != null).ToList();
+                if (!validData.Any())
+                {
+                    _logger.LogWarning("No valid match situation data entries found for match {MatchId}", data.MatchId);
+                    return;
+                }
+
+                var situationData = new MatchSituationStats
+                {
+                    MatchId = data.MatchId,
+                    Data = validData.Select(d => new TimeSliceStats
                     {
-                        Attack = (int)Math.Round((decimal)d.Home.Attack, 0),
-                        Dangerous = (int)Math.Round((decimal)d.Home.Dangerous, 0),
-                        Safe = (int)Math.Round((decimal)d.Home.Safe, 0),
-                        AttackCount = d.Home.AttackCount,
-                        DangerousCount = d.Home.DangerousCount,
-                        SafeCount = d.Home.SafeCount
+                        Time = d.Time,
+                        InjuryTime = d.InjuryTime,
+                        Home = new fredapi.Model.MatchSituationStats.TeamStats
+                        {
+                            Attack = (int)Math.Round((decimal)d.Home.Attack, 0),
+                            Dangerous = (int)Math.Round((decimal)d.Home.Dangerous, 0),
+                            Safe = (int)Math.Round((decimal)d.Home.Safe, 0),
+                            AttackCount = d.Home.AttackCount,
+                            DangerousCount = d.Home.DangerousCount,
+                            SafeCount = d.Home.SafeCount
+                        },
+                        Away = new fredapi.Model.MatchSituationStats.TeamStats
+                        {
+                            Attack = (int)Math.Round((decimal)d.Away.Attack, 0),
+                            Dangerous = (int)Math.Round((decimal)d.Away.Dangerous, 0),
+                            Safe = (int)Math.Round((decimal)d.Away.Safe, 0),
+                            AttackCount = d.Away.AttackCount,
+                            DangerousCount = d.Away.DangerousCount,
+                            SafeCount = d.Away.SafeCount
+                        }
+                    }).ToList()
+                };
+
+                var analyzedStats = MatchSituationAnalyzer.AnalyzeMatchSituation(situationData);
+
+                match.MatchSituation = new ClientMatchSituation
+                {
+                    TotalTime = analyzedStats.TotalTime,
+                    DominantTeam = analyzedStats.DominantTeam,
+                    MatchMomentum = analyzedStats.MatchMomentum,
+                    Home = new ClientTeamSituation
+                    {
+                        TotalAttacks = analyzedStats.Home.TotalAttacks,
+                        TotalDangerousAttacks = analyzedStats.Home.TotalDangerousAttacks,
+                        TotalSafeAttacks = analyzedStats.Home.TotalSafeAttacks,
+                        TotalAttackCount = analyzedStats.Home.TotalAttackCount,
+                        TotalDangerousCount = analyzedStats.Home.TotalDangerousCount,
+                        TotalSafeCount = analyzedStats.Home.TotalSafeCount,
+                        AttackPercentage = Math.Round(analyzedStats.Home.AttackPercentage),
+                        DangerousAttackPercentage = Math.Round(analyzedStats.Home.DangerousAttackPercentage),
+                        SafeAttackPercentage = Math.Round(analyzedStats.Home.SafeAttackPercentage)
                     },
-                    Away = new fredapi.Model.MatchSituationStats.TeamStats
+                    Away = new ClientTeamSituation
                     {
-                        Attack = (int)Math.Round((decimal)d.Away.Attack, 0),
-                        Dangerous = (int)Math.Round((decimal)d.Away.Dangerous, 0),
-                        Safe = (int)Math.Round((decimal)d.Away.Safe, 0),
-                        AttackCount = d.Away.AttackCount,
-                        DangerousCount = d.Away.DangerousCount,
-                        SafeCount = d.Away.SafeCount
+                        TotalAttacks = analyzedStats.Away.TotalAttacks,
+                        TotalDangerousAttacks = analyzedStats.Away.TotalDangerousAttacks,
+                        TotalSafeAttacks = analyzedStats.Away.TotalSafeAttacks,
+                        TotalAttackCount = analyzedStats.Away.TotalAttackCount,
+                        TotalDangerousCount = analyzedStats.Away.TotalDangerousCount,
+                        TotalSafeCount = analyzedStats.Away.TotalSafeCount,
+                        AttackPercentage = Math.Round(analyzedStats.Away.AttackPercentage),
+                        DangerousAttackPercentage = Math.Round(analyzedStats.Away.DangerousAttackPercentage),
+                        SafeAttackPercentage = Math.Round(analyzedStats.Away.SafeAttackPercentage)
                     }
-                }).ToList()
-            };
-
-            var analyzedStats = MatchSituationAnalyzer.AnalyzeMatchSituation(situationData);
-
-            match.MatchSituation = new ClientMatchSituation
-            {
-                TotalTime = analyzedStats.TotalTime,
-                DominantTeam = analyzedStats.DominantTeam,
-                MatchMomentum = analyzedStats.MatchMomentum,
-                Home = new ClientTeamSituation
-                {
-                    TotalAttacks = analyzedStats.Home.TotalAttacks,
-                    TotalDangerousAttacks = analyzedStats.Home.TotalDangerousAttacks,
-                    TotalSafeAttacks = analyzedStats.Home.TotalSafeAttacks,
-                    TotalAttackCount = analyzedStats.Home.TotalAttackCount,
-                    TotalDangerousCount = analyzedStats.Home.TotalDangerousCount,
-                    TotalSafeCount = analyzedStats.Home.TotalSafeCount,
-                    AttackPercentage = Math.Round(analyzedStats.Home.AttackPercentage),
-                    DangerousAttackPercentage = Math.Round(analyzedStats.Home.DangerousAttackPercentage),
-                    SafeAttackPercentage = Math.Round(analyzedStats.Home.SafeAttackPercentage)
-                },
-                Away = new ClientTeamSituation
-                {
-                    TotalAttacks = analyzedStats.Away.TotalAttacks,
-                    TotalDangerousAttacks = analyzedStats.Away.TotalDangerousAttacks,
-                    TotalSafeAttacks = analyzedStats.Away.TotalSafeAttacks,
-                    TotalAttackCount = analyzedStats.Away.TotalAttackCount,
-                    TotalDangerousCount = analyzedStats.Away.TotalDangerousCount,
-                    TotalSafeCount = analyzedStats.Away.TotalSafeCount,
-                    AttackPercentage = Math.Round(analyzedStats.Away.AttackPercentage),
-                    DangerousAttackPercentage = Math.Round(analyzedStats.Away.DangerousAttackPercentage),
-                    SafeAttackPercentage = Math.Round(analyzedStats.Away.SafeAttackPercentage)
-                }
-            };
-        }
-    }
-    catch (Exception ex)
-    {
-        _logger.LogError(ex, "Error processing match situation for match {MatchId}", match.Id);
-    }
-}
-
-private void ProcessMatchDetails(Match match, JsonDocument document)
-{
-    try
-    {
-        var rawJson = document.RootElement.GetRawText();
-        
-        if (rawJson.Contains("\"event\":\"exception\""))
-        {
-            _logger.LogWarning("Received exception response for match {MatchId} in details data", match.Id);
-            return;
-        }
-        
-        var options = new JsonSerializerOptions(_jsonOptions)
-        {
-            Converters = { 
-                new JsonDictionaryStringNumberConverter(),
-                new MatchDetailsDataConverter()
+                };
             }
-        };
-
-        var detailsData = JsonSerializer.Deserialize<MatchDetailsExtendedResponse>(rawJson, options);
-
-        if (detailsData?.Doc?.FirstOrDefault()?.Data != null)
+        }
+        catch (Exception ex)
         {
-            var data = detailsData.Doc[0].Data;
-            match.MatchDetails = new ClientMatchDetailsExtended
-            {
-                Types = data.Types,
-                Home = new ClientTeamStats
-                {
-                    YellowCards = ExtractIntValue(data.Values, "40", "home"),
-                    RedCards = ExtractIntValue(data.Values, "50", "home"),
-                    FreeKicks = ExtractIntValue(data.Values, "120", "home"),
-                    GoalKicks = ExtractIntValue(data.Values, "121", "home"),
-                    ThrowIns = ExtractIntValue(data.Values, "122", "home"),
-                    Offsides = ExtractIntValue(data.Values, "123", "home"),
-                    CornerKicks = ExtractIntValue(data.Values, "124", "home"),
-                    ShotsOnTarget = ExtractIntValue(data.Values, "125", "home"),
-                    ShotsOffTarget = ExtractIntValue(data.Values, "126", "home"),
-                    Saves = ExtractIntValue(data.Values, "127", "home"),
-                    Fouls = ExtractIntValue(data.Values, "129", "home"),
-                    Injuries = ExtractIntValue(data.Values, "158", "home"),
-                    DangerousAttacks = ExtractIntValue(data.Values, "1029", "home"),
-                    BallSafe = ExtractIntValue(data.Values, "1030", "home"),
-                    TotalAttacks = ExtractIntValue(data.Values, "1126", "home"),
-                    GoalAttempts = ExtractIntValue(data.Values, "goalattempts", "home"),
-                    BallSafePercentage = ExtractDoubleValue(data.Values, "ballsafepercentage", "home"),
-                    AttackPercentage = ExtractDoubleValue(data.Values, "attackpercentage", "home"),
-                    DangerousAttackPercentage = ExtractDoubleValue(data.Values, "dangerousattackpercentage", "home")
-                },
-                Away = new ClientTeamStats
-                {
-                    YellowCards = ExtractIntValue(data.Values, "40", "away"),
-                    RedCards = ExtractIntValue(data.Values, "50", "away"),
-                    FreeKicks = ExtractIntValue(data.Values, "120", "away"),
-                    GoalKicks = ExtractIntValue(data.Values, "121", "away"),
-                    ThrowIns = ExtractIntValue(data.Values, "122", "away"),
-                    Offsides = ExtractIntValue(data.Values, "123", "away"),
-                    CornerKicks = ExtractIntValue(data.Values, "124", "away"),
-                    ShotsOnTarget = ExtractIntValue(data.Values, "125", "away"),
-                    ShotsOffTarget = ExtractIntValue(data.Values, "126", "away"),
-                    Saves = ExtractIntValue(data.Values, "127", "away"),
-                    Fouls = ExtractIntValue(data.Values, "129", "away"),
-                    Injuries = ExtractIntValue(data.Values, "158", "away"),
-                    DangerousAttacks = ExtractIntValue(data.Values, "1029", "away"),
-                    BallSafe = ExtractIntValue(data.Values, "1030", "away"),
-                    TotalAttacks = ExtractIntValue(data.Values, "1126", "away"),
-                    GoalAttempts = ExtractIntValue(data.Values, "goalattempts", "away"),
-                    BallSafePercentage = ExtractDoubleValue(data.Values, "ballsafepercentage", "away"),
-                    AttackPercentage = ExtractDoubleValue(data.Values, "attackpercentage", "away"),
-                    DangerousAttackPercentage = ExtractDoubleValue(data.Values, "dangerousattackpercentage", "away")
-                }
-            };
+            _logger.LogError(ex, "Error processing match situation for match {MatchId}", match.Id);
         }
     }
-    catch (Exception ex)
+
+    private void ProcessMatchDetails(Match match, JsonDocument document)
     {
-        _logger.LogError(ex, "Error processing match details for match {MatchId}", match.Id);
+        try
+        {
+            var rawJson = document.RootElement.GetRawText();
+
+            if (rawJson.Contains("\"event\":\"exception\""))
+            {
+                _logger.LogWarning("Received exception response for match {MatchId} in details data", match.Id);
+                return;
+            }
+
+            var options = new JsonSerializerOptions(_jsonOptions)
+            {
+                Converters =
+                {
+                    new JsonDictionaryStringNumberConverter(),
+                    new MatchDetailsDataConverter()
+                }
+            };
+
+            var detailsData = JsonSerializer.Deserialize<MatchDetailsExtendedResponse>(rawJson, options);
+
+            if (detailsData?.Doc?.FirstOrDefault()?.Data != null)
+            {
+                var data = detailsData.Doc[0].Data;
+                match.MatchDetails = new ClientMatchDetailsExtended
+                {
+                    Types = data.Types,
+                    Home = new ClientTeamStats
+                    {
+                        YellowCards = ExtractIntValue(data.Values, "40", "home"),
+                        RedCards = ExtractIntValue(data.Values, "50", "home"),
+                        FreeKicks = ExtractIntValue(data.Values, "120", "home"),
+                        GoalKicks = ExtractIntValue(data.Values, "121", "home"),
+                        ThrowIns = ExtractIntValue(data.Values, "122", "home"),
+                        Offsides = ExtractIntValue(data.Values, "123", "home"),
+                        CornerKicks = ExtractIntValue(data.Values, "124", "home"),
+                        ShotsOnTarget = ExtractIntValue(data.Values, "125", "home"),
+                        ShotsOffTarget = ExtractIntValue(data.Values, "126", "home"),
+                        Saves = ExtractIntValue(data.Values, "127", "home"),
+                        Fouls = ExtractIntValue(data.Values, "129", "home"),
+                        Injuries = ExtractIntValue(data.Values, "158", "home"),
+                        DangerousAttacks = ExtractIntValue(data.Values, "1029", "home"),
+                        BallSafe = ExtractIntValue(data.Values, "1030", "home"),
+                        TotalAttacks = ExtractIntValue(data.Values, "1126", "home"),
+                        GoalAttempts = ExtractIntValue(data.Values, "goalattempts", "home"),
+                        BallSafePercentage = ExtractDoubleValue(data.Values, "ballsafepercentage", "home"),
+                        AttackPercentage = ExtractDoubleValue(data.Values, "attackpercentage", "home"),
+                        DangerousAttackPercentage = ExtractDoubleValue(data.Values, "dangerousattackpercentage", "home")
+                    },
+                    Away = new ClientTeamStats
+                    {
+                        YellowCards = ExtractIntValue(data.Values, "40", "away"),
+                        RedCards = ExtractIntValue(data.Values, "50", "away"),
+                        FreeKicks = ExtractIntValue(data.Values, "120", "away"),
+                        GoalKicks = ExtractIntValue(data.Values, "121", "away"),
+                        ThrowIns = ExtractIntValue(data.Values, "122", "away"),
+                        Offsides = ExtractIntValue(data.Values, "123", "away"),
+                        CornerKicks = ExtractIntValue(data.Values, "124", "away"),
+                        ShotsOnTarget = ExtractIntValue(data.Values, "125", "away"),
+                        ShotsOffTarget = ExtractIntValue(data.Values, "126", "away"),
+                        Saves = ExtractIntValue(data.Values, "127", "away"),
+                        Fouls = ExtractIntValue(data.Values, "129", "away"),
+                        Injuries = ExtractIntValue(data.Values, "158", "away"),
+                        DangerousAttacks = ExtractIntValue(data.Values, "1029", "away"),
+                        BallSafe = ExtractIntValue(data.Values, "1030", "away"),
+                        TotalAttacks = ExtractIntValue(data.Values, "1126", "away"),
+                        GoalAttempts = ExtractIntValue(data.Values, "goalattempts", "away"),
+                        BallSafePercentage = ExtractDoubleValue(data.Values, "ballsafepercentage", "away"),
+                        AttackPercentage = ExtractDoubleValue(data.Values, "attackpercentage", "away"),
+                        DangerousAttackPercentage = ExtractDoubleValue(data.Values, "dangerousattackpercentage", "away")
+                    }
+                };
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error processing match details for match {MatchId}", match.Id);
+        }
     }
-}
 
 // Add this method for fetching match data
     private async Task FetchMatchDataAsync(Match match)
@@ -425,6 +674,8 @@ private void ProcessMatchDetails(Match match, JsonDocument document)
 
         // Use semaphore to limit API calls
         var acquiredSemaphore = await _apiSemaphore.WaitAsync(3000);
+        await AddHumanLikeDelay(700, 1100);
+
         if (!acquiredSemaphore)
         {
             _logger.LogWarning("Timeout waiting for API semaphore for match {MatchId}", match.Id);
@@ -514,18 +765,6 @@ private void ProcessMatchDetails(Match match, JsonDocument document)
             .ToList();
     }
 
-    private List<Match> ProcessEvents(List<Event> events)
-    {
-        // Use parallelism with controlled degree
-        return events
-            .AsParallel()
-            .WithDegreeOfParallelism(Math.Min(Environment.ProcessorCount, 4))
-            .Select(ProcessSingleEvent)
-            .Where(m => m != null && m.Markets.Any()) // Only include matches with actual arbitrage opportunities
-            .Where(m => !m.Teams.Away.Name.ToUpper().Contains("SRL") && !m.Teams.Home.Name.ToUpper().Contains("SRL"))
-            .ToList();
-    }
-
     private List<Match> ProcessAllEvents(List<Event> events)
     {
         // Use parallelism with controlled degree
@@ -538,141 +777,79 @@ private void ProcessMatchDetails(Match match, JsonDocument document)
             .ToList();
     }
 
-    private Match ProcessSingleEvent(Event eventData)
-    {
-        // Check cache first
-        var cacheKey = $"{CACHE_KEY_EVENT_PREFIX}{eventData.EventId}";
-        if (_cache.TryGetValue(cacheKey, out Match cachedMatch))
-        {
-            return cachedMatch;
-        }
-
-        _logger.LogDebug($"Processing event {eventData.EventId}");
-        var potentialMarkets = ProcessMarkets(eventData);
-        var arbitrageMarkets = potentialMarkets
-            .Where(m => m.hasArbitrage && m.market.ProfitPercentage > MinProfitThreshold)
-            .Select(m => m.market)
-            .ToList();
-
-        _logger.LogDebug($"Found {arbitrageMarkets.Count} arbitrage markets for event {eventData.EventId}");
-
-        // Only create a match if there are actual arbitrage opportunities
-        if (!arbitrageMarkets.Any())
-        {
-            _logger.LogDebug($"No arbitrage opportunities found for event {eventData.EventId}");
-            return null;
-        }
-
-        var match = CreateMatch(eventData, arbitrageMarkets);
-
-        // Cache result with expiration
-        _cache.Set(cacheKey, match, TimeSpan.FromSeconds(30));
-
-        return match;
-    }
-
-    private Match CreateMatchFromEvent(Event eventData)
-    {
-        // Try cache first
-        var cacheKey = $"{CACHE_KEY_EVENT_PREFIX}base_{eventData.EventId}";
-        if (_cache.TryGetValue(cacheKey, out Match cachedMatch))
-        {
-            return cachedMatch;
-        }
-
-        var markets = eventData.Markets
-            .Where(m => IsValidMarketStatus(m))
-            .Where(m => m.Desc?.ToLower() == "match result" || m.Desc?.ToLower() == "1x2") // Only include 1X2 markets
-            .Select(m => new Market
-            {
-                Id = m.Id,
-                Description = m.Desc,
-                Specifier = m.Specifier,
-                Outcomes = ProcessOutcomes(m.Outcomes),
-                Favourite = m.Favourite,
-            })
-            .Where(m => m.Outcomes.Any() && m.Outcomes.Count == 3) // Ensure we have exactly 3 outcomes (1X2)
-            .ToList();
-
-        var match = CreateMatch(eventData, markets);
-
-        // Cache result
-        _cache.Set(cacheKey, match, TimeSpan.FromSeconds(30));
-
-        return match;
-    }
-
-    private List<(Market market, bool hasArbitrage)> ProcessMarkets(Event eventData)
-    {
-        _logger.LogDebug($"Processing markets for match {eventData.EventId}");
-
-        // Use parallel processing for markets
-        var markets = eventData.Markets
-            .AsParallel()
-            .Where(m => IsValidMarketStatus(m))
-            .Where(m => _marketValidator.ValidateMarket(m))
-            .Select(m => ProcessMarket(m, eventData.EventId))
-            .Where(m => m.market.Outcomes.Any())
-            .ToList();
-
-        _logger.LogDebug($"Found {markets.Count} valid markets for match {eventData.EventId}");
-
-        return markets;
-    }
 
     private bool IsValidMarketStatus(MarketData market)
     {
         return market.Status != 2 && market.Status != 3; // Exclude suspended and settled markets
     }
 
-    private (Market market, bool hasArbitrage) ProcessMarket(MarketData marketData, string matchId)
+private (Market market, bool hasArbitrage) ProcessMarket(MarketData marketData, string matchId)
+{
+    try
     {
-        try
+        _logger.LogDebug($"Processing market {marketData.Id} for match {matchId}");
+        var market = new Market
         {
-            _logger.LogDebug($"Processing market {marketData.Id} for match {matchId}");
-            var market = new Market
-            {
-                Id = marketData.Id,
-                Description = marketData.Desc,
-                Specifier = marketData.Specifier,
-                Outcomes = ProcessOutcomes(marketData.Outcomes),
-                Favourite = marketData.Favourite,
-            };
+            Id = marketData.Id,
+            Description = marketData.Desc,
+            Specifier = marketData.Specifier,
+            Outcomes = ProcessOutcomes(marketData.Outcomes),
+            Favourite = marketData.Favourite,
+        };
 
-            if (!market.Outcomes.Any() ||
-                !_marketValidator.ValidateMarket(marketData, market.Outcomes.Count))
+        // Fix #6: Add more detailed validation logging
+        if (!market.Outcomes.Any())
+        {
+            _logger.LogDebug($"Market {marketData.Id} has no valid outcomes");
+            return (market, false);
+        }
+
+        // Fix #7: Try validating the market even if it doesn't follow expected patterns
+        bool isValidMarket = _marketValidator.ValidateMarket(marketData, market.Outcomes.Count);
+        if (!isValidMarket)
+        {
+            _logger.LogDebug($"Market {marketData.Id} failed validation: {marketData.Desc}, Specifier: {marketData.Specifier}, Outcomes: {market.Outcomes.Count}");
+            
+            // Fix #8: For arbitrage calculation, try to process markets even if they don't fit standard patterns
+            // but only if they have at least 2 outcomes (arbitrage needs multiple outcomes)
+            if (market.Outcomes.Count < 2)
             {
-                _logger.LogDebug($"Market {marketData.Id} invalid: No outcomes or failed validation");
                 return (market, false);
             }
-
-            var (hasArbitrage, stakePercentages, profitPercentage) =
-                CalculateArbitrageOpportunity(market);
-
-            if (hasArbitrage)
-            {
-                UpdateMarketWithArbitrageData(market, stakePercentages, profitPercentage);
-                LogArbitrageOpportunity(matchId, market);
-            }
-
-            return (market, hasArbitrage);
+            // Proceed anyway if it has enough outcomes for potential arbitrage
         }
-        catch (Exception ex)
+
+        var (hasArbitrage, stakePercentages, profitPercentage) =
+            CalculateArbitrageOpportunity(market);
+
+        if (hasArbitrage)
         {
-            _logger.LogWarning(ex, "Error processing market {MarketId}", marketData.Id);
-            return (new Market(), false);
+            UpdateMarketWithArbitrageData(market, stakePercentages, profitPercentage);
+            LogArbitrageOpportunity(matchId, market);
         }
-    }
 
-    private List<Outcome> ProcessOutcomes(List<OutcomeData> outcomes)
+        return (market, hasArbitrage);
+    }
+    catch (Exception ex)
     {
-        return outcomes
-            .Where(o => o != null && o.IsActive == 1 && !string.IsNullOrEmpty(o.Odds))
-            .Select(CreateOutcome)
-            .Where(o => o != null)
-            .ToList();
+        _logger.LogWarning(ex, "Error processing market {MarketId}", marketData.Id);
+        return (new Market(), false);
     }
-
+}
+private List<Outcome> ProcessOutcomes(List<OutcomeData> outcomes)
+{
+    var validOutcomes = outcomes
+        .Where(o => o != null && o.IsActive == 1 && !string.IsNullOrEmpty(o.Odds))
+        .Select(CreateOutcome)
+        .Where(o => o != null)
+        .ToList();
+    
+    // Fix #9: Log outcomes for debugging
+    _logger.LogDebug($"Processed {outcomes.Count} outcomes, found {validOutcomes.Count} valid outcomes: " +
+                     $"{string.Join(", ", validOutcomes.Select(o => $"{o.Description}: {o.Odds}"))}");
+    
+    return validOutcomes;
+}
     private Outcome CreateOutcome(OutcomeData outcomeData)
     {
         if (!decimal.TryParse(outcomeData.Odds, out var odds) || odds <= 0)
@@ -734,7 +911,7 @@ private void ProcessMatchDetails(Match match, JsonDocument document)
             LastUpdated = DateTime.UtcNow
         };
     }
-
+    
     private (bool hasArbitrage, List<decimal> stakePercentages, decimal profitPercentage)
         CalculateArbitrageOpportunity(Market market)
     {
@@ -746,6 +923,9 @@ private void ProcessMatchDetails(Match match, JsonDocument document)
         var margin = CalculateMarginPercentage(market.Outcomes);
         market.Margin = margin;
 
+        // Debug log to see margins being calculated
+        _logger.LogDebug($"Market {market.Id} ({market.Description}) has margin {margin}%");
+
         if (margin > MaxAcceptableMargin)
         {
             return (false, new List<decimal>(), 0m);
@@ -754,9 +934,25 @@ private void ProcessMatchDetails(Match match, JsonDocument document)
         var totalInverse = market.Outcomes.Sum(o => 1m / o.Odds);
         var profitPercentage = ((1 / totalInverse) - 1) * 100;
 
+        // Log more details about potential opportunities
+        if (profitPercentage > 0)
+        {
+            _logger.LogDebug($"Potential arbitrage: Market {market.Id} ({market.Description}) " + 
+                             $"has profit {profitPercentage:F2}%, " +
+                             $"Outcomes: {string.Join(", ", market.Outcomes.Select(o => $"{o.Description}: {o.Odds}"))}");
+        }
+
         if (profitPercentage <= 0)
         {
             return (false, new List<decimal>(), 0m);
+        }
+
+        // For actual arbitrage opportunities, log more prominently
+        if (profitPercentage > MinProfitThreshold)
+        {
+            _logger.LogInformation($"ARBITRAGE FOUND: Market {market.Id} ({market.Description}) " + 
+                                   $"with {profitPercentage:F2}% profit, " +
+                                   $"Outcomes: {string.Join(", ", market.Outcomes.Select(o => $"{o.Description}: {o.Odds}"))}");
         }
 
         var stakePercentages = CalculateStakePercentages(market.Outcomes, totalInverse);
@@ -774,7 +970,12 @@ private void ProcessMatchDetails(Match match, JsonDocument document)
     private decimal CalculateMarginPercentage(List<Outcome> outcomes)
     {
         var impliedProbabilities = outcomes.Select(o => 1m / o.Odds);
-        var margin = (impliedProbabilities.Sum() - 1m) * 100;
+        var totalImpliedProbability = impliedProbabilities.Sum();
+        var margin = (totalImpliedProbability - 1m) * 100;
+    
+        // Log the calculation details for troubleshooting
+        _logger.LogDebug($"Margin calculation: total implied probability = {totalImpliedProbability}, margin = {margin}%");
+    
         return Math.Round(margin, 2);
     }
 
@@ -902,6 +1103,22 @@ private void ProcessMatchDetails(Match match, JsonDocument document)
         if (valueObj is double doubleValue)
             return doubleValue;
         return 0;
+    }
+
+    // Add this custom comparer for matches to properly deduplicate in the Distinct call
+    private class MatchEqualityComparer : IEqualityComparer<Match>
+    {
+        public bool Equals(Match x, Match y)
+        {
+            if (ReferenceEquals(x, y)) return true;
+            if (x is null || y is null) return false;
+            return x.Id == y.Id;
+        }
+
+        public int GetHashCode(Match obj)
+        {
+            return obj.Id.GetHashCode();
+        }
     }
 }
 
