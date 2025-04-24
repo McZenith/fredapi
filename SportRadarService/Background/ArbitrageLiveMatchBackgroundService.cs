@@ -96,6 +96,7 @@ public partial class ArbitrageLiveMatchBackgroundService : BackgroundService
                     var tokenService = scope.ServiceProvider.GetRequiredService<ITokenService>();
                     await tokenService.GetSportRadarToken();
                 }
+
                 await ProcessMatchesAsync(stoppingToken);
             }
             catch (Exception ex)
@@ -158,14 +159,14 @@ public partial class ArbitrageLiveMatchBackgroundService : BackgroundService
 
         // Process ALL markets for arbitrage, not just NextGoal markets - this is the main issue
         var potentialMarkets = ProcessMarkets(eventData);
-    
+
         // Fix #1: Log all market types being processed for debugging
         var marketTypes = potentialMarkets
             .Select(m => m.market.Description)
             .GroupBy(d => d)
             .Select(g => $"{g.Key}: {g.Count()}")
             .ToList();
-    
+
         _logger.LogDebug($"Processing market types: {string.Join(", ", marketTypes)}");
 
         var arbitrageMarkets = potentialMarkets
@@ -214,7 +215,7 @@ public partial class ArbitrageLiveMatchBackgroundService : BackgroundService
             .GroupBy(d => d)
             .Select(g => $"{g.Key}: {g.Count()}")
             .ToList();
-    
+
         _logger.LogDebug($"Market types considered for arbitrage: {string.Join(", ", marketTypes)}");
         _logger.LogDebug($"Found {markets.Count} valid markets to check for arbitrage in match {eventData.EventId}");
 
@@ -254,16 +255,16 @@ public partial class ArbitrageLiveMatchBackgroundService : BackgroundService
             // REMOVED: Additional check to ensure we only have NextGoal markets
             // This was filtering out matches with other types of arbitrage opportunities
             .ToList();
-        
+
         // Log the types of arbitrage markets found
         var arbitrageTypes = matches
             .SelectMany(m => m.Markets)
             .GroupBy(m => m.Description)
             .Select(g => $"{g.Key}: {g.Count()}")
             .ToList();
-        
+
         _logger.LogInformation($"Found arbitrage in market types: {string.Join(", ", arbitrageTypes)}");
-    
+
         return matches;
     }
 
@@ -306,153 +307,155 @@ public partial class ArbitrageLiveMatchBackgroundService : BackgroundService
     }
 
 // Fixed StreamMatchesToClientsAsync to properly handle all arbitrage types
-private async Task StreamMatchesToClientsAsync(List<Match> arbitrageMatches, List<Event> allEvents,
-    List<Match> allMatchesFromEvents, CancellationToken stoppingToken = default)
-{
-    if (!arbitrageMatches.Any() && !allMatchesFromEvents.Any()) return;
-
-    try
+    private async Task StreamMatchesToClientsAsync(List<Match> arbitrageMatches, List<Event> allEvents,
+        List<Match> allMatchesFromEvents, CancellationToken stoppingToken = default)
     {
-        _logger.LogInformation($"Processing {allMatchesFromEvents.Count} matches for enrichment");
+        if (!arbitrageMatches.Any() && !allMatchesFromEvents.Any()) return;
 
-        // Debug: Log all arbitrage matches and their markets
-        foreach (var match in arbitrageMatches)
+        try
         {
-            _logger.LogInformation($"Arbitrage match: {match.Id} - {match.Teams.Home.Name} vs {match.Teams.Away.Name}");
-            foreach (var market in match.Markets)
-            {
-                _logger.LogInformation($"  Market: {market.Description}, Profit: {market.ProfitPercentage}%, " +
-                                      $"Outcomes: {string.Join(", ", market.Outcomes.Select(o => $"{o.Description}: {o.Odds}"))}");
-            }
-        }
+            _logger.LogInformation($"Processing {allMatchesFromEvents.Count} matches for enrichment");
 
-        // Log market types for debugging
-        var arbitrageMarketTypes = arbitrageMatches
-            .SelectMany(m => m.Markets)
-            .GroupBy(m => m.Description)
-            .Select(g => $"{g.Key}: {g.Count()}")
-            .ToList();
-        
-        var allMatchesMarketTypes = allMatchesFromEvents
-            .SelectMany(m => m.Markets)
-            .GroupBy(m => m.Description)
-            .Select(g => $"{g.Key}: {g.Count()}")
-            .ToList();
-        
-        _logger.LogInformation($"Arbitrage market types: {string.Join(", ", arbitrageMarketTypes)}");
-        _logger.LogInformation($"All matches market types: {string.Join(", ", allMatchesMarketTypes)}");
-
-        // Combine both match lists ensuring no duplicates
-        var allMatchesToProcess = new List<Match>();
-        
-        // Add all regular matches
-        allMatchesToProcess.AddRange(allMatchesFromEvents);
-        
-        // Add arbitrage matches that aren't already in the list
-        foreach (var match in arbitrageMatches)
-        {
-            if (!allMatchesToProcess.Any(m => m.Id == match.Id))
+            // Debug: Log all arbitrage matches and their markets
+            foreach (var match in arbitrageMatches)
             {
-                allMatchesToProcess.Add(match);
-            }
-        }
-        
-        _logger.LogInformation($"Processing a total of {allMatchesToProcess.Count} matches for details/situation data");
-        
-        // Create batches of matches for parallel processing
-        var batches = allMatchesToProcess.Chunk(5).ToList();
-            
-        var batchTasks = new List<Task>();
-
-        // Process batches in parallel with delay between batch starts
-        foreach (var batch in batches)
-        {
-            var batchTask = Task.Run(async () =>
-            {
-                foreach (var match in batch)
+                _logger.LogInformation(
+                    $"Arbitrage match: {match.Id} - {match.Teams.Home.Name} vs {match.Teams.Away.Name}");
+                foreach (var market in match.Markets)
                 {
-                    if (stoppingToken.IsCancellationRequested) break;
-
-                    try
-                    {
-                        await FetchMatchDataAsync(match);
-                        await AddHumanLikeDelay(100, 200);
-                    }
-                    catch (Exception ex)
-                    {
-                        _logger.LogWarning(ex, "Error fetching data for match {MatchId}", match.Id);
-                        await AddHumanLikeDelay(300, 500);
-                    }
+                    _logger.LogInformation($"  Market: {market.Description}, Profit: {market.ProfitPercentage}%, " +
+                                           $"Outcomes: {string.Join(", ", market.Outcomes.Select(o => $"{o.Description}: {o.Odds}"))}");
                 }
-            }, stoppingToken);
+            }
 
-            batchTasks.Add(batchTask);
-            await Task.Delay(150, stoppingToken);
+            // Log market types for debugging
+            var arbitrageMarketTypes = arbitrageMatches
+                .SelectMany(m => m.Markets)
+                .GroupBy(m => m.Description)
+                .Select(g => $"{g.Key}: {g.Count()}")
+                .ToList();
+
+            var allMatchesMarketTypes = allMatchesFromEvents
+                .SelectMany(m => m.Markets)
+                .GroupBy(m => m.Description)
+                .Select(g => $"{g.Key}: {g.Count()}")
+                .ToList();
+
+            _logger.LogInformation($"Arbitrage market types: {string.Join(", ", arbitrageMarketTypes)}");
+            _logger.LogInformation($"All matches market types: {string.Join(", ", allMatchesMarketTypes)}");
+
+            // Combine both match lists ensuring no duplicates
+            var allMatchesToProcess = new List<Match>();
+
+            // Add all regular matches
+            allMatchesToProcess.AddRange(allMatchesFromEvents);
+
+            // Add arbitrage matches that aren't already in the list
+            foreach (var match in arbitrageMatches)
+            {
+                if (!allMatchesToProcess.Any(m => m.Id == match.Id))
+                {
+                    allMatchesToProcess.Add(match);
+                }
+            }
+
+            _logger.LogInformation(
+                $"Processing a total of {allMatchesToProcess.Count} matches for details/situation data");
+
+            // Create batches of matches for parallel processing
+            var batches = allMatchesToProcess.Chunk(5).ToList();
+
+            var batchTasks = new List<Task>();
+
+            // Process batches in parallel with delay between batch starts
+            foreach (var batch in batches)
+            {
+                var batchTask = Task.Run(async () =>
+                {
+                    foreach (var match in batch)
+                    {
+                        if (stoppingToken.IsCancellationRequested) break;
+
+                        try
+                        {
+                            await FetchMatchDataAsync(match);
+                            await AddHumanLikeDelay(100, 200);
+                        }
+                        catch (Exception ex)
+                        {
+                            _logger.LogWarning(ex, "Error fetching data for match {MatchId}", match.Id);
+                            await AddHumanLikeDelay(300, 500);
+                        }
+                    }
+                }, stoppingToken);
+
+                batchTasks.Add(batchTask);
+                await Task.Delay(150, stoppingToken);
+            }
+
+            // Wait for all batches to complete
+            await Task.WhenAll(batchTasks);
+
+            // Enrich matches with prediction data before sending to clients
+            var (enrichedArbitrageMatches, enrichedAllMatches) = await _predictionEnrichedMatchService
+                .EnrichMatchesWithPredictionDataAsync(arbitrageMatches, allMatchesFromEvents);
+
+            // IMPORTANT: Don't filter arbitrage matches by market type anymore
+            // Just send all arbitrage matches to the arbitrage channel
+            var validatedArbitrageMatches = enrichedArbitrageMatches.ToList();
+
+            // Get all matches with 1X2 markets for the regular channel
+            var oneXTwoMatchesLookup = enrichedAllMatches
+                .Where(m => m.Markets.Any(market =>
+                    market.Description?.ToLower() == "match result" ||
+                    market.Description?.ToLower() == "1x2" ||
+                    (market.Description?.ToLower().Contains("1x2") == true)))
+                .ToDictionary(m => m.Id);
+
+            // Get all matches while preserving their details and situations
+            var validatedAllMatches = enrichedAllMatches
+                .Where(m => oneXTwoMatchesLookup.ContainsKey(m.Id))
+                .ToList();
+
+            // Send both messages with enriched and validated data
+            await _hubContext.Clients.All.SendAsync("ReceiveArbitrageLiveMatches", validatedArbitrageMatches,
+                cancellationToken: stoppingToken);
+            await _hubContext.Clients.All.SendAsync("ReceiveAllLiveMatches", validatedAllMatches,
+                cancellationToken: stoppingToken);
+
+            // Update the static collections with validated data
+            UpdateStaticCollection(_lastSentArbitrageMatches, validatedArbitrageMatches);
+            UpdateStaticCollection(_lastSentAllMatches, validatedAllMatches);
+
+            // Cache for new connections
+            _cache.Set(CACHE_KEY_ARBITRAGE_MATCHES, validatedArbitrageMatches, TimeSpan.FromMinutes(5));
+            _cache.Set(CACHE_KEY_ALL_MATCHES, validatedAllMatches, TimeSpan.FromMinutes(5));
+
+            _logger.LogInformation(
+                "Streamed {ArbitrageMatchCount} arbitrage matches and {AllMatchCount} total 1X2 matches with enriched data",
+                validatedArbitrageMatches.Count,
+                validatedAllMatches.Count);
+
+            // Log match detail status for debugging
+            var arbitrageDetailsCount = validatedArbitrageMatches.Count(m => m.MatchDetails != null);
+            var arbitrageSituationCount = validatedArbitrageMatches.Count(m => m.MatchSituation != null);
+            var allDetailsCount = validatedAllMatches.Count(m => m.MatchDetails != null);
+            var allSituationCount = validatedAllMatches.Count(m => m.MatchSituation != null);
+
+            _logger.LogInformation(
+                "Arbitrage matches with details: {DetailsCount}/{TotalCount}, with situation: {SituationCount}/{TotalCount}",
+                arbitrageDetailsCount, validatedArbitrageMatches.Count, arbitrageSituationCount,
+                validatedArbitrageMatches.Count);
+
+            _logger.LogInformation(
+                "All matches with details: {DetailsCount}/{TotalCount}, with situation: {SituationCount}/{TotalCount}",
+                allDetailsCount, validatedAllMatches.Count, allSituationCount, validatedAllMatches.Count);
         }
-
-        // Wait for all batches to complete
-        await Task.WhenAll(batchTasks);
-
-        // Enrich matches with prediction data before sending to clients
-        var (enrichedArbitrageMatches, enrichedAllMatches) = await _predictionEnrichedMatchService
-            .EnrichMatchesWithPredictionDataAsync(arbitrageMatches, allMatchesFromEvents);
-
-        // IMPORTANT: Don't filter arbitrage matches by market type anymore
-        // Just send all arbitrage matches to the arbitrage channel
-        var validatedArbitrageMatches = enrichedArbitrageMatches.ToList();
-            
-        // Get all matches with 1X2 markets for the regular channel
-        var oneXTwoMatchesLookup = enrichedAllMatches
-            .Where(m => m.Markets.Any(market =>
-                market.Description?.ToLower() == "match result" ||
-                market.Description?.ToLower() == "1x2" ||
-                (market.Description?.ToLower().Contains("1x2") == true)))
-            .ToDictionary(m => m.Id);
-
-        // Get all matches while preserving their details and situations
-        var validatedAllMatches = enrichedAllMatches
-            .Where(m => oneXTwoMatchesLookup.ContainsKey(m.Id))
-            .ToList();
-
-        // Send both messages with enriched and validated data
-        await _hubContext.Clients.All.SendAsync("ReceiveArbitrageLiveMatches", validatedArbitrageMatches,
-            cancellationToken: stoppingToken);
-        await _hubContext.Clients.All.SendAsync("ReceiveAllLiveMatches", validatedAllMatches,
-            cancellationToken: stoppingToken);
-
-        // Update the static collections with validated data
-        UpdateStaticCollection(_lastSentArbitrageMatches, validatedArbitrageMatches);
-        UpdateStaticCollection(_lastSentAllMatches, validatedAllMatches);
-
-        // Cache for new connections
-        _cache.Set(CACHE_KEY_ARBITRAGE_MATCHES, validatedArbitrageMatches, TimeSpan.FromMinutes(5));
-        _cache.Set(CACHE_KEY_ALL_MATCHES, validatedAllMatches, TimeSpan.FromMinutes(5));
-
-        _logger.LogInformation(
-            "Streamed {ArbitrageMatchCount} arbitrage matches and {AllMatchCount} total 1X2 matches with enriched data",
-            validatedArbitrageMatches.Count,
-            validatedAllMatches.Count);
-
-        // Log match detail status for debugging
-        var arbitrageDetailsCount = validatedArbitrageMatches.Count(m => m.MatchDetails != null);
-        var arbitrageSituationCount = validatedArbitrageMatches.Count(m => m.MatchSituation != null);
-        var allDetailsCount = validatedAllMatches.Count(m => m.MatchDetails != null);
-        var allSituationCount = validatedAllMatches.Count(m => m.MatchSituation != null);
-
-        _logger.LogInformation(
-            "Arbitrage matches with details: {DetailsCount}/{TotalCount}, with situation: {SituationCount}/{TotalCount}",
-            arbitrageDetailsCount, validatedArbitrageMatches.Count, arbitrageSituationCount,
-            validatedArbitrageMatches.Count);
-
-        _logger.LogInformation(
-            "All matches with details: {DetailsCount}/{TotalCount}, with situation: {SituationCount}/{TotalCount}",
-            allDetailsCount, validatedAllMatches.Count, allSituationCount, validatedAllMatches.Count);
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error streaming matches to clients");
+        }
     }
-    catch (Exception ex)
-    {
-        _logger.LogError(ex, "Error streaming matches to clients");
-    }
-}
 
     // Add this method for updating static collections
     private void UpdateStaticCollection<T>(ConcurrentBag<T> bag, List<T> newItems)
@@ -783,73 +786,76 @@ private async Task StreamMatchesToClientsAsync(List<Match> arbitrageMatches, Lis
         return market.Status != 2 && market.Status != 3; // Exclude suspended and settled markets
     }
 
-private (Market market, bool hasArbitrage) ProcessMarket(MarketData marketData, string matchId)
-{
-    try
+    private (Market market, bool hasArbitrage) ProcessMarket(MarketData marketData, string matchId)
     {
-        _logger.LogDebug($"Processing market {marketData.Id} for match {matchId}");
-        var market = new Market
+        try
         {
-            Id = marketData.Id,
-            Description = marketData.Desc,
-            Specifier = marketData.Specifier,
-            Outcomes = ProcessOutcomes(marketData.Outcomes),
-            Favourite = marketData.Favourite,
-        };
-
-        // Fix #6: Add more detailed validation logging
-        if (!market.Outcomes.Any())
-        {
-            _logger.LogDebug($"Market {marketData.Id} has no valid outcomes");
-            return (market, false);
-        }
-
-        // Fix #7: Try validating the market even if it doesn't follow expected patterns
-        bool isValidMarket = _marketValidator.ValidateMarket(marketData, market.Outcomes.Count);
-        if (!isValidMarket)
-        {
-            _logger.LogDebug($"Market {marketData.Id} failed validation: {marketData.Desc}, Specifier: {marketData.Specifier}, Outcomes: {market.Outcomes.Count}");
-            
-            // Fix #8: For arbitrage calculation, try to process markets even if they don't fit standard patterns
-            // but only if they have at least 2 outcomes (arbitrage needs multiple outcomes)
-            if (market.Outcomes.Count < 2)
+            _logger.LogDebug($"Processing market {marketData.Id} for match {matchId}");
+            var market = new Market
             {
+                Id = marketData.Id,
+                Description = marketData.Desc,
+                Specifier = marketData.Specifier,
+                Outcomes = ProcessOutcomes(marketData.Outcomes),
+                Favourite = marketData.Favourite,
+            };
+
+            // Fix #6: Add more detailed validation logging
+            if (!market.Outcomes.Any())
+            {
+                _logger.LogDebug($"Market {marketData.Id} has no valid outcomes");
                 return (market, false);
             }
-            // Proceed anyway if it has enough outcomes for potential arbitrage
+
+            // Fix #7: Try validating the market even if it doesn't follow expected patterns
+            bool isValidMarket = _marketValidator.ValidateMarket(marketData, market.Outcomes.Count);
+            if (!isValidMarket)
+            {
+                _logger.LogDebug(
+                    $"Market {marketData.Id} failed validation: {marketData.Desc}, Specifier: {marketData.Specifier}, Outcomes: {market.Outcomes.Count}");
+
+                // Fix #8: For arbitrage calculation, try to process markets even if they don't fit standard patterns
+                // but only if they have at least 2 outcomes (arbitrage needs multiple outcomes)
+                if (market.Outcomes.Count < 2)
+                {
+                    return (market, false);
+                }
+                // Proceed anyway if it has enough outcomes for potential arbitrage
+            }
+
+            var (hasArbitrage, stakePercentages, profitPercentage) =
+                CalculateArbitrageOpportunity(market);
+
+            if (hasArbitrage)
+            {
+                UpdateMarketWithArbitrageData(market, stakePercentages, profitPercentage);
+                LogArbitrageOpportunity(matchId, market);
+            }
+
+            return (market, hasArbitrage);
         }
-
-        var (hasArbitrage, stakePercentages, profitPercentage) =
-            CalculateArbitrageOpportunity(market);
-
-        if (hasArbitrage)
+        catch (Exception ex)
         {
-            UpdateMarketWithArbitrageData(market, stakePercentages, profitPercentage);
-            LogArbitrageOpportunity(matchId, market);
+            _logger.LogWarning(ex, "Error processing market {MarketId}", marketData.Id);
+            return (new Market(), false);
         }
+    }
 
-        return (market, hasArbitrage);
-    }
-    catch (Exception ex)
+    private List<Outcome> ProcessOutcomes(List<OutcomeData> outcomes)
     {
-        _logger.LogWarning(ex, "Error processing market {MarketId}", marketData.Id);
-        return (new Market(), false);
+        var validOutcomes = outcomes
+            .Where(o => o != null && o.IsActive == 1 && !string.IsNullOrEmpty(o.Odds))
+            .Select(CreateOutcome)
+            .Where(o => o != null)
+            .ToList();
+
+        // Fix #9: Log outcomes for debugging
+        _logger.LogDebug($"Processed {outcomes.Count} outcomes, found {validOutcomes.Count} valid outcomes: " +
+                         $"{string.Join(", ", validOutcomes.Select(o => $"{o.Description}: {o.Odds}"))}");
+
+        return validOutcomes;
     }
-}
-private List<Outcome> ProcessOutcomes(List<OutcomeData> outcomes)
-{
-    var validOutcomes = outcomes
-        .Where(o => o != null && o.IsActive == 1 && !string.IsNullOrEmpty(o.Odds))
-        .Select(CreateOutcome)
-        .Where(o => o != null)
-        .ToList();
-    
-    // Fix #9: Log outcomes for debugging
-    _logger.LogDebug($"Processed {outcomes.Count} outcomes, found {validOutcomes.Count} valid outcomes: " +
-                     $"{string.Join(", ", validOutcomes.Select(o => $"{o.Description}: {o.Odds}"))}");
-    
-    return validOutcomes;
-}
+
     private Outcome CreateOutcome(OutcomeData outcomeData)
     {
         if (!decimal.TryParse(outcomeData.Odds, out var odds) || odds <= 0)
@@ -911,7 +917,7 @@ private List<Outcome> ProcessOutcomes(List<OutcomeData> outcomes)
             LastUpdated = DateTime.UtcNow
         };
     }
-    
+
     private (bool hasArbitrage, List<decimal> stakePercentages, decimal profitPercentage)
         CalculateArbitrageOpportunity(Market market)
     {
@@ -937,7 +943,7 @@ private List<Outcome> ProcessOutcomes(List<OutcomeData> outcomes)
         // Log more details about potential opportunities
         if (profitPercentage > 0)
         {
-            _logger.LogDebug($"Potential arbitrage: Market {market.Id} ({market.Description}) " + 
+            _logger.LogDebug($"Potential arbitrage: Market {market.Id} ({market.Description}) " +
                              $"has profit {profitPercentage:F2}%, " +
                              $"Outcomes: {string.Join(", ", market.Outcomes.Select(o => $"{o.Description}: {o.Odds}"))}");
         }
@@ -950,7 +956,7 @@ private List<Outcome> ProcessOutcomes(List<OutcomeData> outcomes)
         // For actual arbitrage opportunities, log more prominently
         if (profitPercentage > MinProfitThreshold)
         {
-            _logger.LogInformation($"ARBITRAGE FOUND: Market {market.Id} ({market.Description}) " + 
+            _logger.LogInformation($"ARBITRAGE FOUND: Market {market.Id} ({market.Description}) " +
                                    $"with {profitPercentage:F2}% profit, " +
                                    $"Outcomes: {string.Join(", ", market.Outcomes.Select(o => $"{o.Description}: {o.Odds}"))}");
         }
@@ -972,10 +978,11 @@ private List<Outcome> ProcessOutcomes(List<OutcomeData> outcomes)
         var impliedProbabilities = outcomes.Select(o => 1m / o.Odds);
         var totalImpliedProbability = impliedProbabilities.Sum();
         var margin = (totalImpliedProbability - 1m) * 100;
-    
+
         // Log the calculation details for troubleshooting
-        _logger.LogDebug($"Margin calculation: total implied probability = {totalImpliedProbability}, margin = {margin}%");
-    
+        _logger.LogDebug(
+            $"Margin calculation: total implied probability = {totalImpliedProbability}, margin = {margin}%");
+
         return Math.Round(margin, 2);
     }
 
