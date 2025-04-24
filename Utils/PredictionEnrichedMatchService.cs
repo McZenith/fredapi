@@ -477,215 +477,88 @@ public async Task<List<MatchSnapshot>> GetAllMatchSnapshotsAsync(DateTime? start
         // Create filter builder once to reuse
         var filterBuilder = Builders<MatchSnapshot>.Filter;
         
-        // Start with an empty filter or optimize for null parameters
+        // Build the filter based on date parameters
         var filter = filterBuilder.Empty;
-        
-        // Store all results from chunks
-        var allResults = new List<MatchSnapshot>();
-        
-        // Determine our chunking strategy based on date range
-        TimeSpan chunkSize = TimeSpan.FromDays(1); // Default to 1-day chunks
-        DateTime chunkStart, chunkEnd;
         
         if (startDate.HasValue && endDate.HasValue)
         {
-            // Calculate total timespan
-            var totalTimeSpan = endDate.Value - startDate.Value;
-            
-            // If date range is small enough, just use it directly with no chunking
-            if (totalTimeSpan <= TimeSpan.FromDays(1))
-            {
-                chunkStart = startDate.Value;
-                chunkEnd = endDate.Value;
-                
-                var chunkFilter = filterBuilder.And(
-                    filterBuilder.Gte(s => s.Timestamp, chunkStart),
-                    filterBuilder.Lte(s => s.Timestamp, chunkEnd)
-                );
-                
-                var sort = Builders<MatchSnapshot>.Sort.Ascending(s => s.Timestamp);
-                
-                try
-                {
-                    // Use smaller limit to prevent timeouts
-                    var chunkResults = await collection.Find(chunkFilter)
-                        .Sort(sort)
-                        .Limit(500)
-                        .ToListAsync();
-                        
-                    allResults.AddRange(chunkResults);
-                    _logger.LogInformation($"Retrieved {chunkResults.Count} snapshots for time range {chunkStart} to {chunkEnd}");
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogError(ex, $"Error retrieving chunk {chunkStart} to {chunkEnd}");
-                }
-                
-                sw.Stop();
-                _logger.LogInformation($"Retrieved total {allResults.Count} snapshots in {sw.ElapsedMilliseconds}ms");
-                
-                // Cache the results
-                _cache.Set(cacheKey, allResults, TimeSpan.FromMinutes(5));
-                
-                return allResults;
-            }
-            
-            // For larger date ranges, determine appropriate chunk size
-            if (totalTimeSpan > TimeSpan.FromDays(30))
-            {
-                chunkSize = TimeSpan.FromDays(7); // Use 1-week chunks for long ranges
-            }
-            else if (totalTimeSpan > TimeSpan.FromDays(7))
-            {
-                chunkSize = TimeSpan.FromDays(2); // Use 2-day chunks for medium ranges
-            }
-            
-            // Initialize our chunk start/end
-            chunkStart = startDate.Value;
-            chunkEnd = chunkStart.Add(chunkSize);
-            
-            // Cap the last chunk to the requested end date
-            if (chunkEnd > endDate.Value)
-            {
-                chunkEnd = endDate.Value;
-            }
+            filter = filterBuilder.And(
+                filterBuilder.Gte(s => s.Timestamp, startDate.Value),
+                filterBuilder.Lte(s => s.Timestamp, endDate.Value)
+            );
         }
         else if (startDate.HasValue)
         {
-            // If only start date, use a single chunk with limit
-            var chunkFilter = filterBuilder.Gte(s => s.Timestamp, startDate.Value);
-            var sort = Builders<MatchSnapshot>.Sort.Ascending(s => s.Timestamp);
-            
-            try
-            {
-                var chunkResults = await collection.Find(chunkFilter)
-                    .Sort(sort)
-                    .Limit(500) // Limit to avoid timeouts
-                    .ToListAsync();
-                    
-                allResults.AddRange(chunkResults);
-                _logger.LogInformation($"Retrieved {chunkResults.Count} snapshots from {startDate.Value} (with limit)");
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, $"Error retrieving from {startDate.Value}");
-            }
-            
-            sw.Stop();
-            _logger.LogInformation($"Retrieved total {allResults.Count} snapshots in {sw.ElapsedMilliseconds}ms");
-            
-            // Cache the results
-            _cache.Set(cacheKey, allResults, TimeSpan.FromMinutes(5));
-            
-            return allResults;
+            filter = filterBuilder.Gte(s => s.Timestamp, startDate.Value);
         }
         else if (endDate.HasValue)
         {
-            // If only end date, use a single chunk with limit
-            var chunkFilter = filterBuilder.Lte(s => s.Timestamp, endDate.Value);
-            var sort = Builders<MatchSnapshot>.Sort.Descending(s => s.Timestamp);
-            
-            try
-            {
-                var chunkResults = await collection.Find(chunkFilter)
-                    .Sort(sort)
-                    .Limit(500) // Limit to avoid timeouts
-                    .ToListAsync();
-                    
-                allResults.AddRange(chunkResults);
-                _logger.LogInformation($"Retrieved {chunkResults.Count} snapshots up to {endDate.Value} (with limit)");
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, $"Error retrieving up to {endDate.Value}");
-            }
-            
-            sw.Stop();
-            _logger.LogInformation($"Retrieved total {allResults.Count} snapshots in {sw.ElapsedMilliseconds}ms");
-            
-            // Cache the results
-            _cache.Set(cacheKey, allResults, TimeSpan.FromMinutes(5));
-            
-            return allResults;
-        }
-        else
-        {
-            // If no dates specified, just get most recent with limit
-            var sort = Builders<MatchSnapshot>.Sort.Descending(s => s.Timestamp);
-            
-            try
-            {
-                var chunkResults = await collection.Find(filterBuilder.Empty)
-                    .Sort(sort)
-                    .Limit(100) // More restrictive limit for unrestricted queries
-                    .ToListAsync();
-                    
-                allResults.AddRange(chunkResults);
-                _logger.LogInformation($"Retrieved {chunkResults.Count} most recent snapshots (with limit)");
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "Error retrieving recent snapshots");
-            }
-            
-            sw.Stop();
-            _logger.LogInformation($"Retrieved total {allResults.Count} snapshots in {sw.ElapsedMilliseconds}ms");
-            
-            // Cache the results
-            _cache.Set(cacheKey, allResults, TimeSpan.FromMinutes(5));
-            
-            return allResults;
+            filter = filterBuilder.Lte(s => s.Timestamp, endDate.Value);
         }
         
-        // Process chunks for date range queries
-        if (startDate.HasValue && endDate.HasValue)
+        // Sort by timestamp
+        var sort = Builders<MatchSnapshot>.Sort.Ascending(s => s.Timestamp);
+        
+        // Use explicit pagination with fixed batch size to avoid timeouts
+        const int batchSize = 500;
+        var allResults = new List<MatchSnapshot>();
+        int totalRetrieved = 0;
+        bool hasMoreData = true;
+        
+        _logger.LogInformation($"Starting paginated retrieval with batch size {batchSize}");
+        
+        while (hasMoreData)
         {
-            // Process each chunk until we've covered the entire date range
-            while (chunkStart < endDate.Value)
+            try
             {
-                var chunkFilter = filterBuilder.And(
-                    filterBuilder.Gte(s => s.Timestamp, chunkStart),
-                    filterBuilder.Lt(s => s.Timestamp, chunkEnd)
-                );
+                // Find with pagination parameters
+                var batch = await collection.Find(filter)
+                    .Sort(sort)
+                    .Skip(totalRetrieved)
+                    .Limit(batchSize)
+                    .ToListAsync();
                 
-                var sort = Builders<MatchSnapshot>.Sort.Ascending(s => s.Timestamp);
+                // Add results to our collection
+                allResults.AddRange(batch);
                 
-                try
+                // Update counters
+                totalRetrieved += batch.Count;
+                
+                // Check if we've reached the end
+                hasMoreData = batch.Count == batchSize;
+                
+                _logger.LogInformation($"Retrieved batch of {batch.Count} snapshots. Total so far: {totalRetrieved}");
+                
+                // Give the system a small breather between batches
+                if (hasMoreData)
                 {
-                    _logger.LogDebug($"Retrieving chunk from {chunkStart} to {chunkEnd}");
-                    
-                    var chunkResults = await collection.Find(chunkFilter)
-                        .Sort(sort)
-                        .ToListAsync();
-                        
-                    allResults.AddRange(chunkResults);
-                    _logger.LogInformation($"Retrieved {chunkResults.Count} snapshots for time range {chunkStart} to {chunkEnd}");
+                    await Task.Delay(50); // Small delay to prevent overwhelming the database
                 }
-                catch (Exception ex)
-                {
-                    _logger.LogError(ex, $"Error retrieving chunk {chunkStart} to {chunkEnd}");
-                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, $"Error retrieving batch at offset {totalRetrieved}. Continuing with next batch.");
                 
-                // Move to next chunk
-                chunkStart = chunkEnd;
-                chunkEnd = chunkStart.Add(chunkSize);
+                // If we encounter an error, try to continue with the next batch
+                totalRetrieved += batchSize;
                 
-                // Cap the last chunk to the requested end date
-                if (chunkEnd > endDate.Value)
-                {
-                    chunkEnd = endDate.Value;
-                }
+                // Add small delay to let the system recover
+                await Task.Delay(500);
             }
         }
         
         sw.Stop();
         _logger.LogInformation($"Retrieved total {allResults.Count} snapshots in {sw.ElapsedMilliseconds}ms");
         
-        // Sort the final results, since we may have retrieved out of order
-        allResults = allResults.OrderBy(s => s.Timestamp).ToList();
-        
-        // Cache the results for future use
-        _cache.Set(cacheKey, allResults, TimeSpan.FromMinutes(5));
+        // Cache the results for future use if not too large
+        if (allResults.Count <= 10000)
+        {
+            _cache.Set(cacheKey, allResults, TimeSpan.FromMinutes(5));
+        }
+        else
+        {
+            _logger.LogWarning($"Dataset too large for caching ({allResults.Count} snapshots)");
+        }
         
         return allResults;
     }
@@ -695,122 +568,6 @@ public async Task<List<MatchSnapshot>> GetAllMatchSnapshotsAsync(DateTime? start
         return new List<MatchSnapshot>();
     }
 }
-
-    /// <summary>
-    /// Exports match data to CSV for machine learning
-    /// </summary>
-    /// <summary>
-    /// Exports match data to CSV for machine learning with 9 timeline snapshots
-    /// </summary>
-    public async Task<string> ExportMatchDataToCsvAsync(int matchId)
-    {
-        var snapshots = await GetMatchSnapshotsAsync(matchId);
-
-        if (!snapshots.Any())
-        {
-            return "No data available for this match";
-        }
-
-        // Create CSV header
-        var sb = new System.Text.StringBuilder();
-
-        // Basic match info
-        sb.Append("timestamp,match_id,time_segment,");
-
-        // Match state
-        sb.Append("score,period,match_status,played_time,");
-
-        // Match statistics
-        sb.Append("home_dangerous_attacks,away_dangerous_attacks,");
-        sb.Append("home_safe_attacks,away_safe_attacks,");
-        sb.Append("home_corner_kicks,away_corner_kicks,");
-        sb.Append("home_shots_on_target,away_shots_on_target,");
-        sb.Append("home_ball_safe_percentage,away_ball_safe_percentage,");
-
-        // Prediction data
-        sb.Append("prediction_favorite,prediction_confidence,prediction_expected_goals,");
-        sb.Append("home_team_form,away_team_form,");
-        sb.Append("home_team_win_pct,away_team_win_pct,");
-        sb.Append("home_team_avg_goals,away_team_avg_goals");
-
-        sb.AppendLine();
-
-        // Get 9 snapshots across the match timeline
-        var timelineSnapshots = GetTimelineSnapshots(snapshots);
-
-        // Process each timeline snapshot
-        for (int i = 0; i < timelineSnapshots.Count; i++)
-        {
-            var snapshot = timelineSnapshots[i];
-            var timeSegment = $"{i * 10}-{(i + 1) * 10}"; // e.g., "0-10", "10-20", etc.
-
-            // Basic match info
-            sb.Append($"{snapshot.Timestamp:yyyy-MM-dd HH:mm:ss},");
-            sb.Append($"{snapshot.MatchId},");
-            sb.Append($"{timeSegment},");
-
-            // Match state
-            sb.Append($"{snapshot.Score},");
-            sb.Append($"{snapshot.Period},");
-            sb.Append($"{snapshot.MatchStatus},");
-            sb.Append($"{snapshot.PlayedTime},");
-
-            // Match statistics
-            var homeDangerousAttacks = snapshot.MatchSituation?.Home?.TotalDangerousAttacks ?? 0;
-            var awayDangerousAttacks = snapshot.MatchSituation?.Away?.TotalDangerousAttacks ?? 0;
-            var homeSafeAttacks = snapshot.MatchSituation?.Home?.TotalSafeAttacks ?? 0;
-            var awaySafeAttacks = snapshot.MatchSituation?.Away?.TotalSafeAttacks ?? 0;
-
-            sb.Append($"{homeDangerousAttacks},");
-            sb.Append($"{awayDangerousAttacks},");
-            sb.Append($"{homeSafeAttacks},");
-            sb.Append($"{awaySafeAttacks},");
-
-            // Match details
-            var homeCornerKicks = snapshot.MatchDetails?.Home?.CornerKicks ?? 0;
-            var awayCornerKicks = snapshot.MatchDetails?.Away?.CornerKicks ?? 0;
-            var homeShotsOnTarget = snapshot.MatchDetails?.Home?.ShotsOnTarget ?? 0;
-            var awayShotsOnTarget = snapshot.MatchDetails?.Away?.ShotsOnTarget ?? 0;
-            var homeBallSafePercentage = snapshot.MatchDetails?.Home?.BallSafePercentage ?? 0;
-            var awayBallSafePercentage = snapshot.MatchDetails?.Away?.BallSafePercentage ?? 0;
-
-            sb.Append($"{homeCornerKicks},");
-            sb.Append($"{awayCornerKicks},");
-            sb.Append($"{homeShotsOnTarget},");
-            sb.Append($"{awayShotsOnTarget},");
-            sb.Append($"{homeBallSafePercentage},");
-            sb.Append($"{awayBallSafePercentage},");
-
-            // Prediction data
-            var favorite = snapshot.PredictionData?.Favorite ?? "unknown";
-            var confidence = snapshot.PredictionData?.ConfidenceScore ?? 0;
-            var expectedGoals = snapshot.PredictionData?.ExpectedGoals ?? 0;
-
-            sb.Append($"{favorite},");
-            sb.Append($"{confidence},");
-            sb.Append($"{expectedGoals},");
-
-            // Team data
-            var homeTeamForm = snapshot.PredictionData?.HomeTeamData?.Form ?? "";
-            var awayTeamForm = snapshot.PredictionData?.AwayTeamData?.Form ?? "";
-            var homeTeamWinPct = snapshot.PredictionData?.HomeTeamData?.WinPercentage ?? 0;
-            var awayTeamWinPct = snapshot.PredictionData?.AwayTeamData?.WinPercentage ?? 0;
-            var homeTeamAvgGoals = snapshot.PredictionData?.HomeTeamData?.AvgTotalGoals ?? 0;
-            var awayTeamAvgGoals = snapshot.PredictionData?.AwayTeamData?.AvgTotalGoals ?? 0;
-
-            sb.Append($"{homeTeamForm},");
-            sb.Append($"{awayTeamForm},");
-            sb.Append($"{homeTeamWinPct},");
-            sb.Append($"{awayTeamWinPct},");
-            sb.Append($"{homeTeamAvgGoals},");
-            sb.Append($"{awayTeamAvgGoals}");
-
-            sb.AppendLine();
-        }
-
-        return sb.ToString();
-    }
-
     /// <summary>
     /// Exports a single match as a combined dataset for machine learning
     /// </summary>
@@ -940,7 +697,132 @@ public async Task<List<MatchSnapshot>> GetAllMatchSnapshotsAsync(DateTime? start
     }
 
     /// <summary>
-    /// Exports all match data to a single consolidated ML dataset using 9-snapshot timeline
+    /// Exports match data to CSV for machine learning with timeline snapshots
+    /// </summary>
+    public async Task<string> ExportMatchDataToCsvAsync(int matchId)
+    {
+        var snapshots = await GetMatchSnapshotsAsync(matchId);
+
+        if (!snapshots.Any())
+        {
+            return "No data available for this match";
+        }
+
+        // Create CSV header
+        var sb = new System.Text.StringBuilder();
+
+        // Basic match info
+        sb.Append("timestamp,match_id,time_segment,");
+
+        // Match state
+        sb.Append("score,period,match_status,played_time,");
+
+        // Match statistics
+        sb.Append("home_dangerous_attacks,away_dangerous_attacks,");
+        sb.Append("home_safe_attacks,away_safe_attacks,");
+        sb.Append("home_corner_kicks,away_corner_kicks,");
+        sb.Append("home_shots_on_target,away_shots_on_target,");
+        sb.Append("home_ball_safe_percentage,away_ball_safe_percentage,");
+
+        // Prediction data
+        sb.Append("prediction_favorite,prediction_confidence,prediction_expected_goals,");
+        sb.Append("home_team_form,away_team_form,");
+        sb.Append("home_team_win_pct,away_team_win_pct,");
+        sb.Append("home_team_avg_goals,away_team_avg_goals");
+
+        sb.AppendLine();
+
+        // Get timeline snapshots representing each segment of the match
+        var timelineSnapshots = GetTimelineSnapshots(snapshots);
+
+        // Log the coverage quality
+        _logger.LogInformation(
+            $"Match {matchId}: Found {timelineSnapshots.Count} distinct snapshots representing match timeline");
+
+        // Define time segments
+        var timeSegments = new List<string>
+        {
+            "0-10", "10-20", "20-30", "30-40", "40-50", "50-60", "60-70", "70-80", "80-90"
+        };
+
+        // Process each available timeline snapshot
+        for (int i = 0; i < timelineSnapshots.Count; i++)
+        {
+            var snapshot = timelineSnapshots[i];
+
+            // Get appropriate time segment label (based on position in the timeline)
+            var segmentIndex = Math.Min(i, timeSegments.Count - 1);
+            var timeSegment = timeSegments[segmentIndex];
+
+            // Basic match info
+            sb.Append($"{snapshot.Timestamp:yyyy-MM-dd HH:mm:ss},");
+            sb.Append($"{snapshot.MatchId},");
+            sb.Append($"{timeSegment},");
+
+            // Match state
+            sb.Append($"{snapshot.Score},");
+            sb.Append($"{snapshot.Period},");
+            sb.Append($"{snapshot.MatchStatus},");
+            sb.Append($"{snapshot.PlayedTime},");
+
+            // Match statistics
+            var homeDangerousAttacks = snapshot.MatchSituation?.Home?.TotalDangerousAttacks ?? 0;
+            var awayDangerousAttacks = snapshot.MatchSituation?.Away?.TotalDangerousAttacks ?? 0;
+            var homeSafeAttacks = snapshot.MatchSituation?.Home?.TotalSafeAttacks ?? 0;
+            var awaySafeAttacks = snapshot.MatchSituation?.Away?.TotalSafeAttacks ?? 0;
+
+            sb.Append($"{homeDangerousAttacks},");
+            sb.Append($"{awayDangerousAttacks},");
+            sb.Append($"{homeSafeAttacks},");
+            sb.Append($"{awaySafeAttacks},");
+
+            // Match details
+            var homeCornerKicks = snapshot.MatchDetails?.Home?.CornerKicks ?? 0;
+            var awayCornerKicks = snapshot.MatchDetails?.Away?.CornerKicks ?? 0;
+            var homeShotsOnTarget = snapshot.MatchDetails?.Home?.ShotsOnTarget ?? 0;
+            var awayShotsOnTarget = snapshot.MatchDetails?.Away?.ShotsOnTarget ?? 0;
+            var homeBallSafePercentage = snapshot.MatchDetails?.Home?.BallSafePercentage ?? 0;
+            var awayBallSafePercentage = snapshot.MatchDetails?.Away?.BallSafePercentage ?? 0;
+
+            sb.Append($"{homeCornerKicks},");
+            sb.Append($"{awayCornerKicks},");
+            sb.Append($"{homeShotsOnTarget},");
+            sb.Append($"{awayShotsOnTarget},");
+            sb.Append($"{homeBallSafePercentage},");
+            sb.Append($"{awayBallSafePercentage},");
+
+            // Prediction data
+            var favorite = snapshot.PredictionData?.Favorite ?? "unknown";
+            var confidence = snapshot.PredictionData?.ConfidenceScore ?? 0;
+            var expectedGoals = snapshot.PredictionData?.ExpectedGoals ?? 0;
+
+            sb.Append($"{favorite},");
+            sb.Append($"{confidence},");
+            sb.Append($"{expectedGoals},");
+
+            // Team data
+            var homeTeamForm = snapshot.PredictionData?.HomeTeamData?.Form ?? "";
+            var awayTeamForm = snapshot.PredictionData?.AwayTeamData?.Form ?? "";
+            var homeTeamWinPct = snapshot.PredictionData?.HomeTeamData?.WinPercentage ?? 0;
+            var awayTeamWinPct = snapshot.PredictionData?.AwayTeamData?.WinPercentage ?? 0;
+            var homeTeamAvgGoals = snapshot.PredictionData?.HomeTeamData?.AvgTotalGoals ?? 0;
+            var awayTeamAvgGoals = snapshot.PredictionData?.AwayTeamData?.AvgTotalGoals ?? 0;
+
+            sb.Append($"{homeTeamForm},");
+            sb.Append($"{awayTeamForm},");
+            sb.Append($"{homeTeamWinPct},");
+            sb.Append($"{awayTeamWinPct},");
+            sb.Append($"{homeTeamAvgGoals},");
+            sb.Append($"{awayTeamAvgGoals}");
+
+            sb.AppendLine();
+        }
+
+        return sb.ToString();
+    }
+
+    /// <summary>
+    /// Exports all match data to a single consolidated ML dataset using timeline snapshots
     /// </summary>
     public async Task<string> ExportAllMatchesDatasetAsync()
     {
@@ -968,7 +850,7 @@ public async Task<List<MatchSnapshot>> GetAllMatchSnapshotsAsync(DateTime? start
             sb.Append("pre_home_team_form,pre_away_team_form,");
             sb.Append("pre_home_win_pct,pre_away_win_pct,");
 
-            // For each of the 9 time segments
+            // For each of the 9 time segments - define column headers
             for (int i = 0; i < 9; i++)
             {
                 string segment = $"{i * 10}-{(i + 1) * 10}";
@@ -1003,17 +885,26 @@ public async Task<List<MatchSnapshot>> GetAllMatchSnapshotsAsync(DateTime? start
                 // Get first snapshot for pre-match data
                 var firstSnapshot = snapshots.First();
 
-                // Get 9 snapshots across the match timeline
+                // Get representative timeline snapshots
                 var timelineSnapshots = GetTimelineSnapshots(snapshots);
+
+                // If we have too few snapshots to represent the match well, skip it
+                if (timelineSnapshots.Count < 5) // Require at least 5 unique snapshots to represent timeline
+                {
+                    _logger.LogInformation(
+                        $"Match {matchId} has insufficient timeline coverage: only {timelineSnapshots.Count} snapshots available");
+                    continue;
+                }
 
                 // Get final snapshot for outcome
                 var lastSnapshot = snapshots.Last();
 
-                if(!PredictionResultsService.IsMatchCompleted(lastSnapshot))
+                // Only include completed matches
+                if (!PredictionResultsService.IsMatchCompleted(lastSnapshot))
                 {
                     continue;
                 }
-                
+
                 // Match identification
                 sb.Append($"{matchId},");
                 sb.Append($"\"{firstSnapshot.PredictionData?.HomeTeamData?.Name ?? "Home Team"}\",");
@@ -1030,19 +921,35 @@ public async Task<List<MatchSnapshot>> GetAllMatchSnapshotsAsync(DateTime? start
                 sb.Append($"{firstSnapshot.PredictionData?.HomeTeamData?.WinPercentage ?? 0},");
                 sb.Append($"{firstSnapshot.PredictionData?.AwayTeamData?.WinPercentage ?? 0},");
 
-                // For each of the 9 time segments
+                // For each of the 9 time segments - handle data
                 for (int i = 0; i < 9; i++)
                 {
-                    var snapshot = i < timelineSnapshots.Count ? timelineSnapshots[i] : lastSnapshot;
+                    // Check if we have a snapshot for this segment
+                    MatchSnapshot snapshot = null;
 
-                    sb.Append($"{snapshot.PlayedTime},");
-                    sb.Append($"{snapshot.Score},");
-                    sb.Append($"{snapshot.MatchSituation?.Home?.TotalDangerousAttacks ?? 0},");
-                    sb.Append($"{snapshot.MatchSituation?.Away?.TotalDangerousAttacks ?? 0},");
-                    sb.Append($"{snapshot.MatchDetails?.Home?.ShotsOnTarget ?? 0},");
-                    sb.Append($"{snapshot.MatchDetails?.Away?.ShotsOnTarget ?? 0},");
-                    sb.Append($"{snapshot.MatchDetails?.Home?.CornerKicks ?? 0},");
-                    sb.Append($"{snapshot.MatchDetails?.Away?.CornerKicks ?? 0},");
+                    // Get the snapshot if available, otherwise use empty values
+                    if (i < timelineSnapshots.Count)
+                    {
+                        snapshot = timelineSnapshots[i];
+                    }
+
+                    // If we have a snapshot for this time segment, add its data
+                    if (snapshot != null)
+                    {
+                        sb.Append($"{snapshot.PlayedTime},");
+                        sb.Append($"{snapshot.Score},");
+                        sb.Append($"{snapshot.MatchSituation?.Home?.TotalDangerousAttacks ?? 0},");
+                        sb.Append($"{snapshot.MatchSituation?.Away?.TotalDangerousAttacks ?? 0},");
+                        sb.Append($"{snapshot.MatchDetails?.Home?.ShotsOnTarget ?? 0},");
+                        sb.Append($"{snapshot.MatchDetails?.Away?.ShotsOnTarget ?? 0},");
+                        sb.Append($"{snapshot.MatchDetails?.Home?.CornerKicks ?? 0},");
+                        sb.Append($"{snapshot.MatchDetails?.Away?.CornerKicks ?? 0},");
+                    }
+                    else
+                    {
+                        // No snapshot for this segment, use empty/null values
+                        sb.Append(",,0,0,0,0,0,0,"); // Empty values for missing snapshot
+                    }
                 }
 
                 // Final outcome
@@ -1081,10 +988,15 @@ public async Task<List<MatchSnapshot>> GetAllMatchSnapshotsAsync(DateTime? start
     }
 
     /// <summary>
-    /// Gets 9 snapshots across the match timeline (0-10, 10-20, ..., 80-90)
+    /// Gets snapshots across the match timeline (0-10, 10-20, ..., 80-90)
+    /// Ensures each 10-minute segment has appropriate representation without duplications
     /// </summary>
     private List<MatchSnapshot> GetTimelineSnapshots(List<MatchSnapshot> allSnapshots)
     {
+        // Ensure snapshots are ordered by timestamp
+        var orderedSnapshots = allSnapshots.OrderBy(s => s.Timestamp).ToList();
+
+        // Initialize result collection with expected capacity
         var result = new List<MatchSnapshot>();
 
         // Define 9 time ranges (0-10, 10-20, ..., 80-90)
@@ -1101,52 +1013,60 @@ public async Task<List<MatchSnapshot>> GetAllMatchSnapshotsAsync(DateTime? start
             (80, 90) // Plus any added time
         };
 
+        // Track which snapshots have already been used to avoid duplication
+        var usedSnapshotIds = new HashSet<ObjectId>();
+
         // Find best snapshot for each time range
         foreach (var (start, end) in timeRanges)
         {
             // First try to find snapshots within this exact range
-            var rangeSnapshots = allSnapshots
+            var rangeSnapshots = orderedSnapshots
                 .Where(s =>
                 {
                     var minutes = ParsePlayedTime(s.PlayedTime);
-                    return minutes >= start && minutes < end;
+                    return minutes >= start && minutes < end && !usedSnapshotIds.Contains(s.Id);
                 })
                 .ToList();
 
-            // If we have snapshots in this range, pick the one closest to the middle of the range
             if (rangeSnapshots.Any())
             {
+                // If snapshots exist in this range, pick the one closest to the middle
                 var middleTime = start + (end - start) / 2;
                 var bestSnapshot = rangeSnapshots
                     .OrderBy(s => Math.Abs(ParsePlayedTime(s.PlayedTime) - middleTime))
                     .First();
 
                 result.Add(bestSnapshot);
+                usedSnapshotIds.Add(bestSnapshot.Id);
             }
             else
             {
-                // If no snapshots in this exact range, find closest one
+                // If no snapshots in this exact range, find closest available one that hasn't been used
                 var middleTime = start + (end - start) / 2;
-                var bestSnapshot = allSnapshots
-                    .OrderBy(s => Math.Abs(ParsePlayedTime(s.PlayedTime) - middleTime))
-                    .First();
+                var availableSnapshots = orderedSnapshots.Where(s => !usedSnapshotIds.Contains(s.Id)).ToList();
 
-                result.Add(bestSnapshot);
+                if (availableSnapshots.Any())
+                {
+                    var closestSnapshot = availableSnapshots
+                        .OrderBy(s => Math.Abs(ParsePlayedTime(s.PlayedTime) - middleTime))
+                        .First();
+
+                    result.Add(closestSnapshot);
+                    usedSnapshotIds.Add(closestSnapshot.Id);
+                }
+                else
+                {
+                    // If we've used all snapshots already or none match the criteria,
+                    // we don't add anything for this time segment - it will be missing
+                    _logger.LogDebug($"No available snapshot for time range {start}-{end}");
+
+                    // We don't add a duplicate snapshot here
+                }
             }
         }
 
-        // Ensure we have exactly 9 snapshots
-        while (result.Count < 9)
-        {
-            // If we don't have enough snapshots, duplicate the last one
-            result.Add(result.LastOrDefault() ?? allSnapshots.LastOrDefault());
-        }
-
-        // If we somehow got more than 9, trim the excess
-        if (result.Count > 9)
-        {
-            result = result.Take(9).ToList();
-        }
+        // Log information about coverage
+        _logger.LogInformation($"Found {result.Count} unique snapshots across {timeRanges.Count} time ranges");
 
         return result;
     }
