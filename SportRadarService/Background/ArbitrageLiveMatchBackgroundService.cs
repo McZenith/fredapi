@@ -332,12 +332,12 @@ private async Task StreamMatchesToClientsAsync(List<Match> arbitrageMatches, Lis
             .GroupBy(m => m.Description)
             .Select(g => $"{g.Key}: {g.Count()}")
             .ToList();
-        
+
         _logger.LogInformation($"Arbitrage market types: {string.Join(", ", arbitrageMarketTypes)}");
 
         // Combine both match lists ensuring no duplicates
         var allMatchesToProcess = CombineMatchLists(arbitrageMatches, allMatchesFromEvents);
-        
+
         _logger.LogInformation($"Processing a total of {allMatchesToProcess.Count} matches for details/situation data");
 
         // Process matches in batches with parallel execution
@@ -350,12 +350,35 @@ private async Task StreamMatchesToClientsAsync(List<Match> arbitrageMatches, Lis
         // *** FIX: Send all arbitrage matches without additional filtering ***
         // Just ensure we have the right properties
         var validatedArbitrageMatches = enrichedArbitrageMatches.ToList();
-            
-        // Get all matches with 1X2 markets for the regular channel
+
+        // Get all matches with exactly one 1X2 market for the regular channel
         var validatedAllMatches = enrichedAllMatches
-            .Where(m => m.Markets.Any(market =>
-                market.Description?.ToLower() == "match result" ||
-                market.Description?.ToLower() == "1x2"))
+            .Select(match => {
+                // Create a new match with only the 1X2 market
+                var matchWith1X2Only = new ClientMatch {
+                    Id = match.Id,
+                    SeasonId = match.SeasonId,
+                    Teams = match.Teams,
+                    TournamentName = match.TournamentName,
+                    Score = match.Score,
+                    Period = match.Period,
+                    MatchStatus = match.MatchStatus,
+                    PlayedTime = match.PlayedTime,
+                    LastUpdated = match.LastUpdated,
+                    MatchSituation = match.MatchSituation,
+                    MatchDetails = match.MatchDetails,
+                    PredictionData = match.PredictionData,
+                    // Only include the 1X2 market (if any)
+                    Markets = match.Markets
+                        .Where(m => m.Description?.ToLower() == "match result" || 
+                                    m.Description?.ToLower() == "1x2")
+                        .Take(1) // Take just one market
+                        .ToList()
+                };
+        
+                return matchWith1X2Only;
+            })
+            .Where(m => m.Markets.Any()) // Only include matches that have at least one 1X2 market
             .ToList();
 
         // Send both messages with enriched data
