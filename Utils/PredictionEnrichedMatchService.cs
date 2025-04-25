@@ -76,53 +76,56 @@ public class PredictionEnrichedMatchService
         }
     }
 
-    /// <summary>
-    /// Enriches live matches with prediction data for both arbitrage opportunities and all matches
-    /// </summary>
-    public async Task<(List<ClientMatch> enrichedArbitrageMatches, List<ClientMatch> enrichedAllMatches)>
-        EnrichMatchesWithPredictionDataAsync(
-            List<Match> arbitrageMatches,
-            List<Match> allMatches)
+public async Task<(List<ClientMatch> enrichedArbitrageMatches, List<ClientMatch> enrichedAllMatches)>
+    EnrichMatchesWithPredictionDataAsync(
+        List<Match> arbitrageMatches,
+        List<Match> allMatches)
+{
+    try
     {
-        try
+        // Get cached prediction data if available
+        if (!_cache.TryGetValue("prediction_data", out PredictionDataResponse predictionData))
         {
-            // Get cached prediction data if available
-            if (!_cache.TryGetValue("prediction_data", out PredictionDataResponse predictionData))
-            {
-                _logger.LogInformation("No prediction data available in cache");
-                // Return original matches if no prediction data is available
-                return (
-                    arbitrageMatches.Select(m => ConvertToClientMatch(m)).ToList(),
-                    allMatches.Select(m => ConvertToClientMatch(m)).ToList()
-                );
-            }
-
-            _logger.LogInformation($"Enriching {allMatches.Count} matches with prediction data");
-
-            // Create enriched versions of all matches
-            var enrichedAllMatches = await EnrichMatchesAsync(allMatches, predictionData);
-
-            // Create enriched versions of arbitrage matches
-            var arbitrageMatchIds = arbitrageMatches.Select(m => m.Id).ToHashSet();
-            var enrichedArbitrageMatches = enrichedAllMatches
-                .Where(m => arbitrageMatchIds.Contains(m.Id))
-                .ToList();
-
-            // Take a snapshot of all matches for ML purposes
-            await TakeMatchSnapshotsAsync(enrichedAllMatches);
-
-            return (enrichedArbitrageMatches, enrichedAllMatches);
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Error enriching matches with prediction data");
-            // Return original matches on error
+            _logger.LogInformation("No prediction data available in cache");
+            // Return original matches if no prediction data is available
             return (
                 arbitrageMatches.Select(m => ConvertToClientMatch(m)).ToList(),
                 allMatches.Select(m => ConvertToClientMatch(m)).ToList()
             );
         }
+
+        _logger.LogInformation($"Enriching {allMatches.Count} regular matches and {arbitrageMatches.Count} arbitrage matches with prediction data");
+
+        // Process arbitrage matches and all matches separately to preserve their distinct characteristics
+        var enrichedArbitrageMatches = await EnrichMatchesAsync(arbitrageMatches, predictionData);
+        var enrichedAllMatches = await EnrichMatchesAsync(allMatches, predictionData);
+
+        // Take a snapshot of all matches for ML purposes
+        // Include all enriched matches in the snapshot
+        var allEnrichedMatches = new List<ClientMatch>();
+        allEnrichedMatches.AddRange(enrichedAllMatches);
+        // Add arbitrage matches that aren't already in the list
+        foreach (var match in enrichedArbitrageMatches)
+        {
+            if (!allEnrichedMatches.Any(m => m.Id == match.Id))
+            {
+                allEnrichedMatches.Add(match);
+            }
+        }
+        await TakeMatchSnapshotsAsync(allEnrichedMatches);
+
+        return (enrichedArbitrageMatches, enrichedAllMatches);
     }
+    catch (Exception ex)
+    {
+        _logger.LogError(ex, "Error enriching matches with prediction data");
+        // Return original matches on error
+        return (
+            arbitrageMatches.Select(m => ConvertToClientMatch(m)).ToList(),
+            allMatches.Select(m => ConvertToClientMatch(m)).ToList()
+        );
+    }
+}
 
     private async Task<List<ClientMatch>> EnrichMatchesAsync(
         List<Match> matches,
@@ -1044,7 +1047,6 @@ public async Task<List<MatchSnapshot>> GetAllMatchSnapshotsAsync(DateTime? start
         // Track which snapshots have already been used to avoid duplication
         var usedSnapshotIds = new HashSet<ObjectId>();
 
-        // Find best snapshot for each time range
         foreach (var (start, end) in timeRanges)
         {
             // First try to find snapshots within this exact range
@@ -1069,7 +1071,6 @@ public async Task<List<MatchSnapshot>> GetAllMatchSnapshotsAsync(DateTime? start
             }
             else
             {
-                // If no snapshots in this exact range, find closest available one that hasn't been used
                 var middleTime = start + (end - start) / 2;
                 var availableSnapshots = orderedSnapshots.Where(s => !usedSnapshotIds.Contains(s.Id)).ToList();
 
