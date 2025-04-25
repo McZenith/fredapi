@@ -158,7 +158,7 @@ public class PredictionDataBackgroundService : BackgroundService
 
             // Get matches for the next 24 hours and previous 5 hours (to include ongoing matches)
             var startTime = DateTime.UtcNow.AddMinutes(-300);
-            var endTime = DateTime.UtcNow.AddHours(24);
+            var endTime = DateTime.UtcNow.AddHours(36);
 
             var collection = mongoDbService.GetCollection<MongoEnrichedMatch>("EnrichedSportMatches");
             
