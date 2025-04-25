@@ -306,6 +306,7 @@ public partial class ArbitrageLiveMatchBackgroundService : BackgroundService
     }
 
 // 5. Fix: Simplify StreamMatchesToClientsAsync to avoid excessive filtering
+// Fix the StreamMatchesToClientsAsync method to handle caching correctly
 private async Task StreamMatchesToClientsAsync(List<Match> arbitrageMatches, List<Event> allEvents,
     List<Match> allMatchesFromEvents, CancellationToken stoppingToken = default)
 {
@@ -315,7 +316,7 @@ private async Task StreamMatchesToClientsAsync(List<Match> arbitrageMatches, Lis
     {
         _logger.LogInformation($"Processing {allMatchesFromEvents.Count} matches for enrichment");
 
-        // Debug: Log arbitrage matches found
+        // Log arbitrage match details for debugging
         foreach (var match in arbitrageMatches)
         {
             _logger.LogInformation($"Arbitrage match: {match.Id} - {match.Teams.Home.Name} vs {match.Teams.Away.Name}");
@@ -326,35 +327,68 @@ private async Task StreamMatchesToClientsAsync(List<Match> arbitrageMatches, Lis
             }
         }
 
-        // Log market types for debugging
-        var arbitrageMarketTypes = arbitrageMatches
-            .SelectMany(m => m.Markets)
-            .GroupBy(m => m.Description)
-            .Select(g => $"{g.Key}: {g.Count()}")
-            .ToList();
-
-        _logger.LogInformation($"Arbitrage market types: {string.Join(", ", arbitrageMarketTypes)}");
-
-        // Combine both match lists ensuring no duplicates
-        var allMatchesToProcess = CombineMatchLists(arbitrageMatches, allMatchesFromEvents);
-
+        // Create a separate list of matches to process for details/situation data
+        // This ensures we process both arbitrage and regular matches for enrichment
+        var allMatchesToProcess = new List<Match>();
+        
+        // Start with all regular matches
+        allMatchesToProcess.AddRange(allMatchesFromEvents);
+        
+        // Add arbitrage matches only if they're not already in the list
+        foreach (var match in arbitrageMatches)
+        {
+            if (!allMatchesToProcess.Any(m => m.Id == match.Id))
+            {
+                allMatchesToProcess.Add(match);
+            }
+        }
+        
         _logger.LogInformation($"Processing a total of {allMatchesToProcess.Count} matches for details/situation data");
 
-        // Process matches in batches with parallel execution
-        await ProcessMatchBatchesAsync(allMatchesToProcess, stoppingToken);
+        // Process match data in batches
+        var batches = allMatchesToProcess.Chunk(5).ToList();
+        var batchTasks = new List<Task>();
 
-        // Enrich matches with prediction data before sending to clients
+        foreach (var batch in batches)
+        {
+            var batchTask = Task.Run(async () =>
+            {
+                foreach (var match in batch)
+                {
+                    if (stoppingToken.IsCancellationRequested) break;
+
+                    try
+                    {
+                        await FetchMatchDataAsync(match);
+                        await AddHumanLikeDelay(100, 200);
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning(ex, "Error fetching data for match {MatchId}", match.Id);
+                        await AddHumanLikeDelay(300, 500);
+                    }
+                }
+            }, stoppingToken);
+
+            batchTasks.Add(batchTask);
+            await Task.Delay(150, stoppingToken);
+        }
+
+        // Wait for all batches to complete
+        await Task.WhenAll(batchTasks);
+
+        // Enrich matches with prediction data
+        // IMPORTANT: Keep these separate and don't mix the lists
         var (enrichedArbitrageMatches, enrichedAllMatches) = await _predictionEnrichedMatchService
             .EnrichMatchesWithPredictionDataAsync(arbitrageMatches, allMatchesFromEvents);
 
-        // *** FIX: Send all arbitrage matches without additional filtering ***
-        // Just ensure we have the right properties
-        var validatedArbitrageMatches = enrichedArbitrageMatches.ToList();
+        // Keep all arbitrage matches without filtering
+        var arbitrageMatchesForClient = enrichedArbitrageMatches.ToList();
 
-        // Get all matches with exactly one 1X2 market for the regular channel
-        var validatedAllMatches = enrichedAllMatches
+        // For all matches, filter to only include 1X2 markets
+        var allMatchesForClient = enrichedAllMatches
             .Select(match => {
-                // Create a new match with only the 1X2 market
+                // Create a new match with only one 1X2 market
                 var matchWith1X2Only = new ClientMatch {
                     Id = match.Id,
                     SeasonId = match.SeasonId,
@@ -368,40 +402,45 @@ private async Task StreamMatchesToClientsAsync(List<Match> arbitrageMatches, Lis
                     MatchSituation = match.MatchSituation,
                     MatchDetails = match.MatchDetails,
                     PredictionData = match.PredictionData,
-                    // Only include the 1X2 market (if any)
+                    // Only include one 1X2 market
                     Markets = match.Markets
                         .Where(m => m.Description?.ToLower() == "match result" || 
                                     m.Description?.ToLower() == "1x2")
                         .Take(1) // Take just one market
                         .ToList()
                 };
-        
+                
                 return matchWith1X2Only;
             })
             .Where(m => m.Markets.Any()) // Only include matches that have at least one 1X2 market
             .ToList();
 
-        // Send both messages with enriched data
-        await _hubContext.Clients.All.SendAsync("ReceiveArbitrageLiveMatches", validatedArbitrageMatches,
+        // Log sizes before sending
+        _logger.LogInformation($"Sending {arbitrageMatchesForClient.Count} arbitrage matches and {allMatchesForClient.Count} regular matches");
+
+        // Send messages to clients
+        await _hubContext.Clients.All.SendAsync("ReceiveArbitrageLiveMatches", arbitrageMatchesForClient,
             cancellationToken: stoppingToken);
-        await _hubContext.Clients.All.SendAsync("ReceiveAllLiveMatches", validatedAllMatches,
+        await _hubContext.Clients.All.SendAsync("ReceiveAllLiveMatches", allMatchesForClient,
             cancellationToken: stoppingToken);
 
-        // Update the static collections with validated data
-        UpdateStaticCollection(_lastSentArbitrageMatches, validatedArbitrageMatches);
-        UpdateStaticCollection(_lastSentAllMatches, validatedAllMatches);
+        // IMPORTANT: Keep these lists separate in static collections and cache
+        UpdateStaticCollection(_lastSentArbitrageMatches, arbitrageMatchesForClient);
+        UpdateStaticCollection(_lastSentAllMatches, allMatchesForClient);
 
-        // Cache for new connections
-        _cache.Set(CACHE_KEY_ARBITRAGE_MATCHES, validatedArbitrageMatches, TimeSpan.FromMinutes(5));
-        _cache.Set(CACHE_KEY_ALL_MATCHES, validatedAllMatches, TimeSpan.FromMinutes(5));
+        // Cache separately with their own keys
+        _cache.Set(CACHE_KEY_ARBITRAGE_MATCHES, arbitrageMatchesForClient, TimeSpan.FromMinutes(5));
+        _cache.Set(CACHE_KEY_ALL_MATCHES, allMatchesForClient, TimeSpan.FromMinutes(5));
 
-        LogMatchStats(validatedArbitrageMatches, validatedAllMatches);
+        // Log stats for debugging
+        LogDetailedMatchStats(arbitrageMatchesForClient, allMatchesForClient);
     }
     catch (Exception ex)
     {
         _logger.LogError(ex, "Error streaming matches to clients");
     }
 }
+
 
 // Helper method to combine match lists without duplicates
 private List<Match> CombineMatchLists(List<Match> arbitrageMatches, List<Match> allMatchesFromEvents)
@@ -493,6 +532,49 @@ private void LogMatchStats(List<ClientMatch> arbitrageMatches, List<ClientMatch>
         }
     }
 
+    // Enhanced logging to troubleshoot caching and enrichment issues
+private void LogDetailedMatchStats(List<ClientMatch> arbitrageMatches, List<ClientMatch> allMatches)
+{
+    // Log overall counts
+    _logger.LogInformation(
+        "Streamed {ArbitrageMatchCount} arbitrage matches and {AllMatchCount} regular matches with enriched data",
+        arbitrageMatches.Count,
+        allMatches.Count);
+
+    // Log details about enrichment
+    var arbitrageDetailsCount = arbitrageMatches.Count(m => m.MatchDetails != null);
+    var arbitrageSituationCount = arbitrageMatches.Count(m => m.MatchSituation != null);
+    var arbitragePredictionCount = arbitrageMatches.Count(m => m.PredictionData != null);
+    
+    var allDetailsCount = allMatches.Count(m => m.MatchDetails != null);
+    var allSituationCount = allMatches.Count(m => m.MatchSituation != null);
+    var allPredictionCount = allMatches.Count(m => m.PredictionData != null);
+
+    _logger.LogInformation(
+        "Arbitrage matches - with details: {DetailsCount}/{TotalCount}, with situation: {SituationCount}/{TotalCount}, with prediction: {PredictionCount}/{TotalCount}",
+        arbitrageDetailsCount, arbitrageMatches.Count, arbitrageSituationCount, arbitrageMatches.Count, arbitragePredictionCount, arbitrageMatches.Count);
+
+    _logger.LogInformation(
+        "Regular matches - with details: {DetailsCount}/{TotalCount}, with situation: {SituationCount}/{TotalCount}, with prediction: {PredictionCount}/{TotalCount}",
+        allDetailsCount, allMatches.Count, allSituationCount, allMatches.Count, allPredictionCount, allMatches.Count);
+        
+    // Check for duplicate match IDs between the two lists
+    var arbitrageIds = arbitrageMatches.Select(m => m.Id).ToHashSet();
+    var allMatchIds = allMatches.Select(m => m.Id).ToHashSet();
+    var duplicateIds = arbitrageIds.Intersect(allMatchIds).ToList();
+    
+    if (duplicateIds.Any())
+    {
+        _logger.LogWarning("Found {DuplicateCount} matches that appear in both arbitrage and regular lists", duplicateIds.Count);
+        foreach (var id in duplicateIds)
+        {
+            var arbMatch = arbitrageMatches.First(m => m.Id == id);
+            var regMatch = allMatches.First(m => m.Id == id);
+            _logger.LogWarning("Duplicate match: {MatchId} - {HomeTeam} vs {AwayTeam}", 
+                id, arbMatch.Teams.Home.Name, arbMatch.Teams.Away.Name);
+        }
+    }
+}
 
     private void ProcessMatchSituation(Match match, JsonDocument document)
     {
