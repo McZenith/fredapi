@@ -355,8 +355,7 @@ private async Task StreamMatchesToClientsAsync(List<Match> arbitrageMatches, Lis
         var validatedAllMatches = enrichedAllMatches
             .Where(m => m.Markets.Any(market =>
                 market.Description?.ToLower() == "match result" ||
-                market.Description?.ToLower() == "1x2" ||
-                (market.Description?.ToLower()?.Contains("1x2") == true)))
+                market.Description?.ToLower() == "1x2"))
             .ToList();
 
         // Send both messages with enriched data
