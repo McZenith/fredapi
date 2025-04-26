@@ -348,9 +348,6 @@ private async Task UpdatePredictionDataAsync(CancellationToken stoppingToken)
         // If we have more pages, send them with a small delay between
         if (totalPages > 1)
         {
-            // Small delay to allow clients to process first page
-            await Task.Delay(500, stoppingToken);
-            
             // Send remaining pages
             for (int page = 1; page < totalPages; page++)
             {
