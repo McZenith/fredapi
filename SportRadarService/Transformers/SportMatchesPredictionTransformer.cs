@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.Globalization;
 using System.Text;
+using System.Text.Json;
 using System.Text.Json.Serialization;
 using System.Text.RegularExpressions;
 using fredapi.SportRadarService.Background;
@@ -25,12 +26,11 @@ namespace fredapi.SportRadarService.Transformers
         /// </summary>
         /// <param name="sportMatches">List of EnrichedSportMatch objects from the database</param>
         /// <returns>PredictionDataResponse object that can be serialized to predict-data.json format</returns>
-        public PredictionDataResponse TransformToPredictionData(List<Background.EnrichedSportMatch> sportMatches)
+        public PredictionDataResponse TransformToPredictionData(List<EnrichedSportMatch> sportMatches)
         {
             var stopwatch = Stopwatch.StartNew();
             try
             {
-
                 if (sportMatches == null || !sportMatches.Any())
                 {
                     return CreateEmptyPredictionResponse();
@@ -85,7 +85,6 @@ namespace fredapi.SportRadarService.Transformers
                             result.Data.UpcomingMatches.Add(upcomingMatch);
                             UpdateLeagueMetadata(result.Data.Metadata, upcomingMatch);
                             successCount++;
-
                         }
                         else
                         {
@@ -292,7 +291,7 @@ namespace fredapi.SportRadarService.Transformers
             }
         }
 
-        private bool IsValidMatch(Background.EnrichedSportMatch sportMatch)
+        private bool IsValidMatch(EnrichedSportMatch sportMatch)
         {
             if (sportMatch == null)
             {
@@ -364,7 +363,7 @@ namespace fredapi.SportRadarService.Transformers
         /// <summary>
         /// Transforms a single match into the UpcomingMatch format
         /// </summary>
-        private UpcomingMatch TransformSingleMatch(Background.EnrichedSportMatch sportMatch)
+        private UpcomingMatch TransformSingleMatch(EnrichedSportMatch sportMatch)
         {
             try
             {
@@ -469,7 +468,7 @@ namespace fredapi.SportRadarService.Transformers
         /// <summary>
         /// Creates team data with stats, form, and position information
         /// </summary>
-        private TeamData CreateTeamData(Background.EnrichedSportMatch sportMatch, bool isHome)
+        private TeamData CreateTeamData(EnrichedSportMatch sportMatch, bool isHome)
         {
             try
             {
@@ -482,8 +481,8 @@ namespace fredapi.SportRadarService.Transformers
 
                 var teamName = teamInfo.Name;
 
-                // Get team position in the table - with improved null handling
-                int position = GetTeamPosition(sportMatch, teamName);
+                // Get enhanced position data with tier and relative strength
+                var (position, positionTier, relativePositionStrength) = GetEnhancedPositionInfo(sportMatch, teamName);
 
                 // Extract team stats with better null handling
                 var teamStats = isHome
@@ -497,6 +496,9 @@ namespace fredapi.SportRadarService.Transformers
                 string form = ExtractTeamForm(sportMatch, isHome);
                 string homeForm = isHome ? form : "";
                 string awayForm = !isHome ? form : "";
+
+                // Calculate form consistency based on variance in results
+                double formConsistency = CalculateFormConsistency(form);
 
                 // Calculate and extract stats from match history when direct stats are missing
                 var extractedStats = ExtractStatsFromMatchHistory(teamLastX, teamName, isHome);
@@ -569,11 +571,40 @@ namespace fredapi.SportRadarService.Transformers
                 // Get late goal rate
                 double lateGoalRate = CalculateLateGoalRate(sportMatch, isHome) ?? extractedStats.LateGoalRate;
 
+                // Calculate overall performance rating (combines position, form, and stats)
+                double performanceRating = CalculatePerformanceRating(
+                    relativePositionStrength,
+                    formStrength,
+                    averageGoalsScored,
+                    averageGoalsConceded,
+                    winPercentage);
+
+                // Calculate expected points (per match) based on performance
+                double expectedPoints = CalculateExpectedPoints(performanceRating, formStrength, winPercentage);
+
+                // Add momentum calculation based on recent form vs overall performance
+                double momentum = CalculateMomentum(formStrength, winPercentage, performanceRating);
+
+                // Calculate offensive efficiency (goals per scoring chance)
+                double offensiveEfficiency = CalculateOffensiveEfficiency(averageGoalsScored, teamStats);
+
+                // Calculate defensive efficiency (goals conceded vs expected)
+                double defensiveEfficiency = CalculateDefensiveEfficiency(averageGoalsConceded, teamStats);
+
                 // Create the team data object with all fields populated
                 return new TeamData
                 {
                     Name = teamName,
                     Position = position,
+                    // Add enhanced data
+                    PositionTier = positionTier,
+                    RelativePositionStrength = Math.Round(relativePositionStrength, 2),
+                    FormConsistency = Math.Round(formConsistency, 2),
+                    PerformanceRating = Math.Round(performanceRating, 2),
+                    ExpectedPoints = Math.Round(expectedPoints, 2),
+                    Momentum = Math.Round(momentum, 2),
+                    OffensiveEfficiency = Math.Round(offensiveEfficiency, 2),
+                    DefensiveEfficiency = Math.Round(defensiveEfficiency, 2),
                     Logo = "", // Default to empty as we don't have logos in the data
                     AvgHomeGoals = Math.Round(avgHomeGoals, 2),
                     AvgAwayGoals = Math.Round(avgAwayGoals, 2),
@@ -653,10 +684,173 @@ namespace fredapi.SportRadarService.Transformers
                     GoalDistribution = new Dictionary<string, object>(),
                     OpponentName = isHome
                         ? sportMatch?.OriginalMatch?.Teams?.Away?.Name ?? "Unknown Away Team"
-                        : sportMatch?.OriginalMatch?.Teams?.Home?.Name ?? "Unknown Home Team"
+                        : sportMatch?.OriginalMatch?.Teams?.Home?.Name ?? "Unknown Home Team",
+                    // Add default values for new properties
+                    PositionTier = "unknown",
+                    RelativePositionStrength = 0.5,
+                    FormConsistency = 0,
+                    PerformanceRating = 0,
+                    ExpectedPoints = 0,
+                    Momentum = 0,
+                    OffensiveEfficiency = 0,
+                    DefensiveEfficiency = 0
                 };
             }
         }
+
+// Additional helper methods for the new metrics
+
+        private double CalculateMomentum(double formStrength, double winPercentage, double performanceRating)
+        {
+            // Convert form strength to 0-1 scale
+            double formFactor = formStrength / 100.0;
+
+            // Convert win percentage to 0-1 scale
+            double winFactor = winPercentage / 100.0;
+
+            // Convert performance rating to 0-1 scale
+            double performanceFactor = performanceRating / 100.0;
+
+            // Calculate momentum as differential between recent form and overall performance
+            // Positive values mean team is on an upswing, negative means downswing
+            double momentum = formFactor - ((winFactor + performanceFactor) / 2);
+
+            // Scale to -100 to 100 range
+            return momentum * 100;
+        }
+
+        private double CalculateOffensiveEfficiency(double averageGoalsScored, TeamStats teamStats)
+        {
+            // Default to average if we don't have detailed stats
+            if (teamStats?.Scoring == null)
+                return 1.0;
+
+            // If we have shots per game or xG data, we could use it here
+            // This is an approximation based on available data
+
+            // Get goal conversion rate or approximation
+            double attackingEfficiency;
+
+            // If we have data about shots, use it
+            if (teamStats.Scoring.ExtensionData != null &&
+                teamStats.Scoring.ExtensionData.TryGetValue("shotsPerGame", out var shotsElement) &&
+                shotsElement.ValueKind == JsonValueKind.Object)
+            {
+                if (shotsElement.TryGetProperty("total", out var totalShotsElement) &&
+                    totalShotsElement.TryGetDouble(out double totalShots))
+                {
+                    // Calculate efficiency as goals per shot
+                    attackingEfficiency = totalShots > 0 ? averageGoalsScored / totalShots : 1.0;
+
+                    // Scale to make 1.0 the average
+                    return Math.Min(attackingEfficiency * 5, 2.0);
+                }
+            }
+
+            // Fallback based on goals and chance creation approximation
+            double leagueAverageGoals = 1.4; // Typical average
+            attackingEfficiency = averageGoalsScored / leagueAverageGoals;
+
+            // Returns higher than 1.0 for teams that score more than average,
+            // lower than 1.0 for teams that score less
+            return Math.Min(Math.Max(attackingEfficiency, 0.2), 2.0);
+        }
+
+        private double CalculateDefensiveEfficiency(double averageGoalsConceded, TeamStats teamStats)
+        {
+            // Default efficiency if we don't have detailed stats
+            if (teamStats?.Conceding == null)
+                return 1.0;
+
+            // If we have shots against data or xGA, we could use it
+            // This is an approximation based on available data
+
+            // Defensive efficiency is better when lower (fewer goals conceded)
+            // We invert the scale so higher values = better defense
+
+            double leagueAverageGoalsConceded = 1.4; // Typical average
+
+            // Calculate efficiency compared to league average (lower conceded = better defense)
+            double defensiveEfficiency = leagueAverageGoalsConceded /
+                                         Math.Max(averageGoalsConceded, 0.5); // Avoid divide by zero with min 0.5
+
+            // Returns higher than 1.0 for teams with good defense,
+            // lower than 1.0 for teams with poor defense
+            return Math.Min(Math.Max(defensiveEfficiency, 0.2), 2.0);
+        }
+
+        private double CalculateFormConsistency(string form)
+        {
+            if (string.IsNullOrEmpty(form) || form.Length < 3)
+                return 0.5; // Default medium consistency
+
+            int wins = form.Count(c => c == 'W');
+            int draws = form.Count(c => c == 'D');
+            int losses = form.Count(c => c == 'L');
+
+            // Check for perfect consistency
+            if (wins == form.Length || draws == form.Length || losses == form.Length)
+                return 1.0;
+
+            // Calculate consistency based on predominant result and deviation from it
+            int total = wins + draws + losses;
+            int maxResult = Math.Max(wins, Math.Max(draws, losses));
+            double dominanceRatio = (double)maxResult / total;
+
+            // Factor in result transitions - fewer transitions means more consistency
+            int transitions = 0;
+            for (int i = 1; i < form.Length; i++)
+            {
+                if (form[i] != form[i - 1])
+                    transitions++;
+            }
+
+            double transitionFactor = 1.0 - ((double)transitions / (form.Length - 1));
+
+            // Combine factors (weight dominance more than transitions)
+            return (dominanceRatio * 0.7) + (transitionFactor * 0.3);
+        }
+
+        private double CalculatePerformanceRating(
+            double positionStrength,
+            double formStrength,
+            double goalsScored,
+            double goalsConceded,
+            double winPercentage)
+        {
+            // Convert all inputs to 0-1 scale
+            double formFactor = formStrength / 100.0;
+            double attackRating = Math.Min(goalsScored, 3.0) / 3.0; // Cap at 3 goals per game
+            double defenseRating = Math.Max(0, 1.0 - (goalsConceded / 3.0)); // Lower is better
+            double winRating = winPercentage / 100.0;
+
+            // Weight the factors based on importance
+            double rating = (positionStrength * 0.3) + // 30% league position
+                            (formFactor * 0.25) + // 25% recent form
+                            (attackRating * 0.15) + // 15% attack
+                            (defenseRating * 0.15) + // 15% defense
+                            (winRating * 0.15); // 15% win percentage
+
+            // Scale to 0-100
+            return rating * 100.0;
+        }
+
+        private double CalculateExpectedPoints(double performanceRating, double formStrength, double winPercentage)
+        {
+            // Base expected points on win rate (3 points per win)
+            double basePoints = (winPercentage / 100.0) * 3.0;
+
+            // Adjust based on current form and overall performance
+            double formAdjustment = ((formStrength / 100.0) - 0.5) * 0.5; // -0.25 to +0.25
+            double performanceAdjustment = ((performanceRating / 100.0) - 0.5) * 0.5; // -0.25 to +0.25
+
+            // Combine for final expected points per match
+            double expectedPoints = basePoints + formAdjustment + performanceAdjustment;
+
+            // Ensure within reasonable range (0 to 3)
+            return Math.Max(0, Math.Min(3, expectedPoints));
+        }
+
 
         private class ExtractedTeamStats
         {
@@ -693,7 +887,7 @@ namespace fredapi.SportRadarService.Transformers
             public double LateGoalRate { get; set; }
         }
 
-        private ExtractedTeamStats ExtractStatsFromMatchHistory(Background.TeamLastXExtendedModel teamLastX,
+        private ExtractedTeamStats ExtractStatsFromMatchHistory(TeamLastXExtendedModel teamLastX,
             string teamName, bool isHome)
         {
             var stats = new ExtractedTeamStats();
@@ -1039,7 +1233,6 @@ namespace fredapi.SportRadarService.Transformers
 
                 if (teamRow != null)
                 {
-                  
                 }
             }
 
@@ -1050,7 +1243,6 @@ namespace fredapi.SportRadarService.Transformers
 
             if (teamRow != null)
             {
-                
                 return teamRow.Pos;
             }
 
@@ -1180,7 +1372,7 @@ namespace fredapi.SportRadarService.Transformers
         /// <summary>
         /// Extracts team form as a string (W/D/L) from recent matches
         /// </summary>
-        private string ExtractTeamForm(Background.EnrichedSportMatch sportMatch, bool isHome)
+        private string ExtractTeamForm(EnrichedSportMatch sportMatch, bool isHome)
         {
             var teamLastX = isHome ? sportMatch.Team1LastX : sportMatch.Team2LastX;
 
@@ -1248,7 +1440,7 @@ namespace fredapi.SportRadarService.Transformers
         }
 
         // New helper method for more robust team identification
-        private bool IsTeamPlayingHome(Background.ExtendedMatchStat match, string teamName)
+        private bool IsTeamPlayingHome(ExtendedMatchStat match, string teamName)
         {
             if (match.Teams?.Home == null)
                 return false;
@@ -1260,7 +1452,7 @@ namespace fredapi.SportRadarService.Transformers
                    ContainsTeamName(match.Teams.Home.MediumName, teamName);
         }
 
-        private bool IsTeamPlayingHome(Background.HeadToHeadMatch match, string teamName, string teamId = null)
+        private bool IsTeamPlayingHome(HeadToHeadMatch match, string teamName, string teamId = null)
         {
             if (match.Teams?.Home == null)
                 return false;
@@ -1279,7 +1471,7 @@ namespace fredapi.SportRadarService.Transformers
         }
 
         // Add this overload to handle HeadToHeadMatch
-        private bool IsTeamPlayingHome(Background.ExtendedMatchStat match, string teamName, string teamId = null)
+        private bool IsTeamPlayingHome(ExtendedMatchStat match, string teamName, string teamId = null)
         {
             if (match.Teams?.Home == null)
                 return false;
@@ -1300,7 +1492,7 @@ namespace fredapi.SportRadarService.Transformers
         /// <summary>
         /// Parses match date from various formats
         /// </summary>
-        private DateTime ParseMatchDate(Background.MatchTimeInfo timeInfo)
+        private DateTime ParseMatchDate(MatchTimeInfo timeInfo)
         {
             if (timeInfo == null)
             {
@@ -1603,72 +1795,6 @@ namespace fredapi.SportRadarService.Transformers
             return oddsInfo;
         }
 
-// New helper method to estimate missing odds from Double Chance market
-        private void EstimateMissingOddsFromDoubleChance(
-            Background.ArbitrageLiveMatchBackgroundService.MarketData doubleChanceMarket,
-            ref MatchOdds oddsInfo)
-        {
-            try
-            {
-                // Extract double chance odds
-                double homeDrawOdds = 0, homeAwayOdds = 0, drawAwayOdds = 0;
-
-                var homeDrawOutcome = doubleChanceMarket.Outcomes.FirstOrDefault(o =>
-                    o.Id == "9" || o.Desc?.Contains("Home or Draw", StringComparison.OrdinalIgnoreCase) == true ||
-                    o.Desc?.Contains("1X", StringComparison.OrdinalIgnoreCase) == true);
-
-                if (homeDrawOutcome != null && double.TryParse(homeDrawOutcome.Odds, out double homeDrawValue))
-                {
-                    homeDrawOdds = homeDrawValue;
-                }
-
-                var homeAwayOutcome = doubleChanceMarket.Outcomes.FirstOrDefault(o =>
-                    o.Id == "10" || o.Desc?.Contains("Home or Away", StringComparison.OrdinalIgnoreCase) == true ||
-                    o.Desc?.Contains("12", StringComparison.OrdinalIgnoreCase) == true);
-
-                if (homeAwayOutcome != null && double.TryParse(homeAwayOutcome.Odds, out double homeAwayValue))
-                {
-                    homeAwayOdds = homeAwayValue;
-                }
-
-                var drawAwayOutcome = doubleChanceMarket.Outcomes.FirstOrDefault(o =>
-                    o.Id == "11" || o.Desc?.Contains("Draw or Away", StringComparison.OrdinalIgnoreCase) == true ||
-                    o.Desc?.Contains("X2", StringComparison.OrdinalIgnoreCase) == true);
-
-                if (drawAwayOutcome != null && double.TryParse(drawAwayOutcome.Odds, out double drawAwayValue))
-                {
-                    drawAwayOdds = drawAwayValue;
-                }
-
-                // If we have all double chance odds, we can solve for missing 1X2 odds
-                if (homeDrawOdds > 0 && homeAwayOdds > 0 && drawAwayOdds > 0)
-                {
-                    // Convert odds to probabilities
-                    double pHomeDrawImplied = 1 / homeDrawOdds;
-                    double pHomeAwayImplied = 1 / homeAwayOdds;
-                    double pDrawAwayImplied = 1 / drawAwayOdds;
-
-                    // Solve for individual outcomes
-                    double pHomeImplied = (pHomeDrawImplied + pHomeAwayImplied - pDrawAwayImplied) / 2;
-                    double pDrawImplied = (pHomeDrawImplied + pDrawAwayImplied - pHomeAwayImplied) / 2;
-                    double pAwayImplied = (pHomeAwayImplied + pDrawAwayImplied - pHomeDrawImplied) / 2;
-
-                    // Convert back to odds
-                    if (oddsInfo.HomeWin == 0 && pHomeImplied > 0)
-                        oddsInfo.HomeWin = Math.Round(1 / pHomeImplied, 2);
-
-                    if (oddsInfo.Draw == 0 && pDrawImplied > 0)
-                        oddsInfo.Draw = Math.Round(1 / pDrawImplied, 2);
-
-                    if (oddsInfo.AwayWin == 0 && pAwayImplied > 0)
-                        oddsInfo.AwayWin = Math.Round(1 / pAwayImplied, 2);
-                }
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "Error estimating odds from Double Chance market: {Message}", ex.Message);
-            }
-        }
 
 // Helper to estimate odds from probability
         private double EstimateOddsFromProbability(double probability)
@@ -1770,7 +1896,34 @@ namespace fredapi.SportRadarService.Transformers
                 Losses = 0,
                 GoalsScored = 0,
                 GoalsConceded = 0,
-                RecentMatches = new List<RecentMatchResult>()
+                RecentMatches = new List<RecentMatchResult>(),
+                // Add new properties for enhanced H2H stats
+                HomeWins = 0,
+                AwayWins = 0,
+                HomeGoalsScored = 0,
+                AwayGoalsScored = 0,
+                HomeGoalsConceded = 0,
+                AwayGoalsConceded = 0,
+                AvgGoalsPerMatch = 0,
+                BttsRate = 0,
+                AvgHomeGoalsPerMatch = 0,
+                AvgAwayGoalsPerMatch = 0,
+                Over25GoalsRate = 0,
+                Over35GoalsRate = 0,
+                CleanSheetRate = 0,
+                HomeCleanSheetRate = 0,
+                AwayCleanSheetRate = 0,
+                FormTrend = "neutral", // Can be "improving", "declining", or "neutral"
+                H2HDominance = 0, // Scale from -1 (away dominates) to 1 (home dominates)
+                RecentH2HDominance = 0,
+                WinStreak = 0,
+                DrawStreak = 0,
+                UnbeatenStreak = 0,
+                AvgMatchInterval = 0,
+                Seasonality = "consistent",
+                RivalryIntensity = "medium",
+                ScoringPattern = "balanced",
+                Predictability = 0.5
             };
 
             if (sportMatch?.TeamVersusRecent == null || sportMatch.TeamVersusRecent.Matches == null)
@@ -1802,7 +1955,6 @@ namespace fredapi.SportRadarService.Transformers
 
                 if (!headToHeadMatches.Any())
                 {
-
                     // Try with more lenient matching
                     headToHeadMatches = sportMatch.TeamVersusRecent.Matches
                         .Where(m => m.Result != null && m.Teams != null &&
@@ -1817,9 +1969,32 @@ namespace fredapi.SportRadarService.Transformers
                 }
 
                 int wins = 0, draws = 0, losses = 0, goalsScored = 0, goalsConceded = 0;
+                int homeWins = 0, awayWins = 0, homeGoalsScored = 0, awayGoalsScored = 0;
+                int homeGoalsConceded = 0, awayGoalsConceded = 0;
+                int matchesWithBtts = 0, matchesOver25 = 0, matchesOver35 = 0;
+                int homeCleanSheets = 0, awayCleanSheets = 0, totalCleanSheets = 0;
+                int currentWinStreak = 0, maxWinStreak = 0;
+                int currentDrawStreak = 0, maxDrawStreak = 0;
+                int currentUnbeatenStreak = 0, maxUnbeatenStreak = 0;
+                string lastResult = null;
                 var recentResults = new List<RecentMatchResult>();
 
-                foreach (var match in headToHeadMatches)
+                // Track form trend (recent 3 matches vs older matches)
+                var recentMatchResults = new List<string>();
+                var olderMatchResults = new List<string>();
+
+                // Track match intervals for seasonality analysis
+                var matchDates = new List<DateTime>();
+
+                // Track goal timing patterns
+                int earlyGoals = 0, lateGoals = 0, totalGoalsWithTiming = 0;
+
+                // Order by date for proper trend analysis
+                var orderedMatches = headToHeadMatches
+                    .OrderByDescending(m => ParseMatchDate(m.Time))
+                    .ToList();
+
+                foreach (var match in orderedMatches)
                 {
                     if (match.Result?.Home == null || match.Result?.Away == null)
                         continue;
@@ -1827,30 +2002,160 @@ namespace fredapi.SportRadarService.Transformers
                     bool isHomeTeam = IsHomeTeamInMatch(match, homeTeamName, homeTeamId);
                     int homeGoals = match.Result.Home ?? 0;
                     int awayGoals = match.Result.Away ?? 0;
+                    string matchResult;
+
+                    // Record match date for interval analysis
+                    DateTime matchDate = ParseMatchDate(match.Time);
+                    if (matchDate != DateTime.MinValue)
+                    {
+                        matchDates.Add(matchDate);
+                    }
+
+                    // Calculate total goals in this match
+                    int totalGoals = homeGoals + awayGoals;
 
                     if (isHomeTeam)
                     {
                         // Home team perspective
-                        if (homeGoals > awayGoals) wins++;
-                        else if (homeGoals < awayGoals) losses++;
-                        else draws++;
+                        if (homeGoals > awayGoals)
+                        {
+                            wins++;
+                            homeWins++;
+                            matchResult = "W";
+
+                            // Update win streak
+                            currentWinStreak++;
+                            maxWinStreak = Math.Max(currentWinStreak, maxWinStreak);
+                            currentDrawStreak = 0;
+                            currentUnbeatenStreak++;
+                            maxUnbeatenStreak = Math.Max(currentUnbeatenStreak, maxUnbeatenStreak);
+                        }
+                        else if (homeGoals < awayGoals)
+                        {
+                            losses++;
+                            matchResult = "L";
+                            currentWinStreak = 0;
+                            currentDrawStreak = 0;
+                            currentUnbeatenStreak = 0;
+                        }
+                        else
+                        {
+                            draws++;
+                            matchResult = "D";
+                            currentWinStreak = 0;
+                            currentDrawStreak++;
+                            maxDrawStreak = Math.Max(currentDrawStreak, maxDrawStreak);
+                            currentUnbeatenStreak++;
+                            maxUnbeatenStreak = Math.Max(currentUnbeatenStreak, maxUnbeatenStreak);
+                        }
 
                         goalsScored += homeGoals;
                         goalsConceded += awayGoals;
+                        homeGoalsScored += homeGoals;
+                        homeGoalsConceded += awayGoals;
+
+                        // Track clean sheets
+                        if (awayGoals == 0)
+                        {
+                            totalCleanSheets++;
+                            homeCleanSheets++;
+                        }
                     }
                     else
                     {
                         // Away team perspective
-                        if (awayGoals > homeGoals) wins++;
-                        else if (awayGoals < homeGoals) losses++;
-                        else draws++;
+                        if (awayGoals > homeGoals)
+                        {
+                            wins++;
+                            awayWins++;
+                            matchResult = "W";
+
+                            // Update win streak
+                            currentWinStreak++;
+                            maxWinStreak = Math.Max(currentWinStreak, maxWinStreak);
+                            currentDrawStreak = 0;
+                            currentUnbeatenStreak++;
+                            maxUnbeatenStreak = Math.Max(currentUnbeatenStreak, maxUnbeatenStreak);
+                        }
+                        else if (awayGoals < homeGoals)
+                        {
+                            losses++;
+                            matchResult = "L";
+                            currentWinStreak = 0;
+                            currentDrawStreak = 0;
+                            currentUnbeatenStreak = 0;
+                        }
+                        else
+                        {
+                            draws++;
+                            matchResult = "D";
+                            currentWinStreak = 0;
+                            currentDrawStreak++;
+                            maxDrawStreak = Math.Max(currentDrawStreak, maxDrawStreak);
+                            currentUnbeatenStreak++;
+                            maxUnbeatenStreak = Math.Max(currentUnbeatenStreak, maxUnbeatenStreak);
+                        }
 
                         goalsScored += awayGoals;
                         goalsConceded += homeGoals;
+                        awayGoalsScored += awayGoals;
+                        awayGoalsConceded += homeGoals;
+
+                        // Track clean sheets
+                        if (homeGoals == 0)
+                        {
+                            totalCleanSheets++;
+                            awayCleanSheets++;
+                        }
                     }
 
+                    // Track goal timing patterns if available
+                    if (match.Result?.Period != null)
+                    {
+                        var period = match.Result.Period.ToLower();
+                        if (period.Contains("1st") || period.Contains("first") || period.Contains("early"))
+                        {
+                            earlyGoals++;
+                            totalGoalsWithTiming++;
+                        }
+                        else if (period.Contains("2nd") || period.Contains("second") || period.Contains("late"))
+                        {
+                            lateGoals++;
+                            totalGoalsWithTiming++;
+                        }
+                    }
+
+                    // Track BTTS
+                    if (homeGoals > 0 && awayGoals > 0)
+                    {
+                        matchesWithBtts++;
+                    }
+
+                    // Track over/under
+                    if (totalGoals > 2.5)
+                    {
+                        matchesOver25++;
+                    }
+
+                    if (totalGoals > 3.5)
+                    {
+                        matchesOver35++;
+                    }
+
+                    // Track form for trend analysis
+                    if (recentResults.Count < 3)
+                    {
+                        recentMatchResults.Add(matchResult);
+                    }
+                    else
+                    {
+                        olderMatchResults.Add(matchResult);
+                    }
+
+                    // Store last result for streak analysis
+                    lastResult = matchResult;
+
                     // Add to recent matches with better date formatting
-                    DateTime matchDate = ParseMatchDate(match.Time);
                     if (matchDate != DateTime.MinValue)
                     {
                         var homeAbbr = GetTeamAbbreviation(match.Teams.Home);
@@ -1864,15 +2169,180 @@ namespace fredapi.SportRadarService.Transformers
                     }
                 }
 
+                // Calculate form trend (comparing recent to older results)
+                string formTrend = "neutral";
+                if (recentMatchResults.Count > 0 && olderMatchResults.Count > 0)
+                {
+                    double recentPoints = recentMatchResults.Sum(r => r == "W" ? 3 : (r == "D" ? 1 : 0)) /
+                                          (double)recentMatchResults.Count;
+                    double olderPoints = olderMatchResults.Sum(r => r == "W" ? 3 : (r == "D" ? 1 : 0)) /
+                                         (double)olderMatchResults.Count;
+
+                    // Compare recent to older performance
+                    if (recentPoints > olderPoints + 0.5)
+                    {
+                        formTrend = "improving";
+                    }
+                    else if (recentPoints < olderPoints - 0.5)
+                    {
+                        formTrend = "declining";
+                    }
+                }
+
+                // Calculate H2H dominance (-1 to 1 scale)
+                double h2hDominance = 0;
+                double recentH2hDominance = 0;
+                int totalMatches = wins + draws + losses;
+                if (totalMatches > 0)
+                {
+                    // Scale from -1 (away dominates) to 1 (home dominates)
+                    h2hDominance = (wins - losses) / (double)totalMatches;
+                }
+
+                // Calculate recent H2H dominance from just the most recent 3 matches
+                if (recentMatchResults.Count > 0)
+                {
+                    int recentWins = recentMatchResults.Count(r => r == "W");
+                    int recentLosses = recentMatchResults.Count(r => r == "L");
+                    recentH2hDominance = (recentWins - recentLosses) / (double)recentMatchResults.Count;
+                }
+
+                // Calculate average match interval
+                double avgMatchInterval = 0;
+                if (matchDates.Count > 1)
+                {
+                    matchDates = matchDates.OrderBy(d => d).ToList();
+                    var intervals = new List<double>();
+
+                    for (int i = 1; i < matchDates.Count; i++)
+                    {
+                        intervals.Add((matchDates[i] - matchDates[i - 1]).TotalDays);
+                    }
+
+                    avgMatchInterval = intervals.Average();
+                }
+
+                // Determine seasonality pattern
+                string seasonality = "consistent";
+                if (recentMatchResults.Count >= 2 && olderMatchResults.Count >= 2)
+                {
+                    var recentWinRate = recentMatchResults.Count(r => r == "W") / (double)recentMatchResults.Count;
+                    var olderWinRate = olderMatchResults.Count(r => r == "W") / (double)olderMatchResults.Count;
+
+                    if (Math.Abs(recentWinRate - olderWinRate) > 0.2)
+                    {
+                        seasonality = recentWinRate > olderWinRate ? "improving" : "declining";
+                    }
+                }
+
+                // Determine rivalry intensity based on goals
+                string rivalryIntensity = "medium";
+                if (totalMatches > 0)
+                {
+                    double goalsPerMatch = (goalsScored + goalsConceded) / (double)totalMatches;
+
+                    if (goalsPerMatch > 3.5)
+                    {
+                        rivalryIntensity = "high";
+                    }
+                    else if (goalsPerMatch < 2.0)
+                    {
+                        rivalryIntensity = "low";
+                    }
+                }
+
+                // Determine scoring pattern
+                string scoringPattern = "balanced";
+                if (totalGoalsWithTiming > 0)
+                {
+                    double earlyRatio = earlyGoals / (double)totalGoalsWithTiming;
+                    double lateRatio = lateGoals / (double)totalGoalsWithTiming;
+
+                    if (earlyRatio > 0.65)
+                    {
+                        scoringPattern = "early";
+                    }
+                    else if (lateRatio > 0.65)
+                    {
+                        scoringPattern = "late";
+                    }
+                    else if (Math.Abs(earlyRatio - lateRatio) < 0.2)
+                    {
+                        scoringPattern = "consistent";
+                    }
+                    else
+                    {
+                        scoringPattern = "volatile";
+                    }
+                }
+
+                // Calculate predictability score
+                double predictability = 0.5;
+                if (totalMatches > 2)
+                {
+                    // Higher predictability when one team dominates or results are consistent
+                    double resultVariance = Math.Min(Math.Abs(h2hDominance), 0.8);
+                    double consistencyFactor = Math.Max(0.5 - (draws / (double)totalMatches), 0);
+
+                    predictability = 0.5 + (resultVariance * 0.25) + (consistencyFactor * 0.25);
+                    predictability = Math.Min(Math.Max(predictability, 0.1), 0.9);
+                }
+
                 return new HeadToHeadData
                 {
+                    // Basic stats
                     Matches = headToHeadMatches.Count,
                     Wins = wins,
                     Draws = draws,
                     Losses = losses,
                     GoalsScored = goalsScored,
                     GoalsConceded = goalsConceded,
-                    RecentMatches = recentResults.OrderByDescending(r => r.Date).Take(5).ToList()
+                    RecentMatches = recentResults.OrderByDescending(r => r.Date).Take(5).ToList(),
+
+                    // Venue-specific stats
+                    HomeWins = homeWins,
+                    AwayWins = awayWins,
+                    HomeGoalsScored = homeGoalsScored,
+                    AwayGoalsScored = awayGoalsScored,
+                    HomeGoalsConceded = homeGoalsConceded,
+                    AwayGoalsConceded = awayGoalsConceded,
+
+                    // Scoring patterns
+                    AvgGoalsPerMatch = totalMatches > 0
+                        ? Math.Round((double)(goalsScored + goalsConceded) / totalMatches, 2)
+                        : 0,
+                    AvgHomeGoalsPerMatch = homeWins + draws > 0
+                        ? Math.Round((double)homeGoalsScored / (homeWins + draws), 2)
+                        : 0,
+                    AvgAwayGoalsPerMatch = awayWins + draws > 0
+                        ? Math.Round((double)awayGoalsScored / (awayWins + draws), 2)
+                        : 0,
+                    BttsRate = totalMatches > 0 ? Math.Round((double)matchesWithBtts / totalMatches * 100, 0) : 0,
+                    Over25GoalsRate = totalMatches > 0 ? Math.Round((double)matchesOver25 / totalMatches * 100, 0) : 0,
+                    Over35GoalsRate = totalMatches > 0 ? Math.Round((double)matchesOver35 / totalMatches * 100, 0) : 0,
+                    CleanSheetRate =
+                        totalMatches > 0 ? Math.Round((double)totalCleanSheets / totalMatches * 100, 0) : 0,
+                    HomeCleanSheetRate = (homeWins + draws) > 0
+                        ? Math.Round((double)homeCleanSheets / (homeWins + draws) * 100, 0)
+                        : 0,
+                    AwayCleanSheetRate = (awayWins + draws) > 0
+                        ? Math.Round((double)awayCleanSheets / (awayWins + draws) * 100, 0)
+                        : 0,
+
+                    // Trend analysis
+                    FormTrend = formTrend,
+                    H2HDominance = Math.Round(h2hDominance, 2),
+                    RecentH2HDominance = Math.Round(recentH2hDominance, 2),
+                    WinStreak = maxWinStreak,
+                    DrawStreak = maxDrawStreak,
+                    UnbeatenStreak = maxUnbeatenStreak,
+
+                    // Context patterns
+                    AvgMatchInterval = Math.Round(avgMatchInterval, 0),
+                    Seasonality = seasonality,
+                    RivalryIntensity = rivalryIntensity,
+                    ScoringPattern = scoringPattern,
+                    Predictability = Math.Round(predictability, 2)
                 };
             }
             catch (Exception ex)
@@ -1976,31 +2446,6 @@ namespace fredapi.SportRadarService.Transformers
                    NormalizedTeamNameMatch(match.Teams.Home.MediumName, homeTeamName);
         }
 
-        // New helper method to check if a match is between two specific teams
-        private bool IsMatchBetweenTeams(Background.HeadToHeadMatch match, string team1Name, string team2Name)
-        {
-            if (match.Teams?.Home == null || match.Teams?.Away == null)
-                return false;
-
-            bool isTeam1Home = StringMatches(match.Teams.Home.Name, team1Name) ||
-                               StringMatches(match.Teams.Home.MediumName, team1Name) ||
-                               ContainsTeamName(match.Teams.Home.Name, team1Name);
-
-            bool isTeam2Away = StringMatches(match.Teams.Away.Name, team2Name) ||
-                               StringMatches(match.Teams.Away.MediumName, team2Name) ||
-                               ContainsTeamName(match.Teams.Away.Name, team2Name);
-
-            bool isTeam1Away = StringMatches(match.Teams.Away.Name, team1Name) ||
-                               StringMatches(match.Teams.Away.MediumName, team1Name) ||
-                               ContainsTeamName(match.Teams.Away.Name, team1Name);
-
-            bool isTeam2Home = StringMatches(match.Teams.Home.Name, team2Name) ||
-                               StringMatches(match.Teams.Home.MediumName, team2Name) ||
-                               ContainsTeamName(match.Teams.Home.Name, team2Name);
-
-            // Either team1 is home and team2 is away OR team1 is away and team2 is home
-            return (isTeam1Home && isTeam2Away) || (isTeam1Away && isTeam2Home);
-        }
 
         /// <summary>
         /// Gets a team abbreviation, with fallback to name truncation
@@ -2066,12 +2511,7 @@ namespace fredapi.SportRadarService.Transformers
 
             return cornerStats;
         }
-
-        private bool IsStreak(string form)
-        {
-            return form == "WWW" || form == "LLL";
-        }
-
+        
         /// <summary>
         /// Extracts average corner count from match data
         /// </summary>
@@ -2217,9 +2657,9 @@ namespace fredapi.SportRadarService.Transformers
         }
 
         /// <summary>
-        /// Calculates confidence score based on multiple factors
+        /// Calculates confidence score based on multiple factors, including enhanced metrics
         /// </summary>
-        private int CalculateConfidenceScore(Background.EnrichedSportMatch sportMatch, TeamData homeTeam,
+        private int CalculateConfidenceScore(EnrichedSportMatch sportMatch, TeamData homeTeam,
             TeamData awayTeam, MatchOdds odds)
         {
             try
@@ -2236,6 +2676,22 @@ namespace fredapi.SportRadarService.Transformers
                     formDiff = Math.Abs(homeFormValue - awayFormValue);
                     score += formDiff * 0.1;
                 }
+
+                // Consider form consistency as a factor (more consistent teams are more predictable)
+                double consistencyFactor = (homeTeam.FormConsistency + awayTeam.FormConsistency) / 2;
+                score += consistencyFactor * 5; // Scale impact: max +5 points for high consistency
+
+                // Performance rating difference (significant impact)
+                if (homeTeam.PerformanceRating > 0 && awayTeam.PerformanceRating > 0)
+                {
+                    double ratingDiff = Math.Abs(homeTeam.PerformanceRating - awayTeam.PerformanceRating) / 100.0;
+                    score += ratingDiff * 10; // Scale impact: up to +10 points for large differences
+                }
+
+                // Offensive/defensive efficiency difference (moderate impact)
+                double attackingDiff = Math.Abs(homeTeam.OffensiveEfficiency - awayTeam.OffensiveEfficiency);
+                double defensiveDiff = Math.Abs(homeTeam.DefensiveEfficiency - awayTeam.DefensiveEfficiency);
+                score += (attackingDiff + defensiveDiff) * 3; // Scale impact: up to +12 points combined
 
                 // Odds difference: significant impact
                 double oddsDiff = 0;
@@ -2254,15 +2710,30 @@ namespace fredapi.SportRadarService.Transformers
                     score += Math.Min(positionGap, 5); // Cap at 5 points
                 }
 
-                // Previous head-to-head results influence confidence
+                // Previous head-to-head results - enhanced to use more metrics
                 var h2h = CreateHeadToHeadData(sportMatch);
                 if (h2h.Matches > 0)
                 {
-                    // A team with dominant H2H gets a slight boost
-                    if (h2h.Wins > 2 * h2h.Losses)
+                    // More strongly factor in H2H dominance
+                    score += h2h.H2HDominance * 5; // Scale -5 to +5 points based on dominance
+
+                    // Recent H2H results are more important than overall history
+                    score += h2h.RecentH2HDominance * 7; // Scale -7 to +7 points based on recent dominance
+
+                    // Consider predictability of H2H matchups
+                    score += (h2h.Predictability - 0.5) * 10; // Scale -5 to +5 points
+
+                    // Account for rivalry intensity - closer rivalries can be less predictable
+                    if (h2h.RivalryIntensity == "high")
+                        score -= 2; // High intensity matches are less predictable
+                    else if (h2h.RivalryIntensity == "low")
+                        score += 2; // Low intensity matches follow form more often
+
+                    // Factor in streaks - teams on streaks tend to continue them
+                    if (h2h.WinStreak >= 3)
                         score += 3;
-                    else if (h2h.Losses > 2 * h2h.Wins)
-                        score -= 3;
+                    else if (h2h.UnbeatenStreak >= 4)
+                        score += 2;
                 }
 
                 // Consider recent form streaks
@@ -2281,6 +2752,12 @@ namespace fredapi.SportRadarService.Transformers
                     if (hasWinStreak) score += 3;
                     if (hasLossStreak) score -= 3;
                 }
+
+                // Factor in momentum (positive momentum increases predictability)
+                double homeMomentum = homeTeam.Momentum / 100.0; // Scale to -1 to 1
+                double awayMomentum = awayTeam.Momentum / 100.0; // Scale to -1 to 1
+                double momentumDiff = Math.Abs(homeMomentum - awayMomentum);
+                score += momentumDiff * 5; // Scale impact: up to +5 points for large momentum differences
 
                 // Factor in scoring and defensive stats
                 double goalDiff = Math.Abs(homeTeam.AvgHomeGoals - awayTeam.AvgAwayGoals);
@@ -2318,55 +2795,80 @@ namespace fredapi.SportRadarService.Transformers
         }
 
         /// <summary>
-        /// Calculates expected goals based on team offensive and defensive strength
+        /// Calculates expected goals using enhanced metrics from recent analysis
         /// </summary>
-        private double CalculateExpectedGoals(Background.EnrichedSportMatch sportMatch, TeamData homeTeam,
-            TeamData awayTeam)
+        private double CalculateExpectedGoals(EnrichedSportMatch sportMatch, TeamData homeTeam, TeamData awayTeam)
         {
             try
             {
                 // Base on actual scoring averages
                 double homeScoring = homeTeam.HomeAverageGoalsScored;
                 double awayScoring = awayTeam.AwayAverageGoalsScored;
-                double homeDefence = 1 / Math.Max(homeTeam.HomeAverageGoalsConceded, 0.01);
-                double awayDefence = 1 / Math.Max(awayTeam.AwayAverageGoalsConceded, 0.01);
 
-                // Normalize defense factors
-                homeDefence = Math.Min(Math.Max(homeDefence, 0.5), 1.5);
-                awayDefence = Math.Min(Math.Max(awayDefence, 0.5), 1.5);
+                // Factor in offensive and defensive efficiency
+                double homeAttackingStrength = homeTeam.OffensiveEfficiency;
+                double awayAttackingStrength = awayTeam.OffensiveEfficiency;
+                double homeDefensiveStrength = homeTeam.DefensiveEfficiency;
+                double awayDefensiveStrength = awayTeam.DefensiveEfficiency;
 
-                // Adjust for form
-                double homeForm = CalculateFormNumeric(homeTeam.Form);
-                double awayForm = CalculateFormNumeric(awayTeam.Form);
+                // Get head-to-head data for adjustments
+                var h2h = CreateHeadToHeadData(sportMatch);
+                double h2hFactor = 1.0;
 
-                // Expected goals with adjustments
-                double homeExpected = homeScoring * (2 - awayDefence) * (1 + (homeForm - 0.5) * 0.2);
-                double awayExpected = awayScoring * (2 - homeDefence) * (1 + (awayForm - 0.5) * 0.2);
+                // Adjust expectations based on H2H history if available
+                if (h2h.Matches > 2)
+                {
+                    // Average goals in this matchup compared to teams' averages
+                    double expectedAvg = (homeTeam.AvgHomeGoals + awayTeam.AvgAwayGoals) / 2;
+                    double actualAvg = h2h.AvgGoalsPerMatch;
+
+                    // Calculate adjustment factor (how much H2H deviates from expected)
+                    h2hFactor = expectedAvg > 0 ? actualAvg / expectedAvg : 1.0;
+
+                    // Limit extreme adjustments
+                    h2hFactor = Math.Min(Math.Max(h2hFactor, 0.7), 1.3);
+                }
+
+                // Expected goals with all factors
+                double homeExpected = homeScoring * homeAttackingStrength * (2 - awayDefensiveStrength) * 0.5;
+                double awayExpected = awayScoring * awayAttackingStrength * (2 - homeDefensiveStrength) * 0.5;
+
+                // Apply H2H adjustment
+                double totalExpected = (homeExpected + awayExpected) * h2hFactor;
+
+                // Account for form and momentum
+                double homeFormFactor = homeTeam.FormStrength / 100.0;
+                double awayFormFactor = awayTeam.FormStrength / 100.0;
+                double homeMomentum = (homeTeam.Momentum / 100.0) * 0.1; // Scale to -0.1 to 0.1
+                double awayMomentum = (awayTeam.Momentum / 100.0) * 0.1; // Scale to -0.1 to 0.1
+
+                // Apply form and momentum adjustments
+                homeExpected *= (0.9 + homeFormFactor * 0.2 + homeMomentum);
+                awayExpected *= (0.9 + awayFormFactor * 0.2 + awayMomentum);
+
+                // Recalculate total with form/momentum adjustments
+                totalExpected = homeExpected + awayExpected;
 
                 // Account for league average if available
                 double leagueAvgGoals = CalculateLeagueAvgGoals(sportMatch);
                 if (leagueAvgGoals > 0)
                 {
-                    // Adjust towards league average
-                    homeExpected = (homeExpected * 0.7) + (leagueAvgGoals * 0.5 * 0.3);
-                    awayExpected = (awayExpected * 0.7) + (leagueAvgGoals * 0.5 * 0.3);
+                    // Blend with league average (70% prediction, 30% league average)
+                    totalExpected = (totalExpected * 0.7) + (leagueAvgGoals * 0.3);
                 }
-
-                // Total expected
-                double totalExpected = homeExpected + awayExpected;
 
                 // Sanity check: don't return unrealistic values
                 if (totalExpected > 6)
                     totalExpected = 6;
                 if (totalExpected < 0.5)
-                    totalExpected = 0;
+                    totalExpected = 0.5;
 
                 return Math.Round(totalExpected, 2);
             }
             catch (Exception ex)
             {
                 _logger.LogError(ex, $"Error calculating expected goals for match {sportMatch?.MatchId}: {ex.Message}");
-                return 0;
+                return 2.5; // Return reasonable default if calculation fails
             }
         }
 
@@ -2489,10 +2991,11 @@ namespace fredapi.SportRadarService.Transformers
             }
         }
 
+
         /// <summary>
-        /// Generates prediction reasons based on match data
+        /// Generates prediction reasons based on match data with enhanced metrics
         /// </summary>
-        private List<string> GeneratePredictionReasons(Background.EnrichedSportMatch sportMatch, TeamData homeTeam,
+        private List<string> GeneratePredictionReasons(EnrichedSportMatch sportMatch, TeamData homeTeam,
             TeamData awayTeam, MatchOdds odds, double expectedGoals)
         {
             var reasons = new List<string>();
@@ -2502,27 +3005,103 @@ namespace fredapi.SportRadarService.Transformers
                 // Add form-based reason
                 if (!string.IsNullOrEmpty(homeTeam.Form))
                 {
-                    reasons.Add($"{homeTeam.Name} form: {homeTeam.Form}");
+                    reasons.Add($"{homeTeam.Name} form: {homeTeam.Form} (consistency: {homeTeam.FormConsistency:F2})");
                 }
 
                 if (!string.IsNullOrEmpty(awayTeam.Form))
                 {
-                    reasons.Add($"{awayTeam.Name} form: {awayTeam.Form}");
+                    reasons.Add($"{awayTeam.Name} form: {awayTeam.Form} (consistency: {awayTeam.FormConsistency:F2})");
+                }
+
+                // Add tier comparison
+                if (!string.IsNullOrEmpty(homeTeam.PositionTier) && !string.IsNullOrEmpty(awayTeam.PositionTier))
+                {
+                    reasons.Add(
+                        $"League position: {homeTeam.Name} ({homeTeam.PositionTier}, {homeTeam.Position}) vs {awayTeam.Name} ({awayTeam.PositionTier}, {awayTeam.Position})");
+                }
+
+                // Add offensive and defensive efficiency comparison
+                var offensiveAdvantage = homeTeam.OffensiveEfficiency > awayTeam.OffensiveEfficiency
+                    ? homeTeam.Name
+                    : awayTeam.Name;
+                var defensiveAdvantage = homeTeam.DefensiveEfficiency > awayTeam.DefensiveEfficiency
+                    ? homeTeam.Name
+                    : awayTeam.Name;
+
+                // Only add if the differences are meaningful
+                if (Math.Abs(homeTeam.OffensiveEfficiency - awayTeam.OffensiveEfficiency) > 0.3)
+                {
+                    reasons.Add(
+                        $"Attacking edge: {offensiveAdvantage} ({Math.Max(homeTeam.OffensiveEfficiency, awayTeam.OffensiveEfficiency):F2} vs {Math.Min(homeTeam.OffensiveEfficiency, awayTeam.OffensiveEfficiency):F2})");
+                }
+
+                if (Math.Abs(homeTeam.DefensiveEfficiency - awayTeam.DefensiveEfficiency) > 0.3)
+                {
+                    reasons.Add(
+                        $"Defensive edge: {defensiveAdvantage} ({Math.Max(homeTeam.DefensiveEfficiency, awayTeam.DefensiveEfficiency):F2} vs {Math.Min(homeTeam.DefensiveEfficiency, awayTeam.DefensiveEfficiency):F2})");
+                }
+
+                // Add performance rating comparison
+                if (homeTeam.PerformanceRating > 0 && awayTeam.PerformanceRating > 0)
+                {
+                    double ratingDiff = Math.Abs(homeTeam.PerformanceRating - awayTeam.PerformanceRating);
+                    string teamAdvantage = homeTeam.PerformanceRating > awayTeam.PerformanceRating
+                        ? homeTeam.Name
+                        : awayTeam.Name;
+                    string ratingDescription =
+                        ratingDiff > 20 ? "significant" : (ratingDiff > 10 ? "moderate" : "slight");
+
+                    reasons.Add(
+                        $"Performance rating: {teamAdvantage} has {ratingDescription} advantage ({homeTeam.PerformanceRating:F0} vs {awayTeam.PerformanceRating:F0})");
                 }
 
                 // Add goal expectation reason
                 string scoringPotential = expectedGoals > 2.5 ? "High" : (expectedGoals > 1.5 ? "Moderate" : "Low");
                 reasons.Add(
-                    $"{scoringPotential}-scoring potential: {homeTeam.Name} ({homeTeam.HomeAverageGoalsScored.ToString("0.00")} home) vs {awayTeam.Name} ({awayTeam.AwayAverageGoalsScored.ToString("0.00")} away)");
+                    $"{scoringPotential}-scoring potential: {homeTeam.Name} ({homeTeam.HomeAverageGoalsScored:F2} home) vs {awayTeam.Name} ({awayTeam.AwayAverageGoalsScored:F2} away)");
 
-                // Add head-to-head reason if available
+                // Add head-to-head reason with enhanced metrics
                 var h2h = CreateHeadToHeadData(sportMatch);
                 if (h2h.Matches > 0)
                 {
-                    double avgGoals = SafeDivide(h2h.GoalsScored + h2h.GoalsConceded, h2h.Matches);
-                    string h2hScoring = avgGoals > 2.5 ? "High" : (avgGoals > 1.5 ? "Moderate" : "Low");
-                    reasons.Add(
-                        $"H2H: {h2hScoring}-scoring fixtures averaging {avgGoals.ToString("0.0")} goals per game");
+                    // Create a more detailed H2H reason using the enhanced metrics
+                    var h2hReasonBuilder =
+                        new StringBuilder(
+                            $"H2H: {h2h.Matches} previous matches with {h2h.AvgGoalsPerMatch:F1} goals/game");
+
+                    // Add BTTS rate if significant
+                    if (h2h.BttsRate > 0)
+                    {
+                        h2hReasonBuilder.Append($", {h2h.BttsRate}% BTTS");
+                    }
+
+                    // Add trend information if not neutral
+                    if (h2h.FormTrend != "neutral")
+                    {
+                        h2hReasonBuilder.Append($", {h2h.FormTrend} trend");
+                    }
+
+                    // Add dominance information if significant
+                    if (Math.Abs(h2h.H2HDominance) > 0.3)
+                    {
+                        string dominantTeam = h2h.H2HDominance > 0 ? homeTeam.Name : awayTeam.Name;
+                        h2hReasonBuilder.Append($", {dominantTeam} historically dominant");
+                    }
+
+                    // Add scoring pattern if it's distinctive
+                    if (h2h.ScoringPattern != "balanced" && h2h.ScoringPattern != "consistent")
+                    {
+                        h2hReasonBuilder.Append($", {h2h.ScoringPattern} scoring pattern");
+                    }
+
+                    // Add unbeaten streak if significant
+                    if (h2h.UnbeatenStreak >= 3)
+                    {
+                        string dominantTeam = h2h.H2HDominance > 0 ? homeTeam.Name : awayTeam.Name;
+                        h2hReasonBuilder.Append($", {dominantTeam} on {h2h.UnbeatenStreak}-match unbeaten streak");
+                    }
+
+                    reasons.Add(h2hReasonBuilder.ToString());
                 }
 
                 // Add odds-based reason
@@ -2538,17 +3117,40 @@ namespace fredapi.SportRadarService.Transformers
                     if (favorite != "draw")
                     {
                         reasons.Add(
-                            $"{favoriteStrength} favorite: {favoriteTeam} (H: {odds.HomeWin.ToString("0.00")}, A: {odds.AwayWin.ToString("0.00")})");
+                            $"{favoriteStrength} favorite: {favoriteTeam} (H: {odds.HomeWin:F2}, A: {odds.AwayWin:F2})");
                     }
                     else
                     {
                         reasons.Add(
-                            $"Draw likely: Tight odds (H: {odds.HomeWin.ToString("0.00")}, A: {odds.AwayWin.ToString("0.00")})");
+                            $"Draw likely: Tight odds (H: {odds.HomeWin:F2}, A: {odds.AwayWin:F2})");
                     }
                 }
 
-                // Ensure we have reasonable number of reasons
-                while (reasons.Count > 5)
+                // Add expected points comparison
+                if (homeTeam.ExpectedPoints > 0 && awayTeam.ExpectedPoints > 0)
+                {
+                    string pointsComparison =
+                        $"Expected points: {homeTeam.Name} ({homeTeam.ExpectedPoints:F2}) vs {awayTeam.Name} ({awayTeam.ExpectedPoints:F2})";
+                    reasons.Add(pointsComparison);
+                }
+
+                // Add momentum factor if significant
+                if (Math.Abs(homeTeam.Momentum) > 20 || Math.Abs(awayTeam.Momentum) > 20)
+                {
+                    string teamWithMomentum = Math.Abs(homeTeam.Momentum) > Math.Abs(awayTeam.Momentum)
+                        ? homeTeam.Name
+                        : awayTeam.Name;
+                    double momentum = Math.Max(Math.Abs(homeTeam.Momentum), Math.Abs(awayTeam.Momentum));
+                    string direction = (teamWithMomentum == homeTeam.Name && homeTeam.Momentum > 0) ||
+                                       (teamWithMomentum == awayTeam.Name && awayTeam.Momentum > 0)
+                        ? "positive"
+                        : "negative";
+
+                    reasons.Add($"Momentum: {teamWithMomentum} has {direction} momentum ({momentum:F1})");
+                }
+
+                // Ensure we have a reasonable number of reasons (6-8 is a good range)
+                while (reasons.Count > 8)
                 {
                     reasons.RemoveAt(reasons.Count - 1); // Remove the last reason
                 }
@@ -2567,7 +3169,6 @@ namespace fredapi.SportRadarService.Transformers
 
             return reasons;
         }
-
 
         /// <summary>
         /// Updates metadata for the league this match belongs to
@@ -2655,12 +3256,15 @@ namespace fredapi.SportRadarService.Transformers
         {
             if (string.IsNullOrEmpty(form))
             {
-                return 50.0; // Neutral rating with no form data
+                return 0.0; // Neutral rating with no form data
             }
 
             double score = 50.0; // Start with neutral score
             double weight = 1.0;
             double totalWeight = 0;
+            double streakBonus = 0;
+            string lastResult = null;
+            int currentStreak = 1;
 
             // Process each match result with exponential decay of importance
             for (int i = 0; i < form.Length; i++)
@@ -2678,18 +3282,35 @@ namespace fredapi.SportRadarService.Transformers
                         continue; // Skip invalid characters
                 }
 
+                // Track streaks - consecutive same results
+                if (lastResult != null && lastResult[0] == result)
+                {
+                    currentStreak++;
+                    // Add increasing streak bonus for consecutive same results
+                    if (result == 'W')
+                        streakBonus += 2.0 * Math.Min(currentStreak, 3); // Cap bonus at 3 match streak
+                    else if (result == 'L')
+                        streakBonus -= 1.5 * Math.Min(currentStreak, 3); // Negative impact for losing streaks
+                }
+                else
+                {
+                    currentStreak = 1;
+                }
+
+                lastResult = result.ToString();
+
                 // Apply weighted adjustment
                 score += adjustment * weight;
                 totalWeight += weight;
                 weight *= 0.7; // More aggressive decay for older matches
             }
 
-            // Normalize based on total weight
+            // Normalize based on total weight and add streak bonus
             if (totalWeight > 0)
             {
-                double normalizedScore = 50.0 + ((score - 50.0) / totalWeight * 0.8);
+                double normalizedScore = 50.0 + ((score - 50.0) / totalWeight * 0.8) + streakBonus;
 
-                // Add some randomness to avoid identical values for common patterns
+                // Add small randomness to avoid identical values for common patterns
                 Random random = new Random(form.GetHashCode());
                 normalizedScore += random.NextDouble() * 4 - 2; // +/- 2 points random variation
 
@@ -2698,7 +3319,7 @@ namespace fredapi.SportRadarService.Transformers
             }
 
             // Default return
-            return 50.0;
+            return 0.0;
         }
 
         /// <summary>
@@ -2714,6 +3335,54 @@ namespace fredapi.SportRadarService.Transformers
             }
 
             return (double)teamStats.Conceding.CleanSheets.Total / teamStats.TotalMatches.Total * 100;
+        }
+
+        private (int position, string positionTier, double relativePosStrength) GetEnhancedPositionInfo(
+            Background.EnrichedSportMatch sportMatch, string teamName)
+        {
+            int position = GetTeamPosition(sportMatch, teamName);
+            string positionTier = "mid-table";
+            double relativePosStrength = 0.5; // Default neutral value
+
+            if (sportMatch.TeamTableSlice?.TableRows == null || !sportMatch.TeamTableSlice.TableRows.Any())
+            {
+                return (position, positionTier, relativePosStrength);
+            }
+
+            int totalTeams = sportMatch.TeamTableSlice.TableRows.Count;
+
+            if (totalTeams > 0 && position > 0)
+            {
+                // Calculate relative position (0 to 1 scale, where 0 is best, 1 is worst)
+                double relativePosition = (position - 1) / (double)Math.Max(1, totalTeams - 1);
+
+                // Convert to strength (1 is best, 0 is worst)
+                relativePosStrength = 1 - relativePosition;
+
+                // Determine tier based on position
+                if (position <= Math.Ceiling(totalTeams * 0.2))
+                {
+                    positionTier = "top";
+                }
+                else if (position <= Math.Ceiling(totalTeams * 0.4))
+                {
+                    positionTier = "upper-mid";
+                }
+                else if (position <= Math.Ceiling(totalTeams * 0.6))
+                {
+                    positionTier = "mid-table";
+                }
+                else if (position <= Math.Ceiling(totalTeams * 0.8))
+                {
+                    positionTier = "lower-mid";
+                }
+                else
+                {
+                    positionTier = "relegation-zone";
+                }
+            }
+
+            return (position, positionTier, relativePosStrength);
         }
 
         /// <summary>
@@ -2844,70 +3513,6 @@ namespace fredapi.SportRadarService.Transformers
                 return null;
 
             return Math.Max(0, teamStats.TotalMatches.Away - teamStats.TotalWins.Away - awayDraws.Value);
-        }
-
-        /// <summary>
-        /// Calculates BTTS (Both Teams To Score) rate from team stats
-        /// </summary>
-        private double CalculateBttsRate(TeamStats teamStats)
-        {
-            // Both Teams To Score rate
-            if (teamStats == null || teamStats.TotalMatches == null ||
-                teamStats.TotalMatches.Total == 0)
-            {
-                return 0;
-            }
-
-            // If we have BothTeamsScored data
-            if (teamStats.Scoring?.BothTeamsScored != null)
-            {
-                return SafeDivide(teamStats.Scoring.BothTeamsScored.Total, teamStats.TotalMatches.Total) * 100;
-            }
-
-            // Alternative calculation if missing BothTeamsScored
-            double failedToScoreRate = teamStats.Scoring?.FailedToScore != null
-                ? SafeDivide(teamStats.Scoring.FailedToScore.Total, teamStats.TotalMatches.Total)
-                : 0;
-
-            double cleanSheetRate = teamStats.Conceding?.CleanSheets != null
-                ? SafeDivide(teamStats.Conceding.CleanSheets.Total, teamStats.TotalMatches.Total)
-                : 0;
-
-            // BTTS happens when neither team keeps a clean sheet
-            double bttsEstimate = 100 - (failedToScoreRate + cleanSheetRate -
-                                         (failedToScoreRate * cleanSheetRate)) * 100;
-
-            return Math.Min(Math.Max(bttsEstimate, 0), 100);
-        }
-
-        /// <summary>
-        /// Calculates home BTTS rate from team stats
-        /// </summary>
-        private double CalculateHomeBttsRate(TeamStats teamStats)
-        {
-            if (teamStats == null || teamStats.Scoring == null ||
-                teamStats.Scoring.BothTeamsScored == null || teamStats.TotalMatches == null ||
-                teamStats.TotalMatches.Home == 0)
-            {
-                return 0;
-            }
-
-            return SafeDivide(teamStats.Scoring.BothTeamsScored.Home, teamStats.TotalMatches.Home) * 100;
-        }
-
-        /// <summary>
-        /// Calculates away BTTS rate from team stats
-        /// </summary>
-        private double CalculateAwayBttsRate(TeamStats teamStats)
-        {
-            if (teamStats == null || teamStats.Scoring == null ||
-                teamStats.Scoring.BothTeamsScored == null || teamStats.TotalMatches == null ||
-                teamStats.TotalMatches.Away == 0)
-            {
-                return 0;
-            }
-
-            return SafeDivide(teamStats.Scoring.BothTeamsScored.Away, teamStats.TotalMatches.Away) * 100;
         }
 
         /// <summary>
@@ -3826,12 +4431,34 @@ namespace fredapi.SportRadarService.Transformers
 
         [JsonPropertyName("avgHomeGoals")] public double AvgHomeGoals { get; set; }
 
+        // New properties for enhanced team data
+
+        [JsonPropertyName("momentum")] public double Momentum { get; set; }
+
+        [JsonPropertyName("offensiveEfficiency")]
+        public double OffensiveEfficiency { get; set; }
+
+        [JsonPropertyName("defensiveEfficiency")]
+        public double DefensiveEfficiency { get; set; }
+
         [JsonPropertyName("avgAwayGoals")] public double AvgAwayGoals { get; set; }
 
         [JsonPropertyName("avgTotalGoals")] public double AvgTotalGoals { get; set; }
 
         [JsonPropertyName("homeMatchesOver15")]
         public int HomeMatchesOver15 { get; set; }
+
+        [JsonPropertyName("positionTier")] public string PositionTier { get; set; }
+
+        [JsonPropertyName("relativePositionStrength")]
+        public double RelativePositionStrength { get; set; }
+
+        [JsonPropertyName("performanceRating")]
+        public double PerformanceRating { get; set; }
+
+        [JsonPropertyName("formConsistency")] public double FormConsistency { get; set; }
+
+        [JsonPropertyName("expectedPoints")] public double ExpectedPoints { get; set; }
 
         [JsonPropertyName("awayMatchesOver15")]
         public int AwayMatchesOver15 { get; set; }
@@ -3972,6 +4599,72 @@ namespace fredapi.SportRadarService.Transformers
 
     public class HeadToHeadData
     {
+        // Enhanced H2H venue-specific stats
+        [JsonPropertyName("homeWins")] public int HomeWins { get; set; }
+
+        [JsonPropertyName("awayWins")] public int AwayWins { get; set; }
+
+        [JsonPropertyName("homeGoalsScored")] public int HomeGoalsScored { get; set; }
+
+        [JsonPropertyName("awayGoalsScored")] public int AwayGoalsScored { get; set; }
+
+        [JsonPropertyName("homeGoalsConceded")]
+        public int HomeGoalsConceded { get; set; }
+
+        [JsonPropertyName("awayGoalsConceded")]
+        public int AwayGoalsConceded { get; set; }
+
+        // Enhanced H2H scoring patterns
+        [JsonPropertyName("avgGoalsPerMatch")] public double AvgGoalsPerMatch { get; set; }
+
+        [JsonPropertyName("bttsRate")] public double BttsRate { get; set; }
+
+        [JsonPropertyName("avgHomeGoalsPerMatch")]
+        public double AvgHomeGoalsPerMatch { get; set; }
+
+        [JsonPropertyName("avgAwayGoalsPerMatch")]
+        public double AvgAwayGoalsPerMatch { get; set; }
+
+        [JsonPropertyName("over25GoalsRate")] public double Over25GoalsRate { get; set; }
+
+        [JsonPropertyName("over35GoalsRate")] public double Over35GoalsRate { get; set; }
+
+        [JsonPropertyName("cleanSheetRate")] public double CleanSheetRate { get; set; }
+
+        [JsonPropertyName("homeCleanSheetRate")]
+        public double HomeCleanSheetRate { get; set; }
+
+        [JsonPropertyName("awayCleanSheetRate")]
+        public double AwayCleanSheetRate { get; set; }
+
+        // Enhanced H2H trend analysis
+        [JsonPropertyName("formTrend")] public string FormTrend { get; set; }
+
+        [JsonPropertyName("h2hDominance")] public double H2HDominance { get; set; }
+
+        [JsonPropertyName("recentH2HDominance")]
+        public double RecentH2HDominance { get; set; }
+
+        [JsonPropertyName("winStreak")] public int WinStreak { get; set; }
+
+        [JsonPropertyName("drawStreak")] public int DrawStreak { get; set; }
+
+        [JsonPropertyName("unbeatenStreak")] public int UnbeatenStreak { get; set; }
+
+        // Enhanced H2H context patterns
+        [JsonPropertyName("matchInterval")] public double AvgMatchInterval { get; set; } // Average days between matches
+
+        [JsonPropertyName("seasonality")]
+        public string Seasonality { get; set; } // "consistent", "improving", "declining"
+
+        [JsonPropertyName("rivalryIntensity")]
+        public string RivalryIntensity { get; set; } // "high", "medium", "low" based on cards, fouls, etc.
+
+        [JsonPropertyName("scoringPattern")]
+        public string ScoringPattern { get; set; } // "early", "late", "consistent", "volatile"
+
+        [JsonPropertyName("predictability")] public double Predictability { get; set; } // 0-1 
+
         [JsonPropertyName("matches")] public int Matches { get; set; }
 
         [JsonPropertyName("wins")] public int Wins { get; set; }
