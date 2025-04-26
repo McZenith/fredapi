@@ -6,10 +6,8 @@ using fredapi.SportRadarService.TokenService;
 using fredapi.SportRadarService.Transformers;
 using fredapi.Utils;
 using Microsoft.AspNetCore.SignalR;
-using MongoDB.Bson;
 using MongoDB.Driver;
 using Microsoft.Extensions.Caching.Memory;
-using MongoDB.Driver.Linq;
 
 namespace fredapi.SportRadarService.Background;
 
