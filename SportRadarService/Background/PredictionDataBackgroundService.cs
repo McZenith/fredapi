@@ -25,14 +25,10 @@ public class PredictionDataBackgroundService : BackgroundService
     private const string CACHE_KEY_PREDICTION_DATA = "prediction_data";
     private const string CACHE_KEY_MATCH_PREFIX = "prediction_match_";
     private const string CACHE_KEY_UPDATE_LOCK = "prediction_data_update_lock";
-    private const int BATCH_SIZE = 50;
-    private const int TRANSFORM_BATCH_SIZE = 20;
     private const int CONCURRENT_TRANSFORMATIONS = 4;
 
     // Configurable intervals
     private readonly TimeSpan _updateInterval = TimeSpan.FromHours(1);
-    private readonly TimeSpan _dbQueryTimeout = TimeSpan.FromSeconds(30);
-    private readonly TimeSpan _transformTimeout = TimeSpan.FromSeconds(20);
     private readonly TimeSpan _resultProcessingInterval = TimeSpan.FromMinutes(15);
 
     // Semaphore to control concurrent transformations
