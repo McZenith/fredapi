@@ -1,13 +1,10 @@
-using fredapi.Model;
 using Microsoft.AspNetCore.SignalR;
 using Microsoft.Extensions.Caching.Memory;
 using fredapi.SportRadarService.Background.ArbitrageLiveMatchBackgroundService;
-using fredapi.SportRadarService.Background;
-using System.Threading.Tasks;
-using System;
-using System.Collections.Generic;
-using System.Linq;
+using fredapi.SportRadarService.Transformers;
 using fredapi.Utils;
+using Exception = System.Exception;
+
 
 namespace fredapi.SignalR;
 
@@ -29,85 +26,105 @@ public class LiveMatchHub : Hub
         _logger = logger;
     }
 
-    public override async Task OnConnectedAsync()
+public override async Task OnConnectedAsync()
+{
+    try
     {
-        try
+        string connectionId = Context.ConnectionId;
+        _logger.LogDebug("Client connected: {ConnectionId}", connectionId);
+        
+        // Add to connected clients set with thread safety
+        lock (_connectedClients)
         {
-            string connectionId = Context.ConnectionId;
-            _logger.LogDebug("Client connected: {ConnectionId}", connectionId);
+            _connectedClients.Add(connectionId);
+        }
+
+        // Group all tasks to execute them concurrently
+        var tasks = new List<Task>();
+
+        // Use cached data from memory cache instead of static service
+        if (_cache.TryGetValue(_arbitrageMatchesCacheKey, out List<ClientMatch> arbitrageMatches) && 
+            arbitrageMatches?.Any() == true)
+        {
+            tasks.Add(Clients.Caller.SendAsync("ReceiveArbitrageLiveMatches", arbitrageMatches));
+        }
+        else
+        {
+            // Fallback to static service data if not in cache
+            var serviceArbitrageMatches = ArbitrageLiveMatchBackgroundService.GetLastSentArbitrageMatches();
+            if (serviceArbitrageMatches?.Any() == true)
+            {
+                // Update cache for future connections
+                _cache.Set(_arbitrageMatchesCacheKey, serviceArbitrageMatches, 
+                    TimeSpan.FromMinutes(5));
+                tasks.Add(Clients.Caller.SendAsync("ReceiveArbitrageLiveMatches", serviceArbitrageMatches));
+            }
+        }
+
+        // Same for all matches
+        if (_cache.TryGetValue(_allMatchesCacheKey, out List<ClientMatch> allMatches) && 
+            allMatches?.Any() == true)
+        {
+            tasks.Add(Clients.Caller.SendAsync("ReceiveAllLiveMatches", allMatches));
+        }
+        else
+        {
+            var serviceAllMatches = ArbitrageLiveMatchBackgroundService.GetLastSentAllMatches();
+            if (serviceAllMatches?.Any() == true)
+            {
+                _cache.Set(_allMatchesCacheKey, serviceAllMatches, 
+                    TimeSpan.FromMinutes(5));
+                tasks.Add(Clients.Caller.SendAsync("ReceiveAllLiveMatches", serviceAllMatches));
+            }
+        }
+
+        // IMPROVED: Send prediction data if available - with type checking and logging
+        if (_cache.TryGetValue(_predictionDataCacheKey, out object predictionDataObj))
+        {
+            _logger.LogDebug("Found prediction data in cache of type: {Type}", predictionDataObj?.GetType().Name ?? "null");
             
-            // Add to connected clients set with thread safety
-            lock (_connectedClients)
+            // Check if it's the proper type
+            if (predictionDataObj is PredictionDataResponse predictionData)
             {
-                _connectedClients.Add(connectionId);
-            }
-
-            // Group all tasks to execute them concurrently
-            var tasks = new List<Task>();
-
-            // Use cached data from memory cache instead of static service
-            if (_cache.TryGetValue(_arbitrageMatchesCacheKey, out List<ClientMatch> arbitrageMatches) && 
-                arbitrageMatches?.Any() == true)
-            {
-                tasks.Add(Clients.Caller.SendAsync("ReceiveArbitrageLiveMatches", arbitrageMatches));
-            }
-            else
-            {
-                // Fallback to static service data if not in cache
-                var serviceArbitrageMatches = ArbitrageLiveMatchBackgroundService.GetLastSentArbitrageMatches();
-                if (serviceArbitrageMatches?.Any() == true)
-                {
-                    // Update cache for future connections
-                    _cache.Set(_arbitrageMatchesCacheKey, serviceArbitrageMatches, 
-                        TimeSpan.FromMinutes(5));
-                    tasks.Add(Clients.Caller.SendAsync("ReceiveArbitrageLiveMatches", serviceArbitrageMatches));
-                }
-            }
-
-            // Same for all matches
-            if (_cache.TryGetValue(_allMatchesCacheKey, out List<ClientMatch> allMatches) && 
-                allMatches?.Any() == true)
-            {
-                tasks.Add(Clients.Caller.SendAsync("ReceiveAllLiveMatches", allMatches));
-            }
-            else
-            {
-                var serviceAllMatches = ArbitrageLiveMatchBackgroundService.GetLastSentAllMatches();
-                if (serviceAllMatches?.Any() == true)
-                {
-                    _cache.Set(_allMatchesCacheKey, serviceAllMatches, 
-                        TimeSpan.FromMinutes(5));
-                    tasks.Add(Clients.Caller.SendAsync("ReceiveAllLiveMatches", serviceAllMatches));
-                }
-            }
-
-            // Send prediction data if available
-            if (_cache.TryGetValue(_predictionDataCacheKey, out var predictionData))
-            {
+                _logger.LogDebug("Sending cached prediction data with {Count} matches to new client", 
+                    predictionData.Data?.UpcomingMatches?.Count ?? 0);
                 tasks.Add(Clients.Caller.SendAsync("ReceivePredictionData", predictionData));
             }
-            
-            // NEW: Send prediction results if available
-            if (_cache.TryGetValue(_predictionResultsCacheKey, out PredictionResultsResponse predictionResults))
+            else
             {
-                tasks.Add(Clients.Caller.SendAsync("ReceivePredictionResults", predictionResults));
+                _logger.LogWarning("Cached prediction data is not of expected type PredictionDataResponse but {ActualType}. " + 
+                                  "This will likely cause client-side errors.",
+                    predictionDataObj?.GetType().Name ?? "null");
+                
+                // Try to send something for backward compatibility
+                tasks.Add(Clients.Caller.SendAsync("ReceivePredictionData", predictionDataObj));
             }
-
-            // Wait for all data to be sent concurrently
-            if (tasks.Count > 0)
-            {
-                await Task.WhenAll(tasks);
-            }
-
-            await base.OnConnectedAsync();
         }
-        catch (Exception ex)
+        else
         {
-            _logger.LogError(ex, "Error during client connection: {ConnectionId}", Context.ConnectionId);
-            throw; // Rethrow to let SignalR handle it
+            _logger.LogDebug("No prediction data found in cache for new client");
         }
-    }
+        
+        // Send prediction results if available
+        if (_cache.TryGetValue(_predictionResultsCacheKey, out PredictionResultsResponse predictionResults))
+        {
+            tasks.Add(Clients.Caller.SendAsync("ReceivePredictionResults", predictionResults));
+        }
 
+        // Wait for all data to be sent concurrently
+        if (tasks.Count > 0)
+        {
+            await Task.WhenAll(tasks);
+        }
+
+        await base.OnConnectedAsync();
+    }
+    catch (Exception ex)
+    {
+        _logger.LogError(ex, "Error during client connection: {ConnectionId}", Context.ConnectionId);
+        throw; // Rethrow to let SignalR handle it
+    }
+}
     public override async Task OnDisconnectedAsync(Exception? exception)
     {
         try
@@ -156,28 +173,92 @@ public class LiveMatchHub : Hub
         }
     }
 
-    public async Task RequestPredictionData()
+public async Task RequestPredictionData()
+{
+    try
     {
-        try
+        if (_cache.TryGetValue(_predictionDataCacheKey, out object predictionDataObj))
         {
-            if (_cache.TryGetValue(_predictionDataCacheKey, out var predictionData))
+            // Verify the correct type is cached
+            if (predictionDataObj is PredictionDataResponse predictionData)
             {
+                _logger.LogDebug("Sending cached prediction data with {Count} matches on demand", 
+                    predictionData.Data?.UpcomingMatches?.Count ?? 0);
+                
+                // Send to the client that requested it
                 await Clients.Caller.SendAsync("ReceivePredictionData", predictionData);
-                _logger.LogDebug("Sent prediction data to client {ConnectionId}", Context.ConnectionId);
             }
             else
             {
-                await Clients.Caller.SendAsync("Error", "Prediction data not available");
-                _logger.LogWarning("Prediction data requested but not available for client {ConnectionId}", Context.ConnectionId);
+                _logger.LogWarning("Cached prediction data has incorrect type: {ActualType}. Expected PredictionDataResponse.", 
+                    predictionDataObj?.GetType().Name ?? "null");
+                
+                // Try to be backwards compatible
+                if (predictionDataObj != null)
+                {
+                    // If it's a list of matches, try to format it properly
+                    if (predictionDataObj is System.Collections.Generic.List<UpcomingMatch> matches && matches.Any())
+                    {
+                        _logger.LogInformation("Converting raw match list to proper PredictionDataResponse format");
+                        
+                        // Create a properly formatted response
+                        var currentTime = DateTime.UtcNow;
+                        var formattedResponse = new PredictionDataResponse
+                        {
+                            Data = new PredictionData
+                            {
+                                UpcomingMatches = matches,
+                                Metadata = new PredictionMetadata
+                                {
+                                    Total = matches.Count,
+                                    Date = currentTime.ToString("yyyy-MM-dd"),
+                                    LastUpdated = currentTime.ToString("yyyy-MM-ddTHH:mm:ssZ"),
+                                    LeagueData = new System.Collections.Generic.Dictionary<string, LeagueMetadata>()
+                                }
+                            },
+                            Pagination = new PaginationInfo
+                            {
+                                CurrentPage = 1,
+                                TotalPages = 1,
+                                PageSize = matches.Count,
+                                TotalItems = matches.Count,
+                                HasNext = false,
+                                HasPrevious = false
+                            }
+                        };
+                        
+                        // Update the cache with the properly formatted response
+                        _cache.Set(_predictionDataCacheKey, formattedResponse, TimeSpan.FromHours(2));
+                        
+                        // Send the formatted response
+                        await Clients.Caller.SendAsync("ReceivePredictionData", formattedResponse);
+                        return;
+                    }
+                
+                    await Clients.Caller.SendAsync("ReceivePredictionData", predictionDataObj);
+                    
+                    // Log this situation as it indicates a problem in the system
+                    _logger.LogWarning("Sent incorrectly formatted prediction data. This may cause client-side errors.");
+                }
+                else
+                {
+                    await Clients.Caller.SendAsync("Error", "Prediction data format incorrect");
+                }
             }
         }
-        catch (Exception ex)
+        else
         {
-            _logger.LogError(ex, "Error sending prediction data to client {ConnectionId}", Context.ConnectionId);
-            await Clients.Caller.SendAsync("Error", "Failed to send prediction data");
+            // Nothing in cache
+            await Clients.Caller.SendAsync("Error", "Prediction data not available");
+            _logger.LogWarning("Prediction data requested but not available for client {ConnectionId}", Context.ConnectionId);
         }
     }
-    
+    catch (Exception ex)
+    {
+        _logger.LogError(ex, "Error sending prediction data to client {ConnectionId}", Context.ConnectionId);
+        await Clients.Caller.SendAsync("Error", "Failed to send prediction data");
+    }
+}    
     // NEW: Add method to request prediction results
     public async Task RequestPredictionResults()
     {
