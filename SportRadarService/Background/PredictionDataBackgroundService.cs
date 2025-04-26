@@ -376,7 +376,7 @@ private async Task UpdatePredictionDataAsync(CancellationToken stoppingToken)
                 };
                 
                 // Send the next page
-                await hubContext.Clients.All.SendAsync("ReceivePredictionDataPage", pageData, stoppingToken);
+                await hubContext.Clients.All.SendAsync("ReceivePredictionData", pageData, stoppingToken);
                 
                 _logger.LogInformation($"Sent page {page+1}/{totalPages} with {pageMatches.Count} matches to clients");
                 
