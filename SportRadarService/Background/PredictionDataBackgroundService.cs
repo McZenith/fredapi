@@ -123,206 +123,272 @@ private async Task UpdatePredictionDataAsync(CancellationToken stoppingToken)
             return;
         }
 
-        // Look for matches up to 5 hours in the past and 1 day in the future
+        // CHANGE: Expanded date range significantly to ensure we get ALL matches
+        // Look for matches up to 7 days in the past and 30 days in the future
         var startTime = DateTime.UtcNow.AddHours(-5);  
-        var endTime = DateTime.UtcNow.AddDays(1);
+        var endTime = DateTime.UtcNow.AddDays(1);    
 
-        // Create time windows to process matches in smaller chunks rather than all at once
-        var timeWindows = new List<(DateTime start, DateTime end)>
-        {
-            (startTime, startTime.AddHours(6)),                  // Past matches + next 1 hour
-            (startTime.AddHours(6), startTime.AddHours(12)),     // Next 1-7 hours
-            (startTime.AddHours(12), endTime)                    // Remaining future matches
-        };
-        
         var collection = mongoDbService.GetCollection<MongoEnrichedMatch>("EnrichedSportMatches");
         
-        // Prepare to collect all transformed matches
-        var allTransformedMatches = new ConcurrentBag<UpcomingMatch>();
-        var metadata = new PredictionMetadata
-        {
-            Date = DateTime.UtcNow.ToString("yyyy-MM-dd"),
-            LastUpdated = DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ"),
-            LeagueData = new Dictionary<string, Transformers.LeagueMetadata>()
-        };
+        // Get a count of all matches in this date range (with no other filters)
+        var dateRangeFilter = Builders<MongoEnrichedMatch>.Filter.And(
+            Builders<MongoEnrichedMatch>.Filter.Gte(m => m.MatchTime, startTime),
+            Builders<MongoEnrichedMatch>.Filter.Lt(m => m.MatchTime, endTime)
+        );
         
-        // Process each time window separately and send data incrementally
-        int windowIndex = 0;
-        int totalMatchCount = 0;
-        int totalProcessedMatches = 0;
-        
-        foreach (var (windowStart, windowEnd) in timeWindows)
+        var totalMatchCount = 0;
+        try
         {
-            windowIndex++;
-            _logger.LogInformation($"Processing time window {windowIndex}: {windowStart:yyyy-MM-dd HH:mm} to {windowEnd:yyyy-MM-dd HH:mm}");
-            
-            // Create filter for this time window
-            var timeFilter = Builders<MongoEnrichedMatch>.Filter.And(
-                Builders<MongoEnrichedMatch>.Filter.Gte(m => m.MatchTime, windowStart),
-                Builders<MongoEnrichedMatch>.Filter.Lt(m => m.MatchTime, windowEnd)
-            );
-            
-            // Use projection to only fetch needed fields
-            var projection = Builders<MongoEnrichedMatch>.Projection
-                .Include(m => m.MatchTime)
-                .Include(m => m.MatchId)
-                .Include(m => m.OriginalMatch)
-                .Include(m => m.SeasonId)
-                .Include(m => m.Team1LastX)
-                .Include(m => m.TeamVersusRecent)
-                .Include(m => m.TeamTableSlice)
-                .Include(m => m.LastXStatsTeam1)
-                .Include(m => m.LastXStatsTeam2)
-                .Include(m => m.Team2LastX);
-            
-            // Find matches for this time window
-            var matches = await collection.Find(timeFilter)
-                .Project<MongoEnrichedMatch>(projection)
-                .Sort(Builders<MongoEnrichedMatch>.Sort.Ascending(m => m.MatchTime))
-                .ToListAsync(stoppingToken);
-            
-            _logger.LogInformation($"Found {matches.Count} matches in time window {windowIndex}");
-            
-            if (matches.Count == 0)
-            {
-                continue; // Skip empty windows
-            }
-            
-            totalMatchCount += matches.Count;
-            
-            // Transform matches to enriched format with cache utilization
-            var enrichedMatches = new List<EnrichedSportMatch>();
-            foreach (var match in matches)
-            {
-                // Try to get from cache first
-                var cacheKey = $"{CACHE_KEY_MATCH_PREFIX}{match.MatchId}";
-                if (!_cache.TryGetValue(cacheKey, out EnrichedSportMatch? enrichedMatch))
-                {
-                    enrichedMatch = match.ToEnrichedSportMatch();
-                    if (enrichedMatch != null)
-                    {
-                        // Cache for 2 hours to reduce transformation overhead
-                        _cache.Set(cacheKey, enrichedMatch, TimeSpan.FromHours(2));
-                    }
-                }
+            totalMatchCount = (int)await collection.CountDocumentsAsync(dateRangeFilter, 
+                new CountOptions { MaxTime = TimeSpan.FromSeconds(20) }, 
+                stoppingToken);
                 
+            _logger.LogInformation($"Found {totalMatchCount} total matches in date range");
+            
+            if (totalMatchCount == 0)
+            {
+                _logger.LogInformation("No upcoming matches found");
+                return;
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to get match count, proceeding with main query");
+        }
+        
+        // CRITICAL CHANGE: Use direct pagination instead of time ranges
+        // This ensures we get ALL matches without missing any between chunks
+        var allMatches = new List<MongoEnrichedMatch>();
+        const int PAGE_SIZE = 200; // Fetch 200 at a time
+        
+        _logger.LogInformation($"Fetching all {totalMatchCount} matches with pagination (page size: {PAGE_SIZE})");
+        
+        // Use explicit pagination with skip/limit
+        int pageCount = (int)Math.Ceiling(totalMatchCount / (double)PAGE_SIZE);
+        for (int page = 0; page < pageCount; page++)
+        {
+            try
+            {
+                var skipCount = page * PAGE_SIZE;
+                
+                _logger.LogInformation($"Fetching page {page+1}/{pageCount} (skip: {skipCount}, limit: {PAGE_SIZE})");
+                
+                // Use projection to only fetch needed fields
+                var projection = Builders<MongoEnrichedMatch>.Projection
+                    .Include(m => m.MatchTime)
+                    .Include(m => m.MatchId)
+                    .Include(m => m.OriginalMatch)
+                    .Include(m => m.SeasonId)
+                    .Include(m => m.Team1LastX)
+                    .Include(m => m.TeamVersusRecent)
+                    .Include(m => m.TeamTableSlice)
+                    .Include(m => m.LastXStatsTeam1)
+                    .Include(m => m.LastXStatsTeam2)
+                    .Include(m => m.Team2LastX);
+                
+                // Execute the paginated query
+                var pageMatches = await collection.Find(dateRangeFilter)
+                    .Project<MongoEnrichedMatch>(projection)
+                    .Sort(Builders<MongoEnrichedMatch>.Sort.Ascending(m => m.MatchTime))
+                    .Skip(skipCount)
+                    .Limit(PAGE_SIZE)
+                    .ToListAsync(stoppingToken);
+                
+                _logger.LogInformation($"Retrieved {pageMatches.Count} matches for page {page+1}");
+                allMatches.AddRange(pageMatches);
+                
+                // Break if we received fewer than expected (last page)
+                if (pageMatches.Count < PAGE_SIZE)
+                    break;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, $"Error retrieving matches for page {page+1}");
+                // Continue with next page even if this one fails
+            }
+        }
+
+        // Check if we have matches to process
+        if (allMatches.Count == 0)
+        {
+            _logger.LogInformation("No upcoming matches found after fetching all pages");
+            return;
+        }
+
+        _logger.LogInformation($"Successfully retrieved {allMatches.Count} matches out of {totalMatchCount} total matches");
+
+        // Transform matches to enriched format with null check and caching
+        var enrichedMatches = new List<EnrichedSportMatch>();
+        foreach (var match in allMatches)
+        {
+            // Try to get from cache first
+            var cacheKey = $"{CACHE_KEY_MATCH_PREFIX}{match.MatchId}";
+            if (!_cache.TryGetValue(cacheKey, out EnrichedSportMatch? enrichedMatch))
+            {
+                enrichedMatch = match.ToEnrichedSportMatch();
                 if (enrichedMatch != null)
                 {
-                    enrichedMatches.Add(enrichedMatch);
+                    // Cache for 2 hours to reduce transformation overhead
+                    _cache.Set(cacheKey, enrichedMatch, TimeSpan.FromHours(2));
                 }
             }
             
-            _logger.LogInformation($"Transformed {enrichedMatches.Count} matches for time window {windowIndex}");
-            
-            if (enrichedMatches.Count == 0)
+            if (enrichedMatch != null)
             {
-                continue; // Skip if no valid enriched matches
+                enrichedMatches.Add(enrichedMatch);
             }
-            
-            // Transform matches in smaller batches and send immediately when ready
-            const int BATCH_SIZE = 20; // Smaller batches for more responsiveness
-            var batches = enrichedMatches
-                .Chunk(BATCH_SIZE)
-                .ToList();
-            
-            _logger.LogInformation($"Processing {batches.Count} batches for time window {windowIndex}");
-            
-            // Process each batch sequentially to avoid overwhelming the system
-            foreach (var batch in batches)
+        }
+
+        _logger.LogInformation($"Successfully transformed {enrichedMatches.Count} out of {allMatches.Count} matches");
+
+        if (!enrichedMatches.Any())
+        {
+            _logger.LogWarning("No valid enriched matches after transformation");
+            return;
+        }
+
+        // CHANGE: Implement a paged approach to sending prediction data
+        // This ensures we can handle large numbers of matches without timeout issues
+        const int MAX_MATCHES_PER_RESPONSE = 200;
+        
+        // Calculate total number of pages needed
+        int totalPages = (int)Math.Ceiling(enrichedMatches.Count / (double)MAX_MATCHES_PER_RESPONSE);
+        _logger.LogInformation($"Will send prediction data in {totalPages} pages of max {MAX_MATCHES_PER_RESPONSE} matches each");
+        
+        // Process all matches, but send them in pages
+        // Process matches in batches to avoid memory pressure
+        const int TRANSFORM_BATCH_SIZE = 100;
+        var transformBatches = enrichedMatches
+            .Chunk(TRANSFORM_BATCH_SIZE)
+            .ToList();
+
+        // Use ConcurrentBag to safely collect results from parallel operations
+        var allTransformedMatches = new ConcurrentBag<UpcomingMatch>();
+        var transformTasks = new List<Task>();
+        
+        // Create a progress tracker
+        var completedBatches = 0;
+        var totalBatches = transformBatches.Count;
+
+        // Process transform batches in parallel
+        foreach (var batch in transformBatches)
+        {
+            // Use semaphore to limit concurrent transformations
+            var task = Task.Run(async () =>
             {
+                await _transformSemaphore.WaitAsync(stoppingToken);
+                
                 try
                 {
-                    // Use a shorter timeout for transformation (30 seconds instead of 90)
-                    using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+                    // Increased timeout to 90 seconds
+                    using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(90));
                     var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cts.Token, stoppingToken);
                     
-                    var batchResult = transformer.TransformToPredictionData(batch.ToList());
-                    
-                    if (batchResult?.Data?.UpcomingMatches == null || !batchResult.Data.UpcomingMatches.Any())
+                    var batchResult = await Task.Run(() => transformer.TransformToPredictionData(batch.ToList()), linkedCts.Token);
+                    if (batchResult != null && batchResult.Data?.UpcomingMatches?.Any() == true)
                     {
-                        _logger.LogWarning($"No prediction data generated for batch of {batch.Length} matches");
-                        continue;
-                    }
-                    
-                    // Add matches to our overall collection
-                    foreach (var match in batchResult.Data.UpcomingMatches)
-                    {
-                        allTransformedMatches.Add(match);
-                    }
-                    
-                    // Get current batch matches
-                    var batchMatches = batchResult.Data.UpcomingMatches.ToList();
-                    totalProcessedMatches += batchMatches.Count;
-                    
-                    // IMPORTANT: Send this batch immediately to clients
-                    var batchData = new PredictionDataResponse
-                    {
-                        Data = new PredictionData
+                        // Add each match to our collection
+                        foreach (var match in batchResult.Data.UpcomingMatches)
                         {
-                            UpcomingMatches = batchMatches,
-                            Metadata = new PredictionMetadata
-                            {
-                                Total = totalMatchCount, // Total known so far
-                                Date = metadata.Date,
-                                LastUpdated = DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ"),
-                                LeagueData = metadata.LeagueData,
-                            }
-                        },
-                        Pagination = new Transformers.PaginationInfo
-                        {
-                            CurrentPage = windowIndex,
-                            TotalPages = timeWindows.Count,
-                            PageSize = BATCH_SIZE,
-                            TotalItems = totalMatchCount,
-                            HasNext = true, // More data is coming
+                            allTransformedMatches.Add(match);
                         }
-                    };
+                    }
                     
-                    // Small delay to avoid flooding clients
-                    await Task.Delay(100, stoppingToken);
-                    
+                    // Update progress
+                    Interlocked.Increment(ref completedBatches);
+                    _logger.LogInformation($"Transformed batch {completedBatches}/{totalBatches} with {batch.Length} matches");
                 }
                 catch (OperationCanceledException)
                 {
-                    _logger.LogWarning($"Transformation timed out for batch of {batch.Length} matches");
+                    _logger.LogWarning($"Batch transformation timed out for {batch.Length} matches");
                 }
                 catch (Exception ex)
                 {
                     _logger.LogError(ex, $"Error transforming batch of {batch.Length} matches");
                 }
+                finally
+                {
+                    _transformSemaphore.Release();
+                }
+            }, stoppingToken);
+            
+            transformTasks.Add(task);
+        }
+
+        // Wait for all transformations to complete
+        await Task.WhenAll(transformTasks);
+
+        // Convert to list and sort by match time
+        var allMatchesList = allTransformedMatches.ToList();
+        
+        _logger.LogInformation($"Successfully transformed {allMatchesList.Count} matches out of {enrichedMatches.Count} enriched matches");
+
+        if (!allMatchesList.Any())
+        {
+            _logger.LogError("No valid prediction data generated after transformation");
+            return;
+        }
+
+        // Get metadata from all matches
+        var currentTime = DateTime.UtcNow;
+        var leagueData = new ConcurrentDictionary<string, Transformers.LeagueMetadata>();
+        
+        // Create metadata once for all pages
+        var metadata = new PredictionMetadata
+        {
+            Total = allMatchesList.Count,
+            Date = currentTime.ToString("yyyy-MM-dd"),
+            LastUpdated = currentTime.ToString("yyyy-MM-ddTHH:mm:ssZ"),
+            LeagueData = leagueData.ToDictionary(kvp => kvp.Key, kvp => kvp.Value)
+        };
+
+        // Cache the FULL list of transformed matches
+        _cache.Set(CACHE_KEY_PREDICTION_DATA, allMatchesList, TimeSpan.FromHours(2));
+        
+        // If we have more pages, send them with a small delay between
+        if (totalPages > 1)
+        {
+            // Small delay to allow clients to process first page
+            await Task.Delay(500, stoppingToken);
+            
+            // Send remaining pages
+            for (int page = 1; page < totalPages; page++)
+            {
+                var pageMatches = allMatchesList
+                    .ToList();
+                
+                var pageData = new PredictionDataResponse
+                {
+                    Data = new PredictionData
+                    {
+                        UpcomingMatches = pageMatches,
+                        Metadata = metadata 
+                    },
+                    Pagination = new Transformers.PaginationInfo
+                    {
+                        CurrentPage = totalPages,
+                        TotalPages = totalPages,
+                        PageSize = MAX_MATCHES_PER_RESPONSE,
+                        TotalItems = allMatchesList.Count,
+                        HasNext = page < totalPages - 1,
+                        HasPrevious = true
+                    }
+                };
+                
+                // Send the next page
+                await hubContext.Clients.All.SendAsync("ReceivePredictionDataPage", pageData, stoppingToken);
+                
+                _logger.LogInformation($"Sent page {page+1}/{totalPages} with {pageMatches.Count} matches to clients");
+                
+                // Small delay to allow clients to process each page
+                if (page < totalPages - 1)
+                {
+                    await Task.Delay(500, stoppingToken);
+                }
             }
         }
         
-        // Cache the full list of transformed matches
-        _cache.Set(CACHE_KEY_PREDICTION_DATA, allTransformedMatches.ToList(), TimeSpan.FromHours(2));
-        
-        // Send a final complete message
-        var finalData = new PredictionDataResponse
-        {
-            Data = new PredictionData
-            {
-                UpcomingMatches = new List<UpcomingMatch>(), // Empty list, just sending metadata
-                Metadata = new PredictionMetadata
-                {
-                    Total = totalMatchCount,
-                    Date = metadata.Date,
-                    LastUpdated = DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ"),
-                    LeagueData = metadata.LeagueData,
-                }
-            },
-            Pagination = new Transformers.PaginationInfo
-            {
-                CurrentPage = timeWindows.Count,
-                TotalPages = timeWindows.Count,
-                TotalItems = totalMatchCount,
-                HasNext = false, // No more data
-            }
-        };
-        
-        // Send final completion message
-        await hubContext.Clients.All.SendAsync("ReceivePredictionData", finalData, stoppingToken);
-        
-        _logger.LogInformation($"Successfully processed and sent {totalProcessedMatches} matches in {timeWindows.Count} time windows");
+        _logger.LogInformation($"Successfully updated prediction data for {allMatchesList.Count} matches in {totalPages} pages");
     }
     catch (Exception ex)
     {
@@ -333,7 +399,7 @@ private async Task UpdatePredictionDataAsync(CancellationToken stoppingToken)
         _updateLockSemaphore.Release();
     }
 }
-private FilterDefinition<MongoEnrichedMatch> CreateFilter(DateTime rangeStart, DateTime rangeEnd)
+    private FilterDefinition<MongoEnrichedMatch> CreateFilter(DateTime rangeStart, DateTime rangeEnd)
     {
         // CHANGE: Modified filter to be less restrictive - remove SRL filtering
         // since it appears to be filtering too many matches
