@@ -9,6 +9,7 @@ using Microsoft.AspNetCore.SignalR;
 using MongoDB.Bson;
 using MongoDB.Driver;
 using Microsoft.Extensions.Caching.Memory;
+using MongoDB.Driver.Linq;
 
 namespace fredapi.SportRadarService.Background;
 
@@ -128,8 +129,8 @@ private async Task UpdatePredictionDataAsync(CancellationToken stoppingToken)
 
         // CHANGE: Expanded date range significantly to ensure we get ALL matches
         // Look for matches up to 7 days in the past and 30 days in the future
-        var startTime = DateTime.UtcNow.AddDays(-7);  
-        var endTime = DateTime.UtcNow.AddDays(30);    
+        var startTime = DateTime.UtcNow.AddHours(-5);  
+        var endTime = DateTime.UtcNow.AddDays(1);    
 
         var collection = mongoDbService.GetCollection<MongoEnrichedMatch>("EnrichedSportMatches");
         
