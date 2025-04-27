@@ -289,6 +289,17 @@ namespace fredapi.SportRadarService.Transformers
             {
                 match.ReasonsForPrediction = new List<string>();
             }
+
+            // Ensure recent matches collections exist
+            if (match.HomeTeam.RecentMatches == null)
+            {
+                match.HomeTeam.RecentMatches = new List<MatchResult>();
+            }
+
+            if (match.AwayTeam.RecentMatches == null)
+            {
+                match.AwayTeam.RecentMatches = new List<MatchResult>();
+            }
         }
 
         private bool IsValidMatch(EnrichedSportMatch sportMatch)
@@ -591,6 +602,9 @@ namespace fredapi.SportRadarService.Transformers
                 // Calculate defensive efficiency (goals conceded vs expected)
                 double defensiveEfficiency = CalculateDefensiveEfficiency(averageGoalsConceded, teamStats);
 
+                // Extract recent matches
+                var recentMatches = ExtractRecentMatches(teamLastX, teamName);
+
                 // Create the team data object with all fields populated
                 return new TeamData
                 {
@@ -659,7 +673,8 @@ namespace fredapi.SportRadarService.Transformers
                     TotalHomeDraws = totalHomeDraws,
                     TotalAwayDraws = totalAwayDraws,
                     TotalHomeLosses = totalHomeLosses,
-                    TotalAwayLosses = totalAwayLosses
+                    TotalAwayLosses = totalAwayLosses,
+                    RecentMatches = recentMatches
                 };
             }
             catch (Exception ex)
@@ -693,10 +708,12 @@ namespace fredapi.SportRadarService.Transformers
                     ExpectedPoints = 0,
                     Momentum = 0,
                     OffensiveEfficiency = 0,
-                    DefensiveEfficiency = 0
+                    DefensiveEfficiency = 0,
+                    RecentMatches = new List<MatchResult>()
                 };
             }
         }
+
 
 // Additional helper methods for the new metrics
 
@@ -2511,7 +2528,7 @@ namespace fredapi.SportRadarService.Transformers
 
             return cornerStats;
         }
-        
+
         /// <summary>
         /// Extracts average corner count from match data
         /// </summary>
@@ -2753,6 +2770,34 @@ namespace fredapi.SportRadarService.Transformers
                     if (hasLossStreak) score -= 3;
                 }
 
+                // NEW: Enhanced confidence calculation using recent match history
+                if (homeTeam.RecentMatches != null && homeTeam.RecentMatches.Any() &&
+                    awayTeam.RecentMatches != null && awayTeam.RecentMatches.Any())
+                {
+                    // Calculate weighted form scores using the full match history
+                    double homeFormScore = MatchMomentumCalculator.CalculateWeightedFormScore(homeTeam.RecentMatches);
+                    double awayFormScore = MatchMomentumCalculator.CalculateWeightedFormScore(awayTeam.RecentMatches);
+
+                    // Determine form trends
+                    string homeTrend = MatchMomentumCalculator.DetectFormTrend(homeTeam.RecentMatches);
+                    string awayTrend = MatchMomentumCalculator.DetectFormTrend(awayTeam.RecentMatches);
+
+                    // Adjust confidence based on form difference
+                    double formDifference = Math.Abs(homeFormScore - awayFormScore);
+                    score += formDifference * 3; // Add up to 9 points for significant form difference
+
+                    // Adjust confidence based on trends
+                    if (homeTrend == "improving" && awayTrend != "improving")
+                        score += 2;
+                    else if (awayTrend == "improving" && homeTrend != "improving")
+                        score -= 2;
+
+                    if (homeTrend == "declining" && awayTrend != "declining")
+                        score -= 2;
+                    else if (awayTrend == "declining" && homeTrend != "declining")
+                        score += 2;
+                }
+
                 // Factor in momentum (positive momentum increases predictability)
                 double homeMomentum = homeTeam.Momentum / 100.0; // Scale to -1 to 1
                 double awayMomentum = awayTeam.Momentum / 100.0; // Scale to -1 to 1
@@ -2778,6 +2823,46 @@ namespace fredapi.SportRadarService.Transformers
                         score += 5;
                     else if (favoriteOdds < 2.0) // Moderate favorite
                         score += 3;
+                }
+
+                // NEW: Add direct matchup historical confidence
+                if (homeTeam.RecentMatches != null && awayTeam.RecentMatches != null)
+                {
+                    // Find matches where home team played against away team
+                    var directMatchups = homeTeam.RecentMatches
+                        .Where(m => StringMatches(m.Opponent, awayTeam.Name) && m.IsHome)
+                        .ToList();
+
+                    // Also find matches where away team played against home team
+                    var reversedMatchups = awayTeam.RecentMatches
+                        .Where(m => StringMatches(m.Opponent, homeTeam.Name) && !m.IsHome)
+                        .ToList();
+
+                    // Count wins for each team in direct matchups
+                    int homeTeamWins = directMatchups.Count(m => m.Result == "W");
+                    int homeTeamLosses = directMatchups.Count(m => m.Result == "L");
+
+                    int awayTeamWins = reversedMatchups.Count(m => m.Result == "W");
+                    int awayTeamLosses = reversedMatchups.Count(m => m.Result == "L");
+
+                    // Calculate win ratios if there are enough matchups
+                    int totalDirectMatchups = directMatchups.Count + reversedMatchups.Count;
+
+                    if (totalDirectMatchups >= 2)
+                    {
+                        // Calculate dominance ratio (-1 to 1 scale)
+                        double dominanceRatio = ((double)(homeTeamWins + awayTeamLosses) -
+                                                 (homeTeamLosses + awayTeamWins)) / totalDirectMatchups;
+
+                        // Add to confidence score - up to +/- 5 points based on historical dominance
+                        score += dominanceRatio * 5;
+
+                        // Add extra points for team that's consistently winning in this matchup
+                        if (Math.Abs(dominanceRatio) > 0.6)
+                        {
+                            score += 3; // Very predictable matchup based on history
+                        }
+                    }
                 }
 
                 // Add minimal random variation to prevent identical scores
@@ -2992,9 +3077,6 @@ namespace fredapi.SportRadarService.Transformers
         }
 
 
-        /// <summary>
-        /// Generates prediction reasons based on match data with enhanced metrics
-        /// </summary>
         private List<string> GeneratePredictionReasons(EnrichedSportMatch sportMatch, TeamData homeTeam,
             TeamData awayTeam, MatchOdds odds, double expectedGoals)
         {
@@ -3149,6 +3231,40 @@ namespace fredapi.SportRadarService.Transformers
                     reasons.Add($"Momentum: {teamWithMomentum} has {direction} momentum ({momentum:F1})");
                 }
 
+                // NEW: Add recent match history insights
+                if (homeTeam.RecentMatches != null && homeTeam.RecentMatches.Any() &&
+                    awayTeam.RecentMatches != null && awayTeam.RecentMatches.Any())
+                {
+                    // Check for significant streaks in recent form
+                    var homeRecentForm = homeTeam.RecentMatches.Take(5).Select(m => m.Result).ToList();
+                    var awayRecentForm = awayTeam.RecentMatches.Take(5).Select(m => m.Result).ToList();
+
+                    bool homeOnWinStreak = homeRecentForm.Count(r => r == "W") >= 3;
+                    bool awayOnWinStreak = awayRecentForm.Count(r => r == "W") >= 3;
+                    bool homeOnLossStreak = homeRecentForm.Count(r => r == "L") >= 3;
+                    bool awayOnLossStreak = awayRecentForm.Count(r => r == "L") >= 3;
+
+                    if (homeOnWinStreak || homeOnLossStreak || awayOnWinStreak || awayOnLossStreak)
+                    {
+                        var streakBuilder = new StringBuilder("Recent form: ");
+
+                        if (homeOnWinStreak)
+                            streakBuilder.Append(
+                                $"{homeTeam.Name} on {homeRecentForm.Count(r => r == "W")}-match win streak. ");
+                        if (homeOnLossStreak)
+                            streakBuilder.Append(
+                                $"{homeTeam.Name} on {homeRecentForm.Count(r => r == "L")}-match losing streak. ");
+                        if (awayOnWinStreak)
+                            streakBuilder.Append(
+                                $"{awayTeam.Name} on {awayRecentForm.Count(r => r == "W")}-match win streak. ");
+                        if (awayOnLossStreak)
+                            streakBuilder.Append(
+                                $"{awayTeam.Name} on {awayRecentForm.Count(r => r == "L")}-match losing streak. ");
+
+                        reasons.Add(streakBuilder.ToString().Trim());
+                    }
+                }
+
                 // Ensure we have a reasonable number of reasons (6-8 is a good range)
                 while (reasons.Count > 8)
                 {
@@ -3169,6 +3285,86 @@ namespace fredapi.SportRadarService.Transformers
 
             return reasons;
         }
+
+        /// <summary>
+        /// Calculates team momentum from recent match history
+        /// </summary>
+        public class MatchMomentumCalculator
+        {
+            // Weight factors decrease with match age (most recent match has highest impact)
+            private static readonly double[] WeightFactors = { 1.0, 0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2, 0.1 };
+
+            /// <summary>
+            /// Calculates a weighted form score based on recent match results
+            /// Most recent matches have higher weight in the calculation
+            /// </summary>
+            public static double CalculateWeightedFormScore(List<MatchResult> recentMatches)
+            {
+                if (recentMatches == null || !recentMatches.Any())
+                    return 0;
+
+                double totalScore = 0;
+                double totalWeight = 0;
+
+                for (int i = 0; i < Math.Min(recentMatches.Count, WeightFactors.Length); i++)
+                {
+                    double weight = WeightFactors[i];
+                    double matchScore = recentMatches[i].Result == "W" ? 3 : (recentMatches[i].Result == "D" ? 1 : 0);
+
+                    totalScore += matchScore * weight;
+                    totalWeight += weight;
+                }
+
+                return totalWeight > 0 ? totalScore / totalWeight : 0;
+            }
+
+            /// <summary>
+            /// Detects if team is on an improving or declining trend
+            /// </summary>
+            public static string DetectFormTrend(List<MatchResult> recentMatches, int threshold = 5)
+            {
+                if (recentMatches == null || recentMatches.Count < threshold)
+                    return "neutral";
+
+                var recentForm = recentMatches.Take(threshold / 2).ToList();
+                var olderForm = recentMatches.Skip(threshold / 2).Take(threshold / 2).ToList();
+
+                double recentScore = CalculateWeightedFormScore(recentForm);
+                double olderScore = CalculateWeightedFormScore(olderForm);
+
+                double difference = recentScore - olderScore;
+
+                if (difference > 0.5) return "improving";
+                if (difference < -0.5) return "declining";
+                return "stable";
+            }
+
+            /// <summary>
+            /// Calculates the momentum score from -100 to 100
+            /// Positive values indicate improving form, negative indicate declining form
+            /// </summary>
+            public static double CalculateMomentumScore(List<MatchResult> recentMatches)
+            {
+                if (recentMatches == null || recentMatches.Count < 5)
+                    return 0;
+
+                string trend = DetectFormTrend(recentMatches);
+                double weightedScore = CalculateWeightedFormScore(recentMatches);
+
+                // Scale the weighted score (0-3) to a -100 to 100 scale
+                double baseScore = (weightedScore - 1.5) * 66.67; // Center at 0
+
+                // Adjust based on trend
+                if (trend == "improving")
+                    baseScore += 20;
+                else if (trend == "declining")
+                    baseScore -= 20;
+
+                // Ensure within range
+                return Math.Max(-100, Math.Min(100, baseScore));
+            }
+        }
+
 
         /// <summary>
         /// Updates metadata for the league this match belongs to
@@ -4085,6 +4281,75 @@ namespace fredapi.SportRadarService.Transformers
         }
 
 
+        private List<MatchResult> ExtractRecentMatches(TeamLastXExtendedModel teamLastX, string teamName,
+            int count = 10)
+        {
+            var recentMatches = new List<MatchResult>();
+
+            if (teamLastX?.Matches == null || !teamLastX.Matches.Any())
+            {
+                return recentMatches; // Return empty list if no matches
+            }
+
+            // Get the most recent matches ordered by date
+            var orderedMatches = teamLastX.Matches
+                .Where(m => m.Result != null && m.Teams != null &&
+                            (m.Result.Home.HasValue && m.Result.Away.HasValue))
+                .OrderByDescending(m => ParseMatchDate(m.Time))
+                .Take(count)
+                .ToList();
+
+            foreach (var match in orderedMatches)
+            {
+                try
+                {
+                    // Determine if the team was home or away in this match
+                    bool isTeamHome = match.Teams.Home != null &&
+                                      (StringMatches(match.Teams.Home.Name, teamName) ||
+                                       StringMatches(match.Teams.Home.MediumName, teamName) ||
+                                       ContainsTeamName(match.Teams.Home.Name, teamName) ||
+                                       ContainsTeamName(match.Teams.Home.MediumName, teamName));
+
+                    string opponent = isTeamHome
+                        ? (match.Teams.Away?.Name ?? "Unknown")
+                        : (match.Teams.Home?.Name ?? "Unknown");
+
+                    // Get match result (W/D/L) for this team
+                    string result = GetMatchResult(match, isTeamHome);
+
+                    // Create score string
+                    string score = $"{match.Result.Home}-{match.Result.Away}";
+
+                    // Get match date
+                    DateTime matchDate = ParseMatchDate(match.Time);
+                    string formattedDate = matchDate != DateTime.MinValue
+                        ? matchDate.ToString("yyyy-MM-dd")
+                        : "Unknown date";
+
+                    // Get competition/tournament name
+                    string competition = "Unknown";
+
+                    // Add match to the list
+                    recentMatches.Add(new MatchResult
+                    {
+                        Date = formattedDate,
+                        Opponent = opponent,
+                        IsHome = isTeamHome,
+                        Result = result,
+                        Score = score,
+                        Competition = competition
+                    });
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, $"Error extracting match result: {ex.Message}");
+                    // Continue with next match
+                }
+            }
+
+            return recentMatches;
+        }
+
         /// <summary>
         /// Calculates points against top teams
         /// </summary>
@@ -4424,7 +4689,7 @@ namespace fredapi.SportRadarService.Transformers
     public class TeamData
     {
         [JsonPropertyName("name")] public string Name { get; set; }
-
+        [JsonPropertyName("recentMatches")] public List<MatchResult> RecentMatches { get; set; }
         [JsonPropertyName("position")] public int Position { get; set; }
 
         [JsonPropertyName("logo")] public string Logo { get; set; }
@@ -4707,6 +4972,16 @@ namespace fredapi.SportRadarService.Transformers
         [JsonPropertyName("homeLateGoalRate")] public double HomeLateGoalRate { get; set; }
 
         [JsonPropertyName("awayLateGoalRate")] public double AwayLateGoalRate { get; set; }
+    }
+
+    public class MatchResult
+    {
+        [JsonPropertyName("date")] public string Date { get; set; }
+        [JsonPropertyName("opponent")] public string Opponent { get; set; }
+        [JsonPropertyName("isHome")] public bool IsHome { get; set; }
+        [JsonPropertyName("result")] public string Result { get; set; } // "W", "D", or "L"
+        [JsonPropertyName("score")] public string Score { get; set; } // Format: "2-1"
+        [JsonPropertyName("competition")] public string Competition { get; set; }
     }
 }
 
