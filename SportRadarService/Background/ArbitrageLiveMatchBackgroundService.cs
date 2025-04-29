@@ -404,19 +404,12 @@ private async Task StreamMatchesToClientsAsync(List<Match> arbitrageMatches, Lis
                     PredictionData = match.PredictionData,
                     // Only include one 1X2 market with more comprehensive matching
                     Markets = match.Markets
-                        .Where(m =>
-                            m.Id == "1" || // Common ID for 1X2 markets
-                            m.Description?.ToLower() == "match result" ||
-                            m.Description?.ToLower() == "1x2" ||
-                            m.Description?.ToLower().Contains("1x2") == true ||
-                            m.Description?.ToLower().Contains("1,x,2") == true)
                         .Take(1) // Take just one market
                         .ToList()
                 };
                 
                 return matchWith1X2Only;
             })
-            .Where(m => m.Markets.Any()) // Only include matches that have at least one 1X2 market
             .ToList();
 
         // Log sizes before sending
