@@ -30,6 +30,9 @@ public class PredictionEnrichedMatchService
     // Semaphore for controlling DB access
     private static readonly SemaphoreSlim _dbSemaphore = new(1, 1);
 
+    private readonly ConcurrentDictionary<int, ConcurrentQueue<MatchSnapshot>> _matchSnapshotBuffers = new();
+    private readonly ConcurrentDictionary<int, DateTime> _lastSnapshotTimes = new();
+
     public PredictionEnrichedMatchService(
         ILogger<PredictionEnrichedMatchService> logger,
         MongoDbService mongoDbService,
@@ -334,19 +337,30 @@ public async Task<(List<ClientMatch> enrichedArbitrageMatches, List<ClientMatch>
     }
 
     /// <summary>
-    /// Takes snapshots of all matches for ML purposes
+    /// Takes snapshots of matches for ML purposes, maintaining 9 snapshots at 10-minute intervals
     /// </summary>
     private async Task TakeMatchSnapshotsAsync(List<ClientMatch> matches)
     {
         try
         {
-            // Group snapshots by match ID
-            var newSnapshots = new List<MatchSnapshot>();
             var timestamp = DateTime.UtcNow;
+            var newSnapshots = new List<MatchSnapshot>();
 
             foreach (var match in matches)
             {
-                // Create snapshot
+                // Skip if match is not in a valid state for snapshots
+                if (string.IsNullOrEmpty(match.PlayedTime) || match.PlayedTime == "0:00")
+                {
+                    continue;
+                }
+
+                // Check if enough time has passed since last snapshot (10 minutes)
+                if (!ShouldTakeSnapshot(match.Id, timestamp))
+                {
+                    continue;
+                }
+
+                // Create new snapshot
                 var snapshot = new MatchSnapshot
                 {
                     Id = ObjectId.GenerateNewId(),
@@ -361,21 +375,28 @@ public async Task<(List<ClientMatch> enrichedArbitrageMatches, List<ClientMatch>
                     PredictionData = match.PredictionData
                 };
 
-                // Add to collection
-                if (!_matchSnapshots.TryGetValue(match.Id, out var snapshots))
+                // Get or create buffer for this match
+                var buffer = _matchSnapshotBuffers.GetOrAdd(match.Id, _ => new ConcurrentQueue<MatchSnapshot>());
+
+                // Add to buffer
+                buffer.Enqueue(snapshot);
+
+                // If buffer exceeds 9 snapshots, remove oldest
+                while (buffer.Count > 9)
                 {
-                    snapshots = new ConcurrentBag<MatchSnapshot>();
-                    _matchSnapshots[match.Id] = snapshots;
+                    buffer.TryDequeue(out _);
                 }
 
-                snapshots.Add(snapshot);
+                // Update last snapshot time
+                _lastSnapshotTimes[match.Id] = timestamp;
+
+                // Add to list for database write
                 newSnapshots.Add(snapshot);
             }
 
-            // Only save to DB if we have snapshots
+            // Save new snapshots to database if we have any
             if (newSnapshots.Count > 0)
             {
-                // Save snapshots in the background to avoid blocking
                 _ = Task.Run(async () =>
                 {
                     try
@@ -393,6 +414,20 @@ public async Task<(List<ClientMatch> enrichedArbitrageMatches, List<ClientMatch>
         {
             _logger.LogError(ex, "Error taking match snapshots");
         }
+    }
+
+    /// <summary>
+    /// Determines if a new snapshot should be taken for a match based on time interval
+    /// </summary>
+    private bool ShouldTakeSnapshot(int matchId, DateTime currentTime)
+    {
+        if (!_lastSnapshotTimes.TryGetValue(matchId, out var lastSnapshotTime))
+        {
+            return true; // First snapshot for this match
+        }
+
+        // Take snapshot every 10 minutes
+        return (currentTime - lastSnapshotTime).TotalMinutes >= 10;
     }
 
     /// <summary>
